@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protolens"
+version = "0.1.0"
+description = "Adversarial multi-agent state reasoning for protocol fuzzing"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+protolens = "protolens.main:main"
+
+[tool.setuptools.packages.find]
+include = ["protolens*"]

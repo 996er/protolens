@@ -1,0 +1,80 @@
+{
+  "protocol": "ftp",
+  "target_name": "fftp-lightftp-openai",
+  "spec_paths": ["/home/ubuntu/protolens/benchmarks/specs/ftp_minimal.txt"],
+  "source_root": "/home/ubuntu/target/LightFTP/Source",
+  "entrypoints": ["ftpserv.c", "ftpserv.h", "main.c"],
+  "build_command": "",
+  "run_command": "/home/ubuntu/protolens/target/LightFTP/Source/Release/fftp /home/ubuntu/aflnet/tutorials/lightftp/fftp.conf 2200",
+  "host": "127.0.0.1",
+  "port": 2200,
+  "run_dir": "/home/ubuntu/target/LightFTP/Source/Release/runs/ftp-fftp-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 1000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/profuzzbench/subjects/FTP/LightFTP/in-ftp",
+      "-o",
+      "/home/ubuntu/target/LightFTP/Source/Release/runs/output",
+      "-x",
+      "/home/ubuntu/profuzzbench/subjects/FTP/LightFTP/ftp.dict",
+      "-N",
+      "tcp://127.0.0.1/2200",
+      "-m",
+      "none",
+      "-P",
+      "FTP",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "--",
+      "/home/ubuntu/protolens/target/LightFTP/Source/Release/fftp",
+      "/home/ubuntu/aflnet/tutorials/lightftp/fftp.conf",
+      "2200"
+    ]
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative FTP RFCs including security extensions, updates, and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "control connection lifecycle and states",
+      "authentication and command sequencing",
+      "data connection establishment",
+      "TLS and protocol security extensions",
+      "optional extensions evidenced as supported by the target implementation"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [".c", ".h"],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

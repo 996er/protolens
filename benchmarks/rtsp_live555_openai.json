@@ -1,0 +1,75 @@
+{
+  "protocol": "rtsp",
+  "target_name": "sample-live555-openai",
+  "spec_paths": ["/home/ubuntu/protolens/benchmarks/specs/rtsp_minimal.txt"],
+  "source_root": "./sample_targets",
+  "entrypoints": ["rtsp_server.c"],
+  "build_command": "",
+  "run_command": "./testOnDemandRTSPServer 8554",
+  "host": "127.0.0.1",
+  "port": 8554,
+  "run_dir": "../runs/rtsp-sample-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 1000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/in-rtsp",
+      "-o",
+      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/output",
+      "-N",
+      "tcp://127.0.0.1/8554",
+      "-x",
+      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/rtsp.dict",
+      "-P",
+      "RTSP",
+      "-D",
+      "1000000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-R",
+      "--",
+      "./testOnDemandRTSPServer",
+      "8554"
+    ]
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative RTSP RFCs including updates and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "control connection lifecycle and states",
+      "authentication and command sequencing",
+      "data connection establishment",
+      "TLS and protocol security extensions",
+      "optional extensions evidenced as supported by the target implementation"
+    ],
+    "target_supported_extensions_only": true,
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [".c", ".cc", ".cpp", ".h", ".hpp"],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

@@ -1,0 +1,8 @@
+RTSP minimal state model for ProtoLens.
+
+TRANSITION: START -- DESCRIBE -> READY_FOR_SETUP ; action=parse media description
+TRANSITION: READY_FOR_SETUP -- SETUP [valid transport and media resource] -> READY ; action=allocate session
+TRANSITION: READY -- PLAY [valid session] -> PLAYING ; action=start streaming
+TRANSITION: PLAYING -- PAUSE [valid session] -> READY ; action=pause streaming
+TRANSITION: READY -- TEARDOWN [valid session] -> TEARDOWN ; action=release session
+TRANSITION: PLAYING -- TEARDOWN [valid session] -> TEARDOWN ; action=release session

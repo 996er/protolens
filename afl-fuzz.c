@@ -281,6 +281,19 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_top, /* Top of the list                  */
                           *q_prev100; /* Previous 100 marker              */
 
+struct proto_seed_weight {
+
+  u8* name;                           /* Original ProtoLens seed basename */
+  u32 weight;                         /* Percent multiplier, 100 = neutral */
+  struct proto_seed_weight* next;
+
+};
+
+static struct proto_seed_weight* proto_seed_weights;
+static u8 proto_schedule_loaded;      /* AFLNET_PROTO_SCHEDULE parsed?    */
+static u8 *protolens_import_dir;      /* Runtime seed import directory    */
+static u64 protolens_last_import_scan;/* Last monitor import scan time    */
+
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
 
@@ -5567,6 +5580,77 @@ static u32 choose_block_len(u32 limit) {
 }
 
 
+/* Load ProtoLens mutation-point seed weights. The file format is deliberately
+   compact for the C side: seed_basename<TAB>weight_percent. Invalid lines are
+   ignored, so a bad advisory schedule cannot break a fuzzing campaign. */
+
+static void load_proto_schedule(void) {
+
+  u8* path = (u8*)getenv("AFLNET_PROTO_SCHEDULE");
+  FILE* f;
+  char line[1024];
+
+  proto_schedule_loaded = 1;
+  if (!path || !*path) return;
+
+  f = fopen((char*)path, "r");
+  if (!f) {
+    WARNF("Unable to open AFLNET_PROTO_SCHEDULE: %s", path);
+    return;
+  }
+
+  while (fgets(line, sizeof(line), f)) {
+
+    char *tab, *end;
+    unsigned long weight;
+    struct proto_seed_weight* entry;
+    size_t name_len;
+
+    if (line[0] == '#' || line[0] == '\n') continue;
+    tab = strchr(line, '\t');
+    if (!tab) continue;
+    *tab++ = 0;
+    end = tab;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    *end = 0;
+    weight = strtoul(tab, &end, 10);
+    if (end == tab || weight < 1 || weight > 1000) continue;
+    name_len = strlen(line);
+    if (!name_len) continue;
+
+    entry = ck_alloc(sizeof(struct proto_seed_weight));
+    entry->name = ck_alloc(name_len + 1);
+    memcpy(entry->name, line, name_len + 1);
+    entry->weight = (u32)weight;
+    entry->next = proto_seed_weights;
+    proto_seed_weights = entry;
+
+  }
+
+  fclose(f);
+
+}
+
+
+static u32 proto_schedule_weight(struct queue_entry* q) {
+
+  struct proto_seed_weight* entry;
+  u8* base;
+
+  if (!proto_schedule_loaded) load_proto_schedule();
+  if (!q || !q->fname || !proto_seed_weights) return 100;
+
+  base = (u8*)strrchr((char*)q->fname, '/');
+  if (base) base++; else base = q->fname;
+
+  for (entry = proto_seed_weights; entry; entry = entry->next)
+    if (strstr((char*)base, (char*)entry->name)) return entry->weight;
+
+  return 100;
+
+}
+
+
 /* Calculate case desirability score to adjust the length of havoc fuzzing.
    A helper function for fuzz_one(). Maybe some of these constants should
    go into config.h. */
@@ -5626,6 +5710,19 @@ static u32 calculate_score(struct queue_entry* q) {
     case 8 ... 13:  perf_score *= 3; break;
     case 14 ... 25: perf_score *= 4; break;
     default:        perf_score *= 5;
+
+  }
+
+  /* ProtoLens can provide mutation-point-aware seed weights generated from
+     planned paths. This is advisory and defaults to neutral when absent. */
+
+  {
+
+    u32 proto_weight = proto_schedule_weight(q);
+    if (proto_weight != 100) {
+      perf_score = perf_score * proto_weight / 100;
+      if (!perf_score) perf_score = 1;
+    }
 
   }
 
@@ -7793,6 +7890,135 @@ static void sync_fuzzers(char** argv) {
 }
 
 
+/* Import seeds produced by ProtoLens' runtime monitor. The monitor writes raw
+   AFLNet seed streams into AFLNET_PROTOLENS_IMPORT_DIR; this function executes
+   each new seed immediately and lets save_if_interesting() add only inputs that
+   produce real new coverage or findings. */
+
+static u32 import_protolens_monitor_seeds(char** argv) {
+
+  u8 *env_path, *processed_dir;
+  DIR* qd;
+  struct dirent* qd_ent;
+  u32 imported = 0;
+  u64 cur_ms = get_cur_time();
+
+  if (!protolens_import_dir) {
+
+    env_path = (u8*)getenv("AFLNET_PROTOLENS_IMPORT_DIR");
+    if (!env_path || !*env_path) return 0;
+    protolens_import_dir = ck_strdup(env_path);
+
+  }
+
+  if (protolens_last_import_scan &&
+      cur_ms - protolens_last_import_scan < 1000) return 0;
+
+  protolens_last_import_scan = cur_ms;
+  processed_dir = alloc_printf("%s/.processed", protolens_import_dir);
+  if (mkdir((char*)processed_dir, 0700) && errno != EEXIST) {
+    ck_free(processed_dir);
+    return 0;
+  }
+
+  qd = opendir((char*)protolens_import_dir);
+  if (!qd) {
+    ck_free(processed_dir);
+    return 0;
+  }
+
+  while ((qd_ent = readdir(qd))) {
+
+    u8 *path, *marker;
+    s32 fd, marker_fd;
+    struct stat st;
+
+    if (qd_ent->d_name[0] == '.' || strstr(qd_ent->d_name, "README")) continue;
+
+    path = alloc_printf("%s/%s", protolens_import_dir, qd_ent->d_name);
+    marker = alloc_printf("%s/%s", processed_dir, qd_ent->d_name);
+
+    if (!access((char*)marker, F_OK)) {
+      ck_free(path);
+      ck_free(marker);
+      continue;
+    }
+
+    fd = open((char*)path, O_RDONLY);
+    if (fd < 0) {
+      ck_free(path);
+      ck_free(marker);
+      continue;
+    }
+
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= MAX_FILE) {
+
+      u8 fault;
+      u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+
+      if (mem != MAP_FAILED) {
+
+        region_t *regions;
+        u32 region_count;
+        u32 before_queued = queued_paths;
+
+        write_to_testcase(mem, st.st_size);
+        regions = (*extract_requests)(mem, st.st_size, &region_count);
+        kl_messages = construct_kl_messages(path, regions, region_count);
+        fault = run_target(argv, exec_tmout);
+
+        corpus_read_or_sync = 2;
+        syncing_party = (u8*)"protolens_monitor";
+        syncing_case = 0;
+        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+        syncing_party = 0;
+        corpus_read_or_sync = 0;
+
+        if (queued_paths > before_queued) {
+          imported++;
+          queue_top->handicap = 12;
+          queue_top->favored = 1;
+          score_changed = 1;
+        }
+
+        ck_free(regions);
+        delete_kl_messages(kl_messages);
+        munmap(mem, st.st_size);
+
+        if (stop_soon) {
+          close(fd);
+          ck_free(path);
+          ck_free(marker);
+          break;
+        }
+
+      }
+
+    }
+
+    close(fd);
+    marker_fd = open((char*)marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (marker_fd >= 0) close(marker_fd);
+    ck_free(path);
+    ck_free(marker);
+
+  }
+
+  closedir(qd);
+  ck_free(processed_dir);
+
+  if (imported && queue_top) {
+    queue_cur = queue_top;
+    current_entry = queued_paths - 1;
+    ACTF("ProtoLens monitor imported %u coverage-increasing seed%s.",
+         imported, imported == 1 ? "" : "s");
+  }
+
+  return imported;
+
+}
+
+
 /* Handle stop signal (Ctrl-C, etc). */
 
 static void handle_stop_sig(int sig) {
@@ -9382,6 +9608,9 @@ int main(int argc, char** argv) {
         }
       }
 
+      import_protolens_monitor_seeds(use_argv);
+      if (stop_soon) break;
+
       skipped_fuzz = fuzz_one(use_argv);
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
@@ -9446,6 +9675,9 @@ int main(int argc, char** argv) {
         }
       }
 
+      import_protolens_monitor_seeds(use_argv);
+      if (stop_soon) break;
+
       skipped_fuzz = fuzz_one(use_argv);
 
       if (!stop_soon && sync_id && !skipped_fuzz) {
@@ -9501,6 +9733,9 @@ int main(int argc, char** argv) {
           sync_fuzzers(use_argv);
 
       }
+
+      import_protolens_monitor_seeds(use_argv);
+      if (stop_soon) break;
 
       skipped_fuzz = fuzz_one(use_argv);
 

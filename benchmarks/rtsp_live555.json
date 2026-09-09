@@ -1,0 +1,49 @@
+{
+  "protocol": "rtsp",
+  "target_name": "sample-live555",
+  "spec_paths": ["./specs/rtsp_minimal.txt"],
+  "source_root": "./sample_targets",
+  "entrypoints": ["rtsp_server.c"],
+  "build_command": "",
+  "run_command": "./testOnDemandRTSPServer 8554",
+  "host": "127.0.0.1",
+  "port": 8554,
+  "run_dir": "../runs/rtsp-sample",
+  "aflnet": {
+    "binary": "../afl-fuzz",
+    "timeout_ms": 1000,
+    "duration_seconds": 0,
+    "dry_run": true,
+    "cmd": [
+      "../afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/protolens/runs/rtsp-sample/corpus",
+      "-o",
+      "/home/ubuntu/protolens/runs/rtsp-sample/aflnet",
+      "-N",
+      "tcp://127.0.0.1/8554",
+      "-x",
+      "/home/ubuntu/protolens/runs/rtsp-sample/dictionaries/rtsp.dict",
+      "-P",
+      "RTSP",
+      "-D",
+      "1000000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-R",
+      "--",
+      "./testOnDemandRTSPServer",
+      "8554"
+    ]
+  },
+  "llm": {
+    "provider": "offline",
+    "model": "rule-based",
+    "temperature": 0.0
+  }
+}

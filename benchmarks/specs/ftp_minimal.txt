@@ -1,0 +1,27 @@
+FTP minimal state model for ProtoLens.
+
+TRANSITION: START -- CONNECT -> CONNECTED ; action=server greeting
+TRANSITION: CONNECTED -- USER -> USER_SEEN ; action=store username
+TRANSITION: USER_SEEN -- PASS [valid account credentials] -> AUTHENTICATED ; action=establish user session
+TRANSITION: CONNECTED -- AUTH TLS [TLS supported and certificate configured] -> TLS_NEGOTIATION ; action=start TLS negotiation
+TRANSITION: TLS_NEGOTIATION -- PBSZ [TLS session active] -> TLS_BUFFER_SET ; action=set protection buffer size
+TRANSITION: TLS_BUFFER_SET -- PROT [TLS session active] -> AUTHENTICATED ; action=set data channel protection
+TRANSITION: AUTHENTICATED -- PWD [logged in] -> AUTHENTICATED ; action=print working directory
+TRANSITION: AUTHENTICATED -- CWD [logged in and path allowed] -> AUTHENTICATED ; action=change working directory
+TRANSITION: AUTHENTICATED -- TYPE [logged in] -> AUTHENTICATED ; action=set transfer type
+TRANSITION: AUTHENTICATED -- PASV [logged in] -> DATA_PASSIVE ; action=open passive data listener
+TRANSITION: AUTHENTICATED -- PORT [logged in and address allowed] -> DATA_ACTIVE ; action=set active data endpoint
+TRANSITION: DATA_PASSIVE -- LIST [logged in and data channel ready] -> AUTHENTICATED ; action=list directory
+TRANSITION: DATA_ACTIVE -- LIST [logged in and data channel ready] -> AUTHENTICATED ; action=list directory
+TRANSITION: DATA_PASSIVE -- RETR [readonly or higher access and data channel ready] -> AUTHENTICATED ; action=download file
+TRANSITION: DATA_ACTIVE -- RETR [readonly or higher access and data channel ready] -> AUTHENTICATED ; action=download file
+TRANSITION: DATA_PASSIVE -- STOR [upload or admin access and data channel ready] -> AUTHENTICATED ; action=upload file
+TRANSITION: DATA_ACTIVE -- STOR [upload or admin access and data channel ready] -> AUTHENTICATED ; action=upload file
+TRANSITION: AUTHENTICATED -- RNFR [admin access and source path allowed] -> RENAME_PENDING ; action=remember rename source
+TRANSITION: RENAME_PENDING -- RNTO [admin access and destination path allowed] -> AUTHENTICATED ; action=rename file
+TRANSITION: AUTHENTICATED -- DELE [admin access and path allowed] -> AUTHENTICATED ; action=delete file
+TRANSITION: AUTHENTICATED -- MKD [upload or admin access and path allowed] -> AUTHENTICATED ; action=create directory
+TRANSITION: AUTHENTICATED -- RMD [admin access and path allowed] -> AUTHENTICATED ; action=remove directory
+TRANSITION: CONNECTED -- QUIT -> CLOSED ; action=close control connection
+TRANSITION: USER_SEEN -- QUIT -> CLOSED ; action=close control connection
+TRANSITION: AUTHENTICATED -- QUIT -> CLOSED ; action=close control connection
