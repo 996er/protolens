@@ -1088,6 +1088,22 @@ ProtoLens Result Analyzer
 
 ## CLI 设计
 
+### Python 安装与 LLM SDK
+
+ProtoLens 需要 Python 3.10 或更新版本。`requirement.txt` 列出 OpenAI SDK 及其传递依赖的锁定版本，安装命令为：
+
+```bash
+python3 -m pip install -r requirement.txt
+```
+
+所有在线 LLM 调用都通过 `protolens/utils/llm_client.py` 使用官方 OpenAI Python SDK：Agent 使用 Chat Completions，FSM 构建和网页检索使用 Responses。两条路径均使用 SDK 的 `with_raw_response.create()`，保留兼容服务扩展字段和完整原始 JSON，以供证据归档。参考 [OpenAI Docs](https://developers.openai.com/api/docs/libraries)。
+
+现有 `llm.provider`、`model`、`base_url`、`api_key_env`、`extra_headers`、`timeout_seconds`、`max_tokens` 和 `response_format` 配置继续有效。`base_url` 可使用 API 根路径（例如 `https://example.com/v1`），也兼容以 `/chat/completions` 或 `/responses` 结尾的旧配置。远程接口仍需设置 `api_key_env` 指定的环境变量；本地无密钥接口使用 SDK 所需的占位 token，不包含真实凭证。
+
+SDK 内部 `max_retries` 固定为 0，重试由 ProtoLens 的 `llm.retries` 控制，保留空响应格式降级、输出预算增长与网页检索后续写。每次请求通过上下文管理器关闭 SDK HTTP 客户端。离线模式不创建 SDK 客户端、不发起网络请求。
+
+SDK 保持 HTTPS 证书校验，支持通过容器环境变量 `SSL_CERT_FILE` 指定可信 CA 证书包。迁移 SDK 不会自动信任自签名 CA；连接异常会保留底层证书或超时错误原因。AFLNet、编译器、目标程序等系统依赖仍由 Dockerfile 或系统包管理器安装，不属于 pip 依赖。
+
 ### 初始化 benchmark
 
 ```bash

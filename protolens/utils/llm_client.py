@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from typing import Any, Literal
+
+from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 import json
 import os
 import re
@@ -27,7 +27,7 @@ class IncompleteLLMResponse(RuntimeError):
 
 
 class LLMClient:
-    """使用标准库访问 OpenAI Chat Completions 及第三方兼容接口。"""
+    """Use the OpenAI SDK for Chat Completions and Responses, including compatible APIs."""
 
     OFFLINE_PROVIDERS = {"offline", "mock", "rule-based"}
 
@@ -117,7 +117,6 @@ class LLMClient:
             relaxed = dict(payload)
             relaxed.pop("response_format", None)
             payloads.append(relaxed)
-        url = _chat_completions_url(self.base_url)
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -129,13 +128,13 @@ class LLMClient:
         for payload_index, candidate_payload in enumerate(payloads):
             for attempt in range(self.retries + 1):
                 try:
-                    return self._post_json(url, candidate_payload, headers)
-                except HTTPError as exc:
+                    return self._request_json("chat", candidate_payload, headers)
+                except APIStatusError as exc:
                     last_error = RuntimeError(_http_error_message(exc))
                     if attempt >= self.retries:
                         break
                     time.sleep(min(2**attempt, 8))
-                except (URLError, TimeoutError, RuntimeError) as exc:
+                except (APIError, TimeoutError, RuntimeError) as exc:
                     last_error = exc
                     if attempt >= self.retries:
                         break
@@ -212,15 +211,14 @@ class LLMClient:
         candidate_payload = dict(payload)
         for attempt in range(self.retries + 1):
             try:
-                response = self._post_json(
-                    _responses_url(self.base_url),
+                response = self._request_json(
+                    "responses",
                     candidate_payload,
                     headers,
                     allow_empty=web_search,
                 )
                 if web_search and not response.text.strip():
                     return self._finalize_web_research(
-                        url=_responses_url(self.base_url),
                         payload=candidate_payload,
                         headers=headers,
                         research_response=response,
@@ -230,7 +228,6 @@ class LLMClient:
                 last_error = exc
                 if web_search and _raw_used_web_search(exc.raw):
                     return self._finalize_web_research(
-                        url=_responses_url(self.base_url),
                         payload=candidate_payload,
                         headers=headers,
                         research_response=LLMResponse(
@@ -242,12 +239,12 @@ class LLMClient:
                     )
                 if attempt >= self.retries or not _increase_output_limit(candidate_payload):
                     break
-            except HTTPError as exc:
+            except APIStatusError as exc:
                 last_error = RuntimeError(_http_error_message(exc))
                 if attempt >= self.retries:
                     break
                 time.sleep(min(2**attempt, 8))
-            except (URLError, TimeoutError, RuntimeError) as exc:
+            except (APIError, TimeoutError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
@@ -259,7 +256,6 @@ class LLMClient:
     def _finalize_web_research(
         self,
         *,
-        url: str,
         payload: dict[str, Any],
         headers: dict[str, str],
         research_response: LLMResponse,
@@ -292,7 +288,7 @@ class LLMClient:
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
-                final_response = self._post_json(url, final_payload, headers)
+                final_response = self._request_json("responses", final_payload, headers)
                 combined_raw = dict(final_response.raw or {})
                 combined_raw["output"] = [
                     *_response_output_items(research_response.raw),
@@ -305,12 +301,12 @@ class LLMClient:
                 last_error = exc
                 if attempt >= self.retries or not _increase_output_limit(final_payload):
                     break
-            except HTTPError as exc:
+            except APIStatusError as exc:
                 last_error = RuntimeError(_http_error_message(exc))
                 if attempt >= self.retries:
                     break
                 time.sleep(min(2**attempt, 8))
-            except (URLError, TimeoutError, RuntimeError) as exc:
+            except (APIError, TimeoutError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
@@ -322,26 +318,35 @@ class LLMClient:
             f"finalization attempt(s): {last_error}"
         )
 
-    def _post_json(
+    def _request_json(
         self,
-        url: str,
+        api: Literal["chat", "responses"],
         payload: dict[str, Any],
         headers: dict[str, str],
         *,
         allow_empty: bool = False,
     ) -> LLMResponse:
-        request = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
-            body = response.read().decode("utf-8", errors="replace")
         try:
-            raw = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"LLM returned non-JSON HTTP content: {body[:400]}") from exc
+            with OpenAI(
+                api_key=os.environ.get(self.api_key_env) or "local-no-key",
+                base_url=_sdk_base_url(self.base_url),
+                timeout=self.timeout_seconds,
+                # ProtoLens owns retries, including output-budget and format fallbacks.
+                max_retries=0,
+            ) as client:
+                resource = client.chat.completions if api == "chat" else client.responses
+                # Keep compatible-server extension fields and exact evidence artifacts.
+                response = resource.with_raw_response.create(**payload, extra_headers=headers)
+                try:
+                    raw = json.loads(response.text)
+                except (ValueError, UnicodeError) as exc:
+                    raise RuntimeError(
+                        f"LLM returned non-JSON HTTP content: {response.text[:400]}"
+                    ) from exc
+        except APIConnectionError as exc:
+            raise RuntimeError(_connection_error_message(exc)) from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError("LLM returned JSON that is not an object")
         if _is_max_output_incomplete(raw):
             raise IncompleteLLMResponse(raw)
         response_error = _response_error(raw)
@@ -457,20 +462,12 @@ class LLMClient:
         }
 
 
-def _chat_completions_url(base_url: str) -> str:
+def _sdk_base_url(base_url: str) -> str:
     normalized = base_url.rstrip("/")
-    if normalized.endswith("/chat/completions"):
-        return normalized
-    return f"{normalized}/chat/completions"
-
-
-def _responses_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
-    if normalized.endswith("/chat/completions"):
-        normalized = normalized[: -len("/chat/completions")]
-    if normalized.endswith("/responses"):
-        return normalized
-    return f"{normalized}/responses"
+    for suffix in ("/chat/completions", "/responses"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)]
+    return normalized
 
 
 def _is_local_url(url: str) -> bool:
@@ -481,17 +478,22 @@ def _is_empty_response_error(error: Exception | None) -> bool:
     return bool(error and "LLM returned an empty response" in str(error))
 
 
-def _http_error_message(error: HTTPError, max_body_chars: int = 2000) -> str:
-    try:
-        body = error.read().decode("utf-8", errors="replace")
-    except Exception:
-        body = ""
-    body = body.strip()
+def _http_error_message(error: APIStatusError, max_body_chars: int = 2000) -> str:
+    body = error.response.text.strip()
     if len(body) > max_body_chars:
         body = body[:max_body_chars] + "...<truncated>"
     if body:
-        return f"HTTP Error {error.code}: {error.reason}; body={body}"
-    return f"HTTP Error {error.code}: {error.reason}"
+        return f"HTTP Error {error.status_code}: {error.response.reason_phrase}; body={body}"
+    return f"HTTP Error {error.status_code}: {error.response.reason_phrase}"
+
+
+def _connection_error_message(error: APIConnectionError) -> str:
+    cause: BaseException = error
+    seen: set[int] = set()
+    while cause.__cause__ is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        cause = cause.__cause__
+    return f"LLM connection failed: {type(cause).__name__}: {str(cause)[:2000]}"
 
 
 def _extract_response_text(raw: dict[str, Any]) -> str:
