@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import codecs
 from pathlib import Path
 from typing import Any
 import hashlib
@@ -329,6 +332,9 @@ class CorpusEncoder:
 
     def _encode_message(self, message: str, protocol: str, sequence: int) -> bytes:
         # AFLNet 自己按 CRLF/协议边界切分 seed，不能添加 replay 工具使用的长度前缀。
+        raw = _raw_message_bytes(message)
+        if raw is not None:
+            return raw
         request = _message_to_request(message, protocol, sequence)
         return request.encode("utf-8", errors="replace")
 
@@ -347,15 +353,18 @@ class CorpusEncoder:
         offset = 0
         mutation_set = {item for item in mutation_points if item >= 0}
         for index, message in enumerate(messages):
-            request = _message_to_request(message, protocol, sequence=index + 1)
-            encoded = request.encode("utf-8", errors="replace")
+            encoded = self._encode_message(message, protocol, sequence=index + 1)
             chunks.append(encoded)
+            request = encoded.decode("utf-8", errors="replace")
             byte_ranges.extend(_mutation_byte_ranges(request, offset, index, message, mutation_set))
             offset += len(encoded)
         return b"".join(chunks), byte_ranges
 
 
 def _message_to_request(message: str, protocol: str, sequence: int = 1) -> str:
+    raw = _raw_message_bytes(message)
+    if raw is not None:
+        return raw.decode("utf-8", errors="replace")
     method = _method(message)
     flags = _directives(message)
     directives = _directive_values(message)
@@ -437,6 +446,25 @@ def _ftp_command(message: str) -> str:
     if "malformed" in flags:
         arguments = {**arguments, method: "%%%PROTO%%%"}
     return f"{method} {arguments.get(method, '')}".rstrip() + "\r\n"
+
+
+def _raw_message_bytes(message: str) -> bytes | None:
+    text = str(message)
+    lowered = text.lower()
+    if lowered.startswith("raw-b64:") or lowered.startswith("base64:"):
+        _, payload = text.split(":", 1)
+        try:
+            return base64.b64decode(payload.strip(), validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("raw-b64 message contains invalid base64") from exc
+    if lowered.startswith("raw:"):
+        payload = text.split(":", 1)[1]
+        decoded = codecs.decode(payload, "unicode_escape")
+        try:
+            return decoded.encode("latin-1")
+        except UnicodeEncodeError:
+            return decoded.encode("utf-8", errors="replace")
+    return None
 
 
 def _fallback_request(protocol: str) -> bytes:

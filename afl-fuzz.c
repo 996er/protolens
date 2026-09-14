@@ -7932,11 +7932,15 @@ static u32 import_protolens_monitor_seeds(char** argv) {
     u8 *path, *marker;
     s32 fd, marker_fd;
     struct stat st;
+    u32 monitor_case = 0, before_queued = queued_paths, after_queued = queued_paths;
+    u32 receipt_region_count = 0, receipt_messages_sent = 0;
+    u8 receipt_executed = 0, receipt_fault = 255, receipt_saved = 0;
 
     if (qd_ent->d_name[0] == '.' || strstr(qd_ent->d_name, "README")) continue;
 
     path = alloc_printf("%s/%s", protolens_import_dir, qd_ent->d_name);
     marker = alloc_printf("%s/%s", processed_dir, qd_ent->d_name);
+    sscanf(qd_ent->d_name, "id:%06u", &monitor_case);
 
     if (!access((char*)marker, F_OK)) {
       ck_free(path);
@@ -7960,19 +7964,25 @@ static u32 import_protolens_monitor_seeds(char** argv) {
 
         region_t *regions;
         u32 region_count;
-        u32 before_queued = queued_paths;
 
         write_to_testcase(mem, st.st_size);
         regions = (*extract_requests)(mem, st.st_size, &region_count);
         kl_messages = construct_kl_messages(path, regions, region_count);
         fault = run_target(argv, exec_tmout);
+        receipt_executed = 1;
+        receipt_fault = fault;
+        receipt_region_count = region_count;
+        receipt_messages_sent = messages_sent;
+        before_queued = queued_paths;
 
         corpus_read_or_sync = 2;
         syncing_party = (u8*)"protolens_monitor";
-        syncing_case = 0;
-        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
+        syncing_case = monitor_case;
+        receipt_saved = save_if_interesting(argv, mem, st.st_size, fault);
+        queued_imported += receipt_saved;
         syncing_party = 0;
         corpus_read_or_sync = 0;
+        after_queued = queued_paths;
 
         if (queued_paths > before_queued) {
           imported++;
@@ -7998,7 +8008,21 @@ static u32 import_protolens_monitor_seeds(char** argv) {
 
     close(fd);
     marker_fd = open((char*)marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (marker_fd >= 0) close(marker_fd);
+    if (marker_fd >= 0) {
+      dprintf(marker_fd,
+              "{\"processed\":true,\"executed\":%s,\"fault\":%u,"
+              "\"saved_interesting\":%s,\"queued_before\":%u,\"queued_after\":%u,"
+              "\"region_count\":%u,\"messages_sent\":%u,\"seed_file\":\"%s\"}\n",
+              receipt_executed ? "true" : "false",
+              receipt_fault,
+              receipt_saved ? "true" : "false",
+              before_queued,
+              after_queued,
+              receipt_region_count,
+              receipt_messages_sent,
+              qd_ent->d_name);
+      close(marker_fd);
+    }
     ck_free(path);
     ck_free(marker);
 

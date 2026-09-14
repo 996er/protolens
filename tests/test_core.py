@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import io
 import json
 import threading
@@ -72,6 +73,21 @@ class CorpusEncoderTest(unittest.TestCase):
                 files[0].read_bytes(),
                 b"USER anonymous\r\nPASS protolens@example.com\r\n",
             )
+
+    def test_ftp_raw_modes_preserve_missing_arguments_and_binary_bytes(self) -> None:
+        encoder = CorpusEncoder()
+
+        missing_arg = encoder.payload_for_path(
+            PlannedStatePath("conflict", ["START"], ["raw:RETR\\r\\n"]),
+            "ftp",
+        )
+        binary_prefix = encoder.payload_for_path(
+            PlannedStatePath("conflict", ["START"], ["raw-b64:FgMBAAIAAA=="]),
+            "ftp",
+        )
+
+        self.assertEqual(missing_arg, b"RETR\r\n")
+        self.assertEqual(binary_prefix, b"\x16\x03\x01\x00\x02\x00\x00")
 
     def test_rewrite_removes_stale_generated_seed(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1047,6 +1063,199 @@ class ConfigAndAdapterTest(unittest.TestCase):
             conversations = agent.drain_llm_conversations()
             self.assertEqual(len(conversations), 1)
             self.assertIn("live AFLNet feedback", conversations[0]["system"])
+
+    def test_monitor_agent_uses_candidate_id_to_select_exact_path(self) -> None:
+        class CandidateMonitorLLM:
+            is_offline = False
+            provider = "fake"
+            model = "monitor"
+
+            def chat_json(
+                self,
+                *,
+                system: str,
+                user: str,
+                response_schema: dict | None = None,
+                schema_name: str = "",
+            ) -> LLMResponse:
+                self.payload = json.loads(user)
+                return LLMResponse(
+                    text=json.dumps(
+                        {
+                            "bottleneck_summary": "Same conflict has multiple paths; choose calibrated candidate.",
+                            "seed_candidates": [
+                                {
+                                    "conflict_id": "conflict",
+                                    "candidate_id": "path_good",
+                                    "messages": ["PASS"],
+                                    "rationale": "Use the accepted path candidate.",
+                                    "expected_new_coverage": "good candidate branch",
+                                }
+                            ],
+                        }
+                    ),
+                    provider="fake",
+                    model="monitor",
+                )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, dry_run=False)
+            dynamic = {
+                "stats_present": True,
+                "fuzzer_stats": {
+                    "execs_done": "100",
+                    "execs_per_sec": "50.0",
+                    "paths_total": "1",
+                    "last_path": "1",
+                    "bitmap_cvg": "1.0%",
+                },
+                "ipsm": {"nodes": 1, "edges": 0},
+                "queue_count": 1,
+                "queue_files": [],
+                "health_signals": [],
+            }
+            bad = PlannedStatePath("conflict", ["START", "BAD"], ["USER"], candidate_id="path_bad")
+            good = PlannedStatePath("conflict", ["START", "GOOD"], ["PASS"], candidate_id="path_good")
+            conflict = Conflict(
+                kind="fsm_divergence",
+                priority="P1",
+                state="GOOD",
+                transition=None,
+                description="two candidate paths",
+                expected_path=["START", "GOOD"],
+                fuzzing_strategy="choose candidate",
+                id="conflict",
+            )
+            result = FuzzResult("running", ["/bin/true"], str(root / "in"), str(root / "dict"), str(root / "out"))
+            llm = CandidateMonitorLLM()
+            agent = MonitorAgent(llm)
+            import time
+
+            self.assertEqual(agent.observe(config, result, dynamic, [bad, good], [conflict], force=True)["status"], "improving")
+            time.sleep(0.02)
+            decision = agent.observe(config, result, dynamic, [bad, good], [conflict], force=True)
+
+            self.assertEqual(decision["status"], "stagnant")
+            self.assertEqual(decision["generated_seeds"][0]["source_candidate_id"], "path_good")
+            self.assertEqual(llm.payload["planned_paths"][1]["candidate_id"], "path_good")
+            self.assertIn(b"PASS protolens@example.com\r\n", Path(decision["generated_seeds"][0]["path"]).read_bytes())
+
+    def test_monitor_agent_feeds_processed_receipts_back_to_llm(self) -> None:
+        class ReceiptMonitorLLM:
+            is_offline = False
+            provider = "fake"
+            model = "monitor"
+
+            def chat_json(
+                self,
+                *,
+                system: str,
+                user: str,
+                response_schema: dict | None = None,
+                schema_name: str = "",
+            ) -> LLMResponse:
+                self.payload = json.loads(user)
+                return LLMResponse(
+                    text=json.dumps(
+                        {
+                            "bottleneck_summary": "Use receipt feedback to avoid stale failed patterns.",
+                            "seed_candidates": [
+                                {
+                                    "conflict_id": "conflict",
+                                    "candidate_id": "path_receipt",
+                                    "messages": ["PASS"],
+                                    "rationale": "Try a password branch that differs from the prior receipt.",
+                                    "expected_new_coverage": "password handling",
+                                }
+                            ],
+                        }
+                    ),
+                    provider="fake",
+                    model="monitor",
+                )
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config(root, dry_run=False)
+            import_dir = config.run_dir / "monitor_import_queue"
+            processed_dir = import_dir / ".processed"
+            processed_dir.mkdir(parents=True)
+            seed_path = import_dir / "id:000001,src:protolens_monitor,seed_receipt"
+            seed_payload = b"USER anonymous\r\n"
+            seed_path.write_bytes(seed_payload)
+            (processed_dir / seed_path.name).write_text(
+                json.dumps(
+                    {
+                        "processed": True,
+                        "executed": True,
+                        "fault": 0,
+                        "saved_interesting": True,
+                        "queued_before": 1,
+                        "queued_after": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (config.run_dir / "monitor_seed_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "format": "protolens.monitor_seed_manifest.v1",
+                        "seed_count": 1,
+                        "canonical_keys": ["seed_receipt"],
+                        "payload_sha256s": [hashlib.sha256(seed_payload).hexdigest()],
+                        "seeds": [
+                            {
+                                "path": str(seed_path),
+                                "payload_sha256": hashlib.sha256(seed_payload).hexdigest(),
+                                "canonical_key": "seed_receipt",
+                                "conflict_id": "old_conflict",
+                                "source_candidate_id": "old_path",
+                                "messages": ["USER"],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dynamic = {
+                "stats_present": True,
+                "fuzzer_stats": {
+                    "execs_done": "100",
+                    "execs_per_sec": "50.0",
+                    "paths_total": "1",
+                    "last_path": "1",
+                    "bitmap_cvg": "1.0%",
+                },
+                "ipsm": {"nodes": 1, "edges": 0},
+                "queue_count": 2,
+                "queue_files": ["id:000123,sync:protolens_monitor,src:000001"],
+                "health_signals": [],
+            }
+            path = PlannedStatePath("conflict", ["START"], ["PASS"], candidate_id="path_receipt")
+            conflict = Conflict(
+                kind="fsm_divergence",
+                priority="P1",
+                state="START",
+                transition=None,
+                description="receipt feedback",
+                expected_path=["START"],
+                fuzzing_strategy="use receipts",
+                id="conflict",
+            )
+            result = FuzzResult("running", ["/bin/true"], str(root / "in"), str(root / "dict"), str(root / "out"))
+            llm = ReceiptMonitorLLM()
+            agent = MonitorAgent(llm)
+            import time
+
+            self.assertEqual(agent.observe(config, result, dynamic, [path], [conflict], force=True)["status"], "improving")
+            time.sleep(0.02)
+            self.assertEqual(agent.observe(config, result, dynamic, [path], [conflict], force=True)["status"], "stagnant")
+
+            feedback = llm.payload["monitor_seed_feedback"]
+            self.assertEqual(feedback["processed_count"], 1)
+            self.assertEqual(feedback["saved_interesting_count"], 1)
+            self.assertEqual(feedback["recent_saved"][0]["execution_receipt"]["outcome"], "saved_interesting")
 
     def test_monitor_agent_deduplicates_repeated_llm_seed_payloads(self) -> None:
         class RepeatingMonitorLLM:

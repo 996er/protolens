@@ -118,6 +118,7 @@ class MonitorAgent:
             )
 
         self._load_seed_manifest(config)
+        self._refresh_seed_receipts(config, dynamic)
         signature_key = _signature_key(signature)
         if (
             self._coverage_llm_calls.get(signature_key, 0)
@@ -286,6 +287,7 @@ class MonitorAgent:
             "planned_paths": _planned_path_context(planned_paths),
             "conflicts": _conflict_context(conflicts),
             "seed_feedback": _seed_feedback_context(seed_feedback),
+            "monitor_seed_feedback": _monitor_seed_feedback_context(self._load_seed_manifest(config)),
             "heuristic_seed_templates": _heuristic_seed_templates(planned_paths, config.protocol),
             "previous_monitor_seeds": _previous_seed_context(self._load_seed_manifest(config)),
             "required_output": {
@@ -293,11 +295,17 @@ class MonitorAgent:
                 "seed_candidates": [
                     {
                         "conflict_id": "id from planned_paths",
+                        "candidate_id": "candidate_id from planned_paths; prefer this over conflict_id when present",
                         "messages": ["client command/message sequence to encode as one AFLNet seed"],
                         "rationale": "why this sequence may reach a stronger guarded state",
                         "expected_new_coverage": "state/guard/branch expected to be exercised",
                     }
                 ],
+                "raw_payloads": (
+                    "For FTP, use raw:<escaped bytes> or raw-b64:<base64 bytes> when the test requires missing "
+                    "arguments, unusual whitespace, command fragmentation, or binary prefixes. Plain FTP command "
+                    "messages may be normalized by ProtoLens."
+                ),
             },
         }
         system = (
@@ -355,21 +363,32 @@ class MonitorAgent:
         import_dir.mkdir(parents=True, exist_ok=True)
         (import_dir / ".processed").mkdir(exist_ok=True)
         conflict_index = {conflict.id: conflict for conflict in conflicts}
-        path_index = {path.conflict_id: path for path in planned_paths}
+        path_by_candidate = {path.candidate_id: path for path in planned_paths if path.candidate_id}
+        paths_by_conflict: dict[str, list[PlannedStatePath]] = {}
+        for path in planned_paths:
+            paths_by_conflict.setdefault(path.conflict_id, []).append(path)
         written: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for candidate in analysis.get("seed_candidates", []):
             conflict_id = str(candidate["conflict_id"])
-            path = path_index.get(conflict_id)
-            if path is None or not path.reachable:
-                skipped.append({"conflict_id": conflict_id, "reason": "unknown or unreachable conflict_id"})
+            candidate_id = str(candidate.get("candidate_id", "")).strip()
+            path = _select_candidate_path(candidate_id, conflict_id, path_by_candidate, paths_by_conflict)
+            if path is None:
+                skipped.append(
+                    {
+                        "conflict_id": conflict_id,
+                        "candidate_id": candidate_id,
+                        "reason": "unknown, ambiguous, or unreachable candidate path",
+                    }
+                )
                 continue
-            messages = [str(item).strip() for item in candidate["messages"] if str(item).strip()]
+            messages = [_candidate_message_text(item) for item in candidate["messages"]]
+            messages = [message for message in messages if message]
             messages = [message for message in messages if _client_message(message, config.protocol)]
             if not messages:
-                skipped.append({"conflict_id": conflict_id, "reason": "empty client-sendable message sequence"})
+                skipped.append({"conflict_id": conflict_id, "candidate_id": candidate_id, "reason": "empty client-sendable message sequence"})
                 continue
-            canonical_key = _candidate_key(conflict_id, messages)
+            canonical_key = _candidate_key(path.candidate_id or conflict_id, messages)
             payload_path = PlannedStatePath(
                 conflict_id=f"{conflict_id}.monitor",
                 states=list(path.states),
@@ -381,13 +400,14 @@ class MonitorAgent:
             )
             payload = self.encoder.payload_for_path(payload_path, config.protocol)
             if not payload:
-                skipped.append({"conflict_id": conflict_id, "reason": "protocol encoder produced an empty payload"})
+                skipped.append({"conflict_id": conflict_id, "candidate_id": candidate_id, "reason": "protocol encoder produced an empty payload"})
                 continue
             payload_sha256 = hashlib.sha256(payload).hexdigest()
             if canonical_key in self._generated_keys or payload_sha256 in self._generated_payload_hashes:
                 skipped.append(
                     {
                         "conflict_id": conflict_id,
+                        "candidate_id": candidate_id,
                         "reason": "duplicate_monitor_seed",
                         "canonical_key": canonical_key,
                         "payload_sha256": payload_sha256,
@@ -409,6 +429,7 @@ class MonitorAgent:
                 "payload_sha256": payload_sha256,
                 "canonical_key": canonical_key,
                 "conflict_id": conflict_id,
+                "source_candidate_id": path.candidate_id,
                 "priority": conflict.priority if conflict else "P2",
                 "states": path.states,
                 "messages": messages,
@@ -417,6 +438,7 @@ class MonitorAgent:
                 "reason": str(candidate.get("rationale", "")),
                 "expected_new_coverage": str(candidate.get("expected_new_coverage", "")),
                 "source": "llm_monitor_analysis",
+                "execution_receipt": {"processed": False, "outcome": "pending_import"},
                 "coverage_semantics": (
                     "imported as a candidate; AFLNet save_if_interesting decides whether it produced real new coverage"
                 ),
@@ -465,6 +487,7 @@ class MonitorAgent:
         return self._seed_manifest(config)
 
     def _seed_manifest(self, config: ProtoLensConfig) -> dict[str, Any]:
+        self._refresh_seed_receipts(config, None)
         return {
             "format": "protolens.monitor_seed_manifest.v1",
             "seed_count": len(self._manifest_seeds),
@@ -477,6 +500,7 @@ class MonitorAgent:
         }
 
     def _write_seed_manifest(self, config: ProtoLensConfig) -> None:
+        self._refresh_seed_receipts(config, None)
         path = self.manifest_path(config)
         path.parent.mkdir(parents=True, exist_ok=True)
         seed_by_hash = {
@@ -519,6 +543,33 @@ class MonitorAgent:
         tmp_path = path.with_name(f".{path.name}.tmp")
         tmp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         tmp_path.replace(path)
+
+    def _refresh_seed_receipts(self, config: ProtoLensConfig, dynamic: dict[str, Any] | None) -> None:
+        if not self._manifest_seeds:
+            return
+        import_dir = self.import_dir(config)
+        processed_dir = import_dir / ".processed"
+        queue_files = [str(item) for item in dynamic.get("queue_files", [])] if isinstance(dynamic, dict) else []
+        for seed in self._manifest_seeds:
+            if not isinstance(seed, dict):
+                continue
+            seed_name = Path(str(seed.get("path", ""))).name
+            if not seed_name:
+                continue
+            receipt = dict(seed.get("execution_receipt", {})) if isinstance(seed.get("execution_receipt"), dict) else {}
+            marker = processed_dir / seed_name
+            if marker.is_file():
+                receipt.update(_read_processed_receipt(marker))
+                receipt["processed"] = True
+            else:
+                receipt.setdefault("processed", False)
+            queue_matches = _monitor_queue_matches(seed, queue_files)
+            if queue_matches:
+                receipt["queue_files"] = queue_matches[:10]
+            saved = bool(receipt.get("saved_interesting")) or bool(queue_matches)
+            receipt["saved_interesting"] = saved
+            receipt["outcome"] = _receipt_outcome(receipt)
+            seed["execution_receipt"] = receipt
 
     def _scan_existing_import_seeds(self, config: ProtoLensConfig) -> None:
         import_dir = self.import_dir(config)
@@ -571,6 +622,7 @@ MONITOR_ANALYSIS_SCHEMA: dict[str, Any] = {
                 "required": ["conflict_id", "messages", "rationale", "expected_new_coverage"],
                 "properties": {
                     "conflict_id": {"type": "string", "minLength": 1},
+                    "candidate_id": {"type": "string"},
                     "messages": {
                         "type": "array",
                         "minItems": 1,
@@ -611,7 +663,8 @@ def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(item, dict):
             raise ValueError("monitor seed candidate must be an object")
         conflict_id = str(item.get("conflict_id", "")).strip()
-        messages = [str(value).strip() for value in item.get("messages", []) if str(value).strip()]
+        messages = [_candidate_message_text(value) for value in item.get("messages", [])]
+        messages = [message for message in messages if message]
         rationale = str(item.get("rationale", "")).strip()
         expected = str(item.get("expected_new_coverage", "")).strip()
         if not conflict_id or not messages or not rationale or not expected:
@@ -621,6 +674,7 @@ def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
         candidates.append(
             {
                 "conflict_id": conflict_id,
+                "candidate_id": str(item.get("candidate_id", "")).strip(),
                 "messages": messages[:32],
                 "rationale": rationale,
                 "expected_new_coverage": expected,
@@ -647,12 +701,15 @@ def _planned_path_context(planned_paths: list[PlannedStatePath]) -> list[dict[st
     return [
         {
             "conflict_id": path.conflict_id,
+            "candidate_id": path.candidate_id,
             "states": path.states,
             "messages": path.messages,
+            "transition_ids": path.transition_ids,
             "required_guards": path.required_guards,
             "mutation_points": path.mutation_points,
             "reachable": path.reachable,
             "reason": path.reason,
+            "calibration": path.calibration,
         }
         for path in planned_paths[:120]
     ]
@@ -684,6 +741,7 @@ def _heuristic_seed_templates(planned_paths: list[PlannedStatePath], protocol: s
             templates.append(
                 {
                     "conflict_id": path.conflict_id,
+                    "candidate_id": path.candidate_id,
                     "messages": variant["messages"],
                     "reason": variant["reason"],
                     "required_guards": path.required_guards,
@@ -729,13 +787,40 @@ def _candidate_key(conflict_id: str, messages: list[str]) -> str:
     return stable_id(f"seed_{digest}", conflict_id, label)
 
 
+def _select_candidate_path(
+    candidate_id: str,
+    conflict_id: str,
+    path_by_candidate: dict[str, PlannedStatePath],
+    paths_by_conflict: dict[str, list[PlannedStatePath]],
+) -> PlannedStatePath | None:
+    if candidate_id:
+        path = path_by_candidate.get(candidate_id)
+        return path if path is not None and path.reachable else None
+    reachable = [path for path in paths_by_conflict.get(conflict_id, []) if path.reachable]
+    if len(reachable) == 1:
+        return reachable[0]
+    return None
+
+
 def _normalize_seed_message(message: str) -> str:
+    if _is_raw_seed_message(message):
+        return str(message)
     normalized = " ".join(str(message).strip().split())
     if not normalized:
         return ""
     parts = normalized.split(" ", 1)
     command = parts[0].upper()
     return command if len(parts) == 1 else f"{command} {parts[1]}"
+
+
+def _candidate_message_text(value: Any) -> str:
+    text = str(value)
+    return text if _is_raw_seed_message(text) else text.strip()
+
+
+def _is_raw_seed_message(message: str) -> bool:
+    lowered = str(message).lower()
+    return lowered.startswith("raw:") or lowered.startswith("raw-b64:") or lowered.startswith("base64:")
 
 
 def _previous_seed_context(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -747,13 +832,66 @@ def _previous_seed_context(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         context.append(
             {
                 "conflict_id": seed.get("conflict_id", ""),
+                "source_candidate_id": seed.get("source_candidate_id", ""),
                 "canonical_key": seed.get("canonical_key", ""),
                 "payload_sha256": seed.get("payload_sha256", ""),
                 "messages": list(seed.get("messages", []))[:16] if isinstance(seed.get("messages"), list) else [],
                 "expected_new_coverage": seed.get("expected_new_coverage", ""),
+                "execution_receipt": _compact_receipt(seed.get("execution_receipt")),
             }
         )
     return context
+
+
+def _monitor_seed_feedback_context(manifest: dict[str, Any]) -> dict[str, Any]:
+    seeds = [seed for seed in manifest.get("seeds", []) if isinstance(seed, dict)] if isinstance(manifest, dict) else []
+    processed = [seed for seed in seeds if isinstance(seed.get("execution_receipt"), dict) and seed["execution_receipt"].get("processed")]
+    saved = [seed for seed in seeds if isinstance(seed.get("execution_receipt"), dict) and seed["execution_receipt"].get("saved_interesting")]
+    pending = [seed for seed in seeds if seed not in processed]
+    failed = [
+        seed
+        for seed in processed
+        if isinstance(seed.get("execution_receipt"), dict) and not seed["execution_receipt"].get("saved_interesting")
+    ]
+    return {
+        "present": bool(seeds),
+        "seed_count": len(seeds),
+        "processed_count": len(processed),
+        "saved_interesting_count": len(saved),
+        "pending_count": len(pending),
+        "recent_saved": [_monitor_seed_sample(seed) for seed in saved[-12:]],
+        "recent_processed_without_new_coverage": [_monitor_seed_sample(seed) for seed in failed[-12:]],
+        "recent_pending": [_monitor_seed_sample(seed) for seed in pending[-12:]],
+    }
+
+
+def _monitor_seed_sample(seed: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "conflict_id": seed.get("conflict_id", ""),
+        "source_candidate_id": seed.get("source_candidate_id", ""),
+        "canonical_key": seed.get("canonical_key", ""),
+        "messages": list(seed.get("messages", []))[:12] if isinstance(seed.get("messages"), list) else [],
+        "expected_new_coverage": seed.get("expected_new_coverage", ""),
+        "execution_receipt": _compact_receipt(seed.get("execution_receipt")),
+    }
+
+
+def _compact_receipt(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, dict):
+        return {"processed": False, "outcome": "pending_import"}
+    keys = (
+        "processed",
+        "executed",
+        "saved_interesting",
+        "outcome",
+        "fault",
+        "queued_before",
+        "queued_after",
+        "region_count",
+        "messages_sent",
+        "queue_files",
+    )
+    return {key: receipt[key] for key in keys if key in receipt}
 
 
 def _seed_feedback_context(seed_feedback: dict[str, Any] | None) -> dict[str, Any]:
@@ -801,6 +939,53 @@ def _canonical_key_from_seed_name(name: str) -> str:
 def _event_index_from_path(path: Any) -> int:
     match = re.search(r"id:(\d+)", str(path))
     return int(match.group(1)) if match else 0
+
+
+def _read_processed_receipt(marker: Path) -> dict[str, Any]:
+    try:
+        text = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return {"processed": True}
+    if not text:
+        return {"processed": True}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {"processed": True, "raw_marker": text[:200]}
+    if not isinstance(data, dict):
+        return {"processed": True}
+    data["processed"] = True
+    return data
+
+
+def _monitor_queue_matches(seed: dict[str, Any], queue_files: list[str]) -> list[str]:
+    if not queue_files:
+        return []
+    seed_path = Path(str(seed.get("path", ""))).name
+    event_index = _event_index_from_path(seed_path)
+    tokens = {
+        str(seed.get("payload_sha256", ""))[:16],
+        str(seed.get("canonical_key", ""))[:32],
+    }
+    if event_index:
+        tokens.add(f"sync:protolens_monitor,src:{event_index:06d}")
+    if seed_path:
+        tokens.add(seed_path)
+    tokens = {token for token in tokens if token}
+    return [name for name in queue_files if any(token in name for token in tokens)]
+
+
+def _receipt_outcome(receipt: dict[str, Any]) -> str:
+    if receipt.get("saved_interesting"):
+        return "saved_interesting"
+    if not receipt.get("processed"):
+        return "pending_import"
+    if not receipt.get("executed", True):
+        return "processed_not_executed"
+    fault = receipt.get("fault")
+    if fault not in (None, 0, "0"):
+        return f"executed_fault_{fault}_no_new_coverage"
+    return "executed_no_new_coverage"
 
 
 def _dedupe_seed_records(seeds: list[dict[str, Any]]) -> list[dict[str, Any]]:
