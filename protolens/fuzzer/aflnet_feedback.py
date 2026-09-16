@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import hashlib
 import os
 import re
 import shutil
@@ -33,15 +34,17 @@ PLOT_FIELDS = [
 class AFLNetDynamicAnalyzer:
     """Read real AFLNet campaign outputs without inventing missing coverage data."""
 
-    def analyze(self, fuzz_result: FuzzResult) -> dict[str, Any]:
+    def analyze(self, fuzz_result: FuzzResult, protocol: str = "") -> dict[str, Any]:
         output_dir = Path(fuzz_result.output_dir)
         stats = _read_fuzzer_stats(output_dir / "fuzzer_stats")
         plot_rows = _read_plot_data(output_dir / "plot_data")
         last_plot = plot_rows[-1] if plot_rows else {}
-        queue = _list_files(output_dir / "queue")
+        queue_artifacts = _queue_artifacts(output_dir)
+        queue = [item["name"] for item in queue_artifacts]
         crashes = _list_files(output_dir / "replayable-crashes") or _list_files(output_dir / "crashes")
         hangs = _list_files(output_dir / "replayable-hangs") or _list_files(output_dir / "hangs")
         ipsm = _read_ipsm(output_dir / "ipsm.dot")
+        execution_fsm = _build_execution_fsm(output_dir, protocol, queue_artifacts, ipsm)
         health = _health_signals(fuzz_result, stats, last_plot, queue, crashes, hangs, ipsm)
         return {
             "format": "protolens.aflnet_dynamic_analysis.v1",
@@ -52,6 +55,7 @@ class AFLNetDynamicAnalyzer:
             "fuzzer_stats": stats,
             "latest_plot": last_plot,
             "ipsm": ipsm,
+            "execution_fsm": execution_fsm,
             "queue_files": queue[:200],
             "queue_count": len(queue),
             "crash_files": crashes[:200],
@@ -235,10 +239,13 @@ class ClosedLoopReplanner:
             )
         path_priorities.sort(key=lambda item: item["score"], reverse=True)
         seed_actions, seed_priorities = _seed_replanning(seed_feedback)
+        execution_frontier = _execution_frontier_plan(dynamic)
         return {
             "format": "protolens.closed_loop_replanning.v1",
             "based_on_dynamic_output": bool(dynamic.get("stats_present") or dynamic.get("plot_data_present")),
+            "execution_fsm_present": bool(execution_frontier),
             "actions": actions,
+            "next_round_execution_frontier": execution_frontier[:100],
             "next_round_path_priorities": path_priorities[:100],
             "seed_feedback_present": bool(seed_feedback and seed_feedback.get("seed_manifest_present")),
             "seed_actions": seed_actions,
@@ -490,6 +497,190 @@ def _list_files(path: Path) -> list[str]:
         for item in path.iterdir()
         if item.is_file() and not item.name.startswith((".", "README"))
     )
+
+
+def _queue_artifacts(output_dir: Path) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for directory_name in ("queue", "replayable-queue"):
+        directory = output_dir / directory_name
+        if not directory.exists():
+            continue
+        for item in sorted(directory.iterdir()):
+            if not item.is_file() or item.name.startswith((".", "README")):
+                continue
+            key = item.name
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed = _parse_afl_artifact_name(item.name)
+            artifacts.append(
+                {
+                    "name": item.name,
+                    "directory": directory_name,
+                    "path": item,
+                    "queue_id": parsed.get("queue_id", ""),
+                    "parent_queue_ids": parsed.get("parent_queue_ids", []),
+                    "origin_seed_file": parsed.get("origin_seed_file", ""),
+                    "has_new_coverage": "+cov" in item.name,
+                }
+            )
+    return sorted(artifacts, key=lambda item: (_queue_sort_key(str(item.get("queue_id", ""))), str(item.get("name", ""))))
+
+
+def _build_execution_fsm(
+    output_dir: Path,
+    protocol: str,
+    queue_artifacts: list[dict[str, Any]],
+    ipsm: dict[str, Any],
+) -> dict[str, Any]:
+    labels = [str(item) for item in ipsm.get("node_labels", [])]
+    states = [
+        {
+            "id": label,
+            "label": label,
+            "source": "aflnet_ipsm",
+            "observed": True,
+        }
+        for label in labels[:500]
+    ]
+    edges = [
+        {
+            "source": str(source),
+            "target": str(target),
+            "source_kind": "aflnet_ipsm_response_edge",
+            "observed": True,
+        }
+        for source, target in ipsm.get("edge_pairs", [])[:1000]
+    ]
+    candidates = _execution_frontier_candidates(queue_artifacts, protocol)
+    prefixes = _verified_prefixes(candidates)
+    return {
+        "format": "protolens.execution_fsm.v1",
+        "source": "aflnet_ipsm_and_queue",
+        "output_dir": str(output_dir),
+        "protocol": protocol,
+        "state_count": len(labels),
+        "edge_count": len(ipsm.get("edge_pairs", [])),
+        "states": states,
+        "edges": edges,
+        "frontier": {
+            "source": "aflnet_queue_payloads",
+            "queue_file_count": len(queue_artifacts),
+            "candidate_count": len(candidates),
+            "verified_prefixes": prefixes[:100],
+            "candidates": candidates[:80],
+            "policy": "monitor LLM should mutate only these verified command prefixes with small local edits",
+        },
+        "notes": [
+            "IPSM states and edges are campaign-global response observations.",
+            "Frontier candidates come from real queue payloads saved by AFLNet; they are executable seed prefixes.",
+        ],
+    }
+
+
+def _execution_frontier_candidates(queue_artifacts: list[dict[str, Any]], protocol: str) -> list[dict[str, Any]]:
+    ranked = sorted(
+        queue_artifacts,
+        key=lambda item: (
+            bool(item.get("has_new_coverage")),
+            _queue_sort_key(str(item.get("queue_id", ""))),
+        ),
+        reverse=True,
+    )
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for artifact in ranked[:240]:
+        path = artifact.get("path")
+        if not isinstance(path, Path):
+            continue
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        messages = _seed_message_summaries(payload, protocol)
+        commands = [item["method"] for item in messages if item.get("method")]
+        if not commands:
+            continue
+        key = tuple(commands[:16])
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(
+            {
+                "queue_id": artifact.get("queue_id", ""),
+                "queue_file": artifact.get("name", ""),
+                "directory": artifact.get("directory", ""),
+                "parent_queue_ids": list(artifact.get("parent_queue_ids", [])),
+                "origin_seed_file": artifact.get("origin_seed_file", ""),
+                "has_new_coverage": bool(artifact.get("has_new_coverage")),
+                "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+                "command_sequence": commands[:32],
+                "messages": messages[:32],
+                "mutation_scope": "small_local_mutation_on_verified_prefix",
+            }
+        )
+        if len(candidates) >= 80:
+            break
+    return candidates
+
+
+def _seed_message_summaries(payload: bytes, protocol: str) -> list[dict[str, str]]:
+    summaries: list[dict[str, str]] = []
+    for index, chunk in enumerate(_split_seed_messages(payload[:65536], protocol or "")):
+        line = chunk.splitlines()[0] if chunk.splitlines() else chunk[:80]
+        text = line.decode("utf-8", errors="replace").strip()
+        method = _message_method(text, protocol)
+        if not method:
+            continue
+        summaries.append(
+            {
+                "index": str(index),
+                "method": method,
+                "first_line": text[:160],
+            }
+        )
+    return summaries
+
+
+def _message_method(first_line: str, protocol: str) -> str:
+    if not first_line:
+        return ""
+    token = first_line.split()[0].upper() if first_line.split() else ""
+    if protocol.lower() in {"http", "rtsp", "daap-http"} and token in {"RTSP/1.0", "HTTP/1.1"}:
+        return ""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_.-]{1,24}", token):
+        return "RAW"
+    return token
+
+
+def _verified_prefixes(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prefixes: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for candidate in candidates:
+        commands = [str(item) for item in candidate.get("command_sequence", []) if str(item)]
+        for length in range(1, min(len(commands), 6) + 1):
+            prefix = tuple(commands[:length])
+            if prefix in seen:
+                continue
+            seen.add(prefix)
+            prefixes.append(
+                {
+                    "commands": list(prefix),
+                    "queue_file": candidate.get("queue_file", ""),
+                    "queue_id": candidate.get("queue_id", ""),
+                    "length": length,
+                }
+            )
+    return prefixes
+
+
+def _queue_sort_key(queue_id: str) -> int:
+    try:
+        return int(str(queue_id).strip())
+    except ValueError:
+        return -1
 
 
 def _artifact_names(dynamic: dict[str, Any], key: str, directories: tuple[str, ...]) -> list[str]:
@@ -745,6 +936,35 @@ def _seed_replanning(seed_feedback: dict[str, Any] | None) -> tuple[list[dict[st
                 }
             )
     return actions, priorities
+
+
+def _execution_frontier_plan(dynamic: dict[str, Any]) -> list[dict[str, Any]]:
+    execution_fsm = dynamic.get("execution_fsm", {}) if isinstance(dynamic, dict) else {}
+    if not isinstance(execution_fsm, dict):
+        return []
+    frontier = execution_fsm.get("frontier", {}) if isinstance(execution_fsm.get("frontier"), dict) else {}
+    plan: list[dict[str, Any]] = []
+    for candidate in frontier.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        commands = [str(item) for item in candidate.get("command_sequence", []) if str(item)]
+        if not commands:
+            continue
+        score = 200 + min(200, 10 * len(commands))
+        if candidate.get("has_new_coverage"):
+            score += 120
+        plan.append(
+            {
+                "queue_id": candidate.get("queue_id", ""),
+                "queue_file": candidate.get("queue_file", ""),
+                "score": min(600, score),
+                "command_sequence": commands[:32],
+                "mutation_scope": "small_local_mutation_on_verified_prefix",
+                "reason": "derived from AFLNet queue payload observed during execution",
+            }
+        )
+    plan.sort(key=lambda item: (-int(item["score"]), str(item.get("queue_id", ""))))
+    return plan
 
 
 def _crash_paths(output_dir: Path) -> list[Path]:

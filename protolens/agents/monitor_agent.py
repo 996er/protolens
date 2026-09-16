@@ -208,7 +208,7 @@ class MonitorAgent:
         self._coverage_llm_calls[signature_key] = self._coverage_llm_calls.get(signature_key, 0) + 1
         self._coverage_llm_failures.pop(signature_key, None)
         self._coverage_llm_retry_after.pop(signature_key, None)
-        seeds, skipped = self._write_llm_breakthrough_seeds(config, planned_paths, conflicts, analysis)
+        seeds, skipped = self._write_llm_breakthrough_seeds(config, planned_paths, conflicts, analysis, dynamic)
         decision = {
             "status": "stagnant" if seeds else "stagnant_no_seed",
             "reason": (
@@ -272,8 +272,9 @@ class MonitorAgent:
         payload = {
             "task": (
                 "Analyze why the AFLNet campaign is coverage-stagnant and return concrete protocol "
-                "seed candidates likely to break strong state guards. Use only client-sendable protocol "
-                "messages. Do not include transport actions such as TCP reset, half-close, or TLS renegotiation."
+                "seed candidates likely to break strong state guards. Mutate only the verified execution frontier "
+                "reconstructed from AFLNet IPSM/queue feedback. Use only client-sendable protocol messages. "
+                "Do not include transport actions such as TCP reset, half-close, or TLS renegotiation."
             ),
             "protocol": config.protocol,
             "target_name": config.target_name,
@@ -284,7 +285,8 @@ class MonitorAgent:
                 "hangs": fuzz_result.hangs[:20],
             },
             "dynamic_feedback": _compact_dynamic(dynamic),
-            "planned_paths": _planned_path_context(planned_paths),
+            "execution_frontier": _execution_frontier_context(dynamic),
+            "planned_paths": _planned_path_context(planned_paths, config.protocol),
             "conflicts": _conflict_context(conflicts),
             "seed_feedback": _seed_feedback_context(seed_feedback),
             "monitor_seed_feedback": _monitor_seed_feedback_context(self._load_seed_manifest(config)),
@@ -296,7 +298,8 @@ class MonitorAgent:
                     {
                         "conflict_id": "id from planned_paths",
                         "candidate_id": "candidate_id from planned_paths; prefer this over conflict_id when present",
-                        "messages": ["client command/message sequence to encode as one AFLNet seed"],
+                        "frontier_queue_id": "queue_id from execution_frontier.candidates when available",
+                        "messages": ["small mutation of a verified execution_frontier command sequence"],
                         "rationale": "why this sequence may reach a stronger guarded state",
                         "expected_new_coverage": "state/guard/branch expected to be exercised",
                     }
@@ -357,6 +360,7 @@ class MonitorAgent:
         planned_paths: list[PlannedStatePath],
         conflicts: list[Conflict],
         analysis: dict[str, Any],
+        dynamic: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         self._load_seed_manifest(config)
         import_dir = self.import_dir(config)
@@ -383,10 +387,21 @@ class MonitorAgent:
                 )
                 continue
             messages = [_candidate_message_text(item) for item in candidate["messages"]]
-            messages = [message for message in messages if message]
-            messages = [message for message in messages if _client_message(message, config.protocol)]
+            messages = [message for message in (_client_seed_message(message, config.protocol) for message in messages) if message]
             if not messages:
                 skipped.append({"conflict_id": conflict_id, "candidate_id": candidate_id, "reason": "empty client-sendable message sequence"})
+                continue
+            frontier_match = _frontier_match(messages, dynamic)
+            if frontier_match is not None and not frontier_match.get("matched"):
+                skipped.append(
+                    {
+                        "conflict_id": conflict_id,
+                        "candidate_id": candidate_id,
+                        "reason": "outside_verified_execution_frontier",
+                        "candidate_commands": frontier_match.get("candidate_commands", []),
+                        "required_frontier_examples": frontier_match.get("frontier_examples", []),
+                    }
+                )
                 continue
             canonical_key = _candidate_key(path.candidate_id or conflict_id, messages)
             payload_path = PlannedStatePath(
@@ -623,6 +638,7 @@ MONITOR_ANALYSIS_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "conflict_id": {"type": "string", "minLength": 1},
                     "candidate_id": {"type": "string"},
+                    "frontier_queue_id": {"type": "string"},
                     "messages": {
                         "type": "array",
                         "minItems": 1,
@@ -689,6 +705,7 @@ def _compact_dynamic(dynamic: dict[str, Any]) -> dict[str, Any]:
         "fuzzer_stats": dynamic.get("fuzzer_stats", {}),
         "latest_plot": dynamic.get("latest_plot", {}),
         "ipsm": dynamic.get("ipsm", {}),
+        "execution_fsm": _execution_fsm_summary(dynamic.get("execution_fsm", {})),
         "queue_count": dynamic.get("queue_count", 0),
         "queue_files": list(dynamic.get("queue_files", []))[:50],
         "crash_count": dynamic.get("crash_count", 0),
@@ -697,22 +714,68 @@ def _compact_dynamic(dynamic: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _planned_path_context(planned_paths: list[PlannedStatePath]) -> list[dict[str, Any]]:
-    return [
-        {
-            "conflict_id": path.conflict_id,
-            "candidate_id": path.candidate_id,
-            "states": path.states,
-            "messages": path.messages,
-            "transition_ids": path.transition_ids,
-            "required_guards": path.required_guards,
-            "mutation_points": path.mutation_points,
-            "reachable": path.reachable,
-            "reason": path.reason,
-            "calibration": path.calibration,
-        }
-        for path in planned_paths[:120]
-    ]
+def _execution_fsm_summary(execution_fsm: Any) -> dict[str, Any]:
+    if not isinstance(execution_fsm, dict):
+        return {"present": False}
+    frontier = execution_fsm.get("frontier", {}) if isinstance(execution_fsm.get("frontier"), dict) else {}
+    return {
+        "present": bool(execution_fsm.get("states") or frontier.get("candidates")),
+        "format": execution_fsm.get("format", ""),
+        "source": execution_fsm.get("source", ""),
+        "state_count": execution_fsm.get("state_count", 0),
+        "edge_count": execution_fsm.get("edge_count", 0),
+        "frontier_candidate_count": frontier.get("candidate_count", 0),
+    }
+
+
+def _execution_frontier_context(dynamic: dict[str, Any]) -> dict[str, Any]:
+    execution_fsm = dynamic.get("execution_fsm", {}) if isinstance(dynamic, dict) else {}
+    if not isinstance(execution_fsm, dict):
+        return {"present": False, "candidates": [], "verified_prefixes": []}
+    frontier = execution_fsm.get("frontier", {}) if isinstance(execution_fsm.get("frontier"), dict) else {}
+    candidates = []
+    for candidate in frontier.get("candidates", [])[:40]:
+        if not isinstance(candidate, dict):
+            continue
+        candidates.append(
+            {
+                "queue_id": candidate.get("queue_id", ""),
+                "queue_file": candidate.get("queue_file", ""),
+                "has_new_coverage": candidate.get("has_new_coverage", False),
+                "command_sequence": list(candidate.get("command_sequence", []))[:24],
+                "messages": list(candidate.get("messages", []))[:12],
+                "mutation_scope": candidate.get("mutation_scope", "small_local_mutation_on_verified_prefix"),
+            }
+        )
+    return {
+        "present": bool(candidates),
+        "policy": frontier.get("policy", "mutate only verified queue prefixes"),
+        "verified_prefixes": list(frontier.get("verified_prefixes", []))[:80],
+        "candidates": candidates,
+    }
+
+
+def _planned_path_context(planned_paths: list[PlannedStatePath], protocol: str) -> list[dict[str, Any]]:
+    context: list[dict[str, Any]] = []
+    for path in planned_paths[:120]:
+        client_messages = [message for message in (_client_seed_message(message, protocol) for message in path.messages) if message]
+        filtered = [message for message in path.messages if not _client_message(message, protocol)]
+        context.append(
+            {
+                "conflict_id": path.conflict_id,
+                "candidate_id": path.candidate_id,
+                "states": path.states,
+                "messages": client_messages,
+                "filtered_non_client_messages": filtered,
+                "transition_ids": path.transition_ids,
+                "required_guards": path.required_guards,
+                "mutation_points": path.mutation_points,
+                "reachable": path.reachable and bool(client_messages),
+                "reason": path.reason,
+                "calibration": path.calibration,
+            }
+        )
+    return context
 
 
 def _conflict_context(conflicts: list[Conflict]) -> list[dict[str, Any]]:
@@ -1052,7 +1115,7 @@ def _path_priority(path: PlannedStatePath, conflict: Conflict | None, dynamic: d
 
 
 def _path_variants(path: PlannedStatePath, protocol: str) -> list[dict[str, Any]]:
-    messages = [message for message in path.messages if _client_message(message, protocol)]
+    messages = [message for message in (_client_seed_message(message, protocol) for message in path.messages) if message]
     if not messages:
         return []
     guards = " ".join(path.required_guards).lower()
@@ -1134,8 +1197,141 @@ def _guard_commands(protocol: str, guards: str) -> list[str]:
 
 
 def _client_message(message: str, protocol: str) -> bool:
-    method = message.split()[0].upper() if message.split() else message.upper()
-    return not (protocol.lower() == "ftp" and method == "CONNECT")
+    return _client_seed_message(message, protocol) is not None
+
+
+def _client_seed_message(message: str, protocol: str) -> str | None:
+    text = str(message).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered.startswith(("raw:", "raw-b64:", "base64:")):
+        return text
+    normalized = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
+    internal_tokens = {
+        "accept",
+        "bind",
+        "client_thread",
+        "clientsocket",
+        "connection_handler",
+        "fork",
+        "getpeername",
+        "getsockname",
+        "invalid_socket",
+        "listen",
+        "poll",
+        "select",
+        "server",
+        "socket",
+        "thread",
+        "worker",
+    }
+    if "()" in text or any(token in normalized for token in internal_tokens):
+        return None
+    if " returns " in lowered or lowered.startswith(("return ", "on ", "when ")):
+        return None
+
+    parts = text.split()
+    if len(parts) >= 2 and parts[0].lower().replace("_", "-") == protocol.lower().replace("_", "-"):
+        method = parts[1].upper()
+        normalized_text = " ".join(parts[1:])
+    else:
+        method = parts[0].upper() if parts else text.upper()
+        normalized_text = text
+    method = method.rstrip(":")
+    protocol_methods = {
+        "ftp": {
+            "ABOR", "ACCT", "ALLO", "APPE", "AUTH", "CCC", "CDUP", "CWD", "DELE", "EPRT",
+            "EPSV", "FEAT", "HELP", "LIST", "MDTM", "MFMT", "MKD", "MLSD", "MLST", "MODE",
+            "NLST", "NOOP", "OPTS", "PASS", "PASV", "PBSZ", "PORT", "PROT", "PWD", "QUIT",
+            "REIN", "REST", "RETR", "RMD", "RNFR", "RNTO", "SITE", "SIZE", "SMNT", "STAT",
+            "STOR", "STOU", "STRU", "SYST", "TYPE", "USER", "XCUP", "XCWD", "XMKD", "XPWD",
+            "XRMD",
+        },
+        "rtsp": {
+            "ANNOUNCE", "DESCRIBE", "GET_PARAMETER", "OPTIONS", "PAUSE", "PLAY", "PLAY_NOTIFY",
+            "RECORD", "REDIRECT", "SET_PARAMETER", "SETUP", "TEARDOWN",
+        },
+        "smtp": {"AUTH", "DATA", "EHLO", "EXPN", "HELO", "HELP", "MAIL", "NOOP", "QUIT", "RCPT", "RSET", "STARTTLS", "VRFY"},
+        "http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
+        "daap-http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
+    }
+    commands = protocol_methods.get(protocol.lower())
+    if commands is not None:
+        return normalized_text if method in commands else None
+    return normalized_text if re.fullmatch(r"[A-Z][A-Z0-9_.-]{1,24}", method) else None
+
+
+def _frontier_match(messages: list[str], dynamic: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(dynamic, dict):
+        return None
+    execution_fsm = dynamic.get("execution_fsm", {})
+    if not isinstance(execution_fsm, dict):
+        return None
+    frontier = execution_fsm.get("frontier", {})
+    if not isinstance(frontier, dict):
+        return None
+    frontier_sequences = _frontier_command_sequences(frontier)
+    if not frontier_sequences:
+        return None
+    candidate_commands = [_message_method(message) for message in messages]
+    candidate_commands = [command for command in candidate_commands if command]
+    if not candidate_commands:
+        return {
+            "matched": False,
+            "candidate_commands": [],
+            "frontier_examples": frontier_sequences[:5],
+        }
+    for sequence in frontier_sequences:
+        required = min(2, len(sequence), len(candidate_commands))
+        if required <= 0:
+            continue
+        if candidate_commands[:required] == sequence[:required]:
+            return {
+                "matched": True,
+                "candidate_commands": candidate_commands,
+                "frontier_commands": sequence,
+                "matched_prefix_length": required,
+            }
+    return {
+        "matched": False,
+        "candidate_commands": candidate_commands,
+        "frontier_examples": frontier_sequences[:5],
+    }
+
+
+def _frontier_command_sequences(frontier: dict[str, Any]) -> list[list[str]]:
+    sequences: list[list[str]] = []
+    for candidate in frontier.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        commands = [str(item).upper() for item in candidate.get("command_sequence", []) if str(item)]
+        if commands:
+            sequences.append(commands)
+    for prefix in frontier.get("verified_prefixes", []):
+        if not isinstance(prefix, dict):
+            continue
+        commands = [str(item).upper() for item in prefix.get("commands", []) if str(item)]
+        if commands:
+            sequences.append(commands)
+    unique: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for sequence in sequences:
+        key = tuple(sequence)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(sequence)
+    return unique
+
+
+def _message_method(message: str) -> str:
+    text = str(message).strip()
+    if not text:
+        return ""
+    if text.lower().startswith(("raw:", "raw-b64:", "base64:")):
+        return "RAW"
+    return text.split()[0].upper().rstrip(":") if text.split() else ""
 
 
 def _dedupe_sequence(messages: list[str]) -> list[str]:

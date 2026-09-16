@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import traceback
 
 from protolens.agents.attacker_agent import AttackerAgent
 from protolens.agents.base_agent import AgentContext
@@ -456,7 +457,7 @@ class ProtoLensPipeline:
         *,
         campaign_complete: bool,
     ) -> dict[str, object]:
-        dynamic_analysis = self.dynamic_analyzer.analyze(fuzz_result)
+        dynamic_analysis = self.dynamic_analyzer.analyze(fuzz_result, self.config.protocol)
         dynamic_analysis["campaign_complete"] = campaign_complete
         dynamic_analysis["campaign_phase"] = fuzz_result.mode
         state_mapping = self.state_mapper.map(dynamic_analysis, planned_paths)
@@ -493,33 +494,59 @@ class ProtoLensPipeline:
         fuzz_result: FuzzResult,
         transport_manifest: dict[str, object],
     ) -> None:
-        dynamic_analysis = self._write_campaign_artifacts(
-            planned_paths,
-            conflicts,
-            fuzz_result,
-            transport_manifest,
-            campaign_complete=False,
-        )
-        seed_feedback = self._read_optional_json("seed_feedback.json")
-        decision = self.monitor_agent.observe(
-            self.config,
-            fuzz_result,
-            dynamic_analysis,
-            planned_paths,
-            conflicts,
-            seed_feedback=seed_feedback if isinstance(seed_feedback, dict) else None,
-        )
-        self._write_monitor_llm_conversations()
-        if decision is None:
-            return
-        self.store.append_jsonl("findings/monitor_agent.jsonl", decision)
-        self.logger.debug("wrote artifact", path=self.store.write_json("monitor_agent_report.json", self.monitor_agent.report()))
-        if decision.get("generated_seeds"):
-            self.logger.info(
-                "monitor agent injected breakthrough seeds",
-                generated=len(decision.get("generated_seeds", [])),
-                import_dir=decision.get("import_dir", ""),
+        try:
+            dynamic_analysis = self._write_campaign_artifacts(
+                planned_paths,
+                conflicts,
+                fuzz_result,
+                transport_manifest,
+                campaign_complete=False,
             )
+            seed_feedback = self._read_optional_json("seed_feedback.json")
+            decision = self.monitor_agent.observe(
+                self.config,
+                fuzz_result,
+                dynamic_analysis,
+                planned_paths,
+                conflicts,
+                seed_feedback=seed_feedback if isinstance(seed_feedback, dict) else None,
+            )
+            self._write_monitor_llm_conversations()
+            if decision is None:
+                return
+            self.store.append_jsonl("findings/monitor_agent.jsonl", decision)
+            self.logger.debug("wrote artifact", path=self.store.write_json("monitor_agent_report.json", self.monitor_agent.report()))
+            if decision.get("generated_seeds"):
+                self.logger.info(
+                    "monitor agent injected breakthrough seeds",
+                    generated=len(decision.get("generated_seeds", [])),
+                    import_dir=decision.get("import_dir", ""),
+                )
+        except Exception as exc:
+            decision = {
+                "format": "protolens.monitor_agent_decision.v1",
+                "agent": "monitor_agent",
+                "status": "progress_error",
+                "reason": "progress analysis failed; AFLNet campaign is kept running",
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+                "traceback": traceback.format_exc(limit=20),
+                "fuzz_result": {
+                    "mode": fuzz_result.mode,
+                    "process_id": fuzz_result.process_id,
+                    "output_dir": fuzz_result.output_dir,
+                },
+            }
+            self.store.append_jsonl("findings/monitor_agent.jsonl", decision)
+            self.logger.error(
+                "fuzz progress handling failed; keeping AFLNet campaign running",
+                error=exc,
+                process_id=fuzz_result.process_id,
+            )
+            try:
+                self._write_monitor_llm_conversations()
+                self.store.write_json("monitor_agent_report.json", self.monitor_agent.report())
+            except Exception as report_exc:
+                self.logger.error("failed to write monitor failure report", error=report_exc)
 
     def _write_monitor_llm_conversations(self) -> None:
         for conversation in self.monitor_agent.drain_llm_conversations():

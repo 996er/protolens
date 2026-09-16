@@ -206,11 +206,31 @@ class AFLNetAdapter:
                 "campaign interrupted by user",
             )
         except OSError as exc:
+            if process is not None and process.poll() is None:
+                _terminate_process_group(process)
             return replace(
                 prepared,
                 mode="error",
+                process_id=process.pid if process else None,
+                exit_code=1,
+                started_at=started_at,
                 completed_at=_utc_now(),
                 notes=_replace_terminal_note(prepared.notes, f"failed to start AFLNet: {exc}"),
+            )
+        except Exception as exc:
+            if process is not None and process.poll() is None:
+                _terminate_process_group(process)
+            return replace(
+                prepared,
+                mode="error",
+                process_id=process.pid if process else None,
+                exit_code=1,
+                started_at=started_at,
+                completed_at=_utc_now(),
+                notes=_replace_terminal_note(
+                    prepared.notes,
+                    f"ProtoLens aborted AFLNet campaign after internal error: {type(exc).__name__}: {exc}",
+                ),
             )
 
     def prepare_and_run(
