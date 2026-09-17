@@ -11,6 +11,7 @@ import time
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import Conflict, FuzzResult, PlannedStatePath, stable_id
 from protolens.tools.corpus_encoder import CorpusEncoder
+from protolens.utils.client_messages import client_seed_message
 from protolens.utils.llm_client import LLMClient
 
 
@@ -1201,65 +1202,7 @@ def _client_message(message: str, protocol: str) -> bool:
 
 
 def _client_seed_message(message: str, protocol: str) -> str | None:
-    text = str(message).strip()
-    if not text:
-        return None
-    lowered = text.lower()
-    if lowered.startswith(("raw:", "raw-b64:", "base64:")):
-        return text
-    normalized = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
-    internal_tokens = {
-        "accept",
-        "bind",
-        "client_thread",
-        "clientsocket",
-        "connection_handler",
-        "fork",
-        "getpeername",
-        "getsockname",
-        "invalid_socket",
-        "listen",
-        "poll",
-        "select",
-        "server",
-        "socket",
-        "thread",
-        "worker",
-    }
-    if "()" in text or any(token in normalized for token in internal_tokens):
-        return None
-    if " returns " in lowered or lowered.startswith(("return ", "on ", "when ")):
-        return None
-
-    parts = text.split()
-    if len(parts) >= 2 and parts[0].lower().replace("_", "-") == protocol.lower().replace("_", "-"):
-        method = parts[1].upper()
-        normalized_text = " ".join(parts[1:])
-    else:
-        method = parts[0].upper() if parts else text.upper()
-        normalized_text = text
-    method = method.rstrip(":")
-    protocol_methods = {
-        "ftp": {
-            "ABOR", "ACCT", "ALLO", "APPE", "AUTH", "CCC", "CDUP", "CWD", "DELE", "EPRT",
-            "EPSV", "FEAT", "HELP", "LIST", "MDTM", "MFMT", "MKD", "MLSD", "MLST", "MODE",
-            "NLST", "NOOP", "OPTS", "PASS", "PASV", "PBSZ", "PORT", "PROT", "PWD", "QUIT",
-            "REIN", "REST", "RETR", "RMD", "RNFR", "RNTO", "SITE", "SIZE", "SMNT", "STAT",
-            "STOR", "STOU", "STRU", "SYST", "TYPE", "USER", "XCUP", "XCWD", "XMKD", "XPWD",
-            "XRMD",
-        },
-        "rtsp": {
-            "ANNOUNCE", "DESCRIBE", "GET_PARAMETER", "OPTIONS", "PAUSE", "PLAY", "PLAY_NOTIFY",
-            "RECORD", "REDIRECT", "SET_PARAMETER", "SETUP", "TEARDOWN",
-        },
-        "smtp": {"AUTH", "DATA", "EHLO", "EXPN", "HELO", "HELP", "MAIL", "NOOP", "QUIT", "RCPT", "RSET", "STARTTLS", "VRFY"},
-        "http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
-        "daap-http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
-    }
-    commands = protocol_methods.get(protocol.lower())
-    if commands is not None:
-        return normalized_text if method in commands else None
-    return normalized_text if re.fullmatch(r"[A-Z][A-Z0-9_.-]{1,24}", method) else None
+    return client_seed_message(message, protocol)
 
 
 def _frontier_match(messages: list[str], dynamic: dict[str, Any] | None) -> dict[str, Any] | None:

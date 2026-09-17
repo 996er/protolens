@@ -9,6 +9,7 @@ import hashlib
 import json
 
 from protolens.fsm.fsm_model import PlannedStatePath, SeedIntent
+from protolens.utils.client_messages import PROTOCOL_METHODS, client_seed_message
 
 
 class CorpusEncoder:
@@ -79,7 +80,11 @@ class CorpusEncoder:
             if not intent.reachable or not intent.messages:
                 skipped.append({"seed_id": intent.seed_id, "reason": "unreachable or empty messages"})
                 continue
-            payload, byte_ranges = self._payload_and_ranges(intent.messages, protocol, intent.mutation_points)
+            messages = _normalized_messages(intent.messages, protocol)
+            if not messages:
+                skipped.append({"seed_id": intent.seed_id, "reason": "no client-send protocol messages after filtering"})
+                continue
+            payload, byte_ranges = self._payload_and_ranges(messages, protocol, intent.mutation_points)
             if not payload:
                 skipped.append({"seed_id": intent.seed_id, "reason": "protocol encoder produced an empty payload"})
                 continue
@@ -87,7 +92,7 @@ class CorpusEncoder:
             if payload_sha256 in entry_by_payload:
                 physical = entry_by_payload[payload_sha256]
                 coalesced = physical.setdefault("coalesced_intents", [])
-                coalesced.append(_intent_audit_record(intent))
+                coalesced.append(_intent_audit_record(intent, messages))
                 skipped.append(
                     {
                         "seed_id": intent.seed_id,
@@ -115,7 +120,7 @@ class CorpusEncoder:
                 "variant": intent.variant,
                 "objective": intent.objective,
                 "states": list(intent.states),
-                "messages": list(intent.messages),
+                "messages": messages,
                 "mutation_points": list(intent.mutation_points),
                 "byte_ranges": byte_ranges,
                 "required_guards": list(intent.required_guards),
@@ -127,7 +132,7 @@ class CorpusEncoder:
                 "reason": intent.reason,
                 "source_path_index": intent.source_path_index,
                 "source_candidate_id": intent.source_candidate_id,
-                "coalesced_intents": [_intent_audit_record(intent)],
+                "coalesced_intents": [_intent_audit_record(intent, messages)],
             }
             entries.append(entry)
             entry_by_payload[payload_sha256] = entry
@@ -194,7 +199,8 @@ class CorpusEncoder:
         tokens: set[str] = set()
         for path in paths:
             for message in path.messages:
-                head = message.split()[0].upper() if message.split() else message.upper()
+                normalized = client_seed_message(message, "generic")
+                head = normalized.split()[0].upper() if normalized and normalized.split() else ""
                 if head:
                     tokens.add(head)
         tokens.update({"Session:", "CSeq:", "Content-Length:", "Transport:"})
@@ -226,7 +232,8 @@ class CorpusEncoder:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         entries: list[dict[str, object]] = []
         for index, path in enumerate(paths):
-            if not path.reachable or not path.messages or not self._payload_for_path(path, protocol):
+            messages = _normalized_messages(path.messages, protocol)
+            if not path.reachable or not messages or not self._payload_for_path(path, protocol):
                 continue
             mutation_points = sorted({item for item in path.mutation_points if item >= 0})
             weight = _queue_weight(path, mutation_points)
@@ -236,7 +243,7 @@ class CorpusEncoder:
                     "conflict_id": path.conflict_id,
                     "weight": weight,
                     "mutation_points": mutation_points,
-                    "messages": list(path.messages),
+                    "messages": messages,
                     "required_guards": list(path.required_guards),
                     "reason": "weighted from mutation_points and required guards",
                 }
@@ -332,10 +339,13 @@ class CorpusEncoder:
 
     def _encode_message(self, message: str, protocol: str, sequence: int) -> bytes:
         # AFLNet 自己按 CRLF/协议边界切分 seed，不能添加 replay 工具使用的长度前缀。
-        raw = _raw_message_bytes(message)
+        normalized = client_seed_message(message, protocol)
+        if normalized is None:
+            return b""
+        raw = _raw_message_bytes(normalized)
         if raw is not None:
             return raw
-        request = _message_to_request(message, protocol, sequence)
+        request = _message_to_request(normalized, protocol, sequence)
         return request.encode("utf-8", errors="replace")
 
     def _payload_for_path(self, path: PlannedStatePath, protocol: str) -> bytes:
@@ -354,6 +364,8 @@ class CorpusEncoder:
         mutation_set = {item for item in mutation_points if item >= 0}
         for index, message in enumerate(messages):
             encoded = self._encode_message(message, protocol, sequence=index + 1)
+            if not encoded:
+                continue
             chunks.append(encoded)
             request = encoded.decode("utf-8", errors="replace")
             byte_ranges.extend(_mutation_byte_ranges(request, offset, index, message, mutation_set))
@@ -415,12 +427,21 @@ def _message_to_request(message: str, protocol: str, sequence: int = 1) -> str:
     return f"{message}\r\n"
 
 
+def _normalized_messages(messages: list[str], protocol: str) -> list[str]:
+    return [
+        normalized
+        for message in messages
+        for normalized in [client_seed_message(message, protocol)]
+        if normalized
+    ]
+
+
 def _ftp_command(message: str) -> str:
     method = _method(message)
     flags = _directives(message)
     argument = _argument_text(message)
     # CONNECT 表示服务端 greeting，不是客户端可发送的 FTP 命令。
-    if method == "CONNECT":
+    if method == "CONNECT" or method not in PROTOCOL_METHODS["ftp"]:
         return ""
     arguments = {
         "USER": "anonymous",
@@ -554,7 +575,7 @@ def _argument_text(message: str) -> str:
     return " ".join(parts[1:]).strip() if len(parts) > 1 else ""
 
 
-def _intent_audit_record(intent: SeedIntent) -> dict[str, Any]:
+def _intent_audit_record(intent: SeedIntent, messages: list[str] | None = None) -> dict[str, Any]:
     return {
         "seed_id": intent.seed_id,
         "conflict_id": intent.conflict_id,
@@ -562,7 +583,7 @@ def _intent_audit_record(intent: SeedIntent) -> dict[str, Any]:
         "variant": intent.variant,
         "objective": intent.objective,
         "states": list(intent.states),
-        "messages": list(intent.messages),
+        "messages": list(messages if messages is not None else intent.messages),
         "mutation_points": list(intent.mutation_points),
         "required_guards": list(intent.required_guards),
         "expected_feedback": list(intent.expected_feedback),

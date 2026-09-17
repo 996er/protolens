@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from protolens.fsm.fsm_model import Conflict, PlannedStatePath, SeedIntent, stable_id
+from protolens.fsm.fsm_model import Conflict, PlannedStatePath, ProtocolFSM, SeedIntent, StateTransition, stable_id
+from protolens.utils.client_messages import client_seed_message, transition_client_seed_message
 
 
 class StateAwareTestSynthesizer:
@@ -14,6 +15,7 @@ class StateAwareTestSynthesizer:
         planned_paths: list[PlannedStatePath],
         conflicts: list[Conflict],
         protocol: str,
+        fsm: ProtocolFSM | None = None,
     ) -> list[SeedIntent]:
         conflict_index = {conflict.id: conflict for conflict in conflicts}
         counters: dict[str, int] = defaultdict(int)
@@ -24,8 +26,8 @@ class StateAwareTestSynthesizer:
                 continue
             conflict = conflict_index.get(path.conflict_id)
             family_id = stable_id("family", path.conflict_id)
-            for variant in _variants_for_path(path, conflict, protocol):
-                messages = _clean_messages(variant["messages"])
+            for variant in _variants_for_path(path, conflict, protocol, fsm):
+                messages = _clean_messages(variant["messages"], protocol)
                 if not messages:
                     continue
                 key = (path.conflict_id, tuple(_canonical_message(item) for item in messages))
@@ -57,8 +59,13 @@ class StateAwareTestSynthesizer:
         return intents
 
 
-def _variants_for_path(path: PlannedStatePath, conflict: Conflict | None, protocol: str) -> list[dict[str, Any]]:
-    messages = _clean_messages(path.messages)
+def _variants_for_path(
+    path: PlannedStatePath,
+    conflict: Conflict | None,
+    protocol: str,
+    fsm: ProtocolFSM | None = None,
+) -> list[dict[str, Any]]:
+    messages = _clean_messages(path.messages, protocol)
     variants: list[dict[str, Any]] = [
         {
             "variant": "baseline_valid_prefix",
@@ -75,7 +82,7 @@ def _variants_for_path(path: PlannedStatePath, conflict: Conflict | None, protoc
     last_index = _last_mutation_index(path, messages)
     guards = " ".join(path.required_guards + ([conflict.description] if conflict else [])).lower()
 
-    direct = _direct_trigger_messages(path, conflict, messages)
+    direct = _direct_trigger_messages(path, conflict, messages, protocol, fsm)
     if direct:
         variants.append(
             {
@@ -161,22 +168,39 @@ def _variants_for_path(path: PlannedStatePath, conflict: Conflict | None, protoc
     return variants
 
 
-def _direct_trigger_messages(path: PlannedStatePath, conflict: Conflict | None, messages: list[str]) -> list[str]:
+def _direct_trigger_messages(
+    path: PlannedStatePath,
+    conflict: Conflict | None,
+    messages: list[str],
+    protocol: str,
+    fsm: ProtocolFSM | None,
+) -> list[str]:
     if not conflict or not conflict.transition:
         return []
-    trigger = conflict.transition.split("->", 1)[0].strip()
-    if "--" in trigger:
-        trigger = trigger.split("--", 1)[1].strip()
-    trigger = trigger.split()[0] if trigger.split() else ""
+    transition = _resolve_transition(fsm, conflict.transition)
+    trigger = transition_client_seed_message(transition, protocol) if transition else None
+    if trigger is None:
+        label_trigger = conflict.transition.split("->", 1)[0].strip()
+        if "--" in label_trigger:
+            label_trigger = label_trigger.split("--", 1)[1].strip()
+        trigger = client_seed_message(label_trigger, protocol)
     if not trigger:
         return []
-    source = conflict.state
-    prefix: list[str] = []
-    for state, message in zip(path.states, messages):
-        if state == source:
-            break
-        prefix.append(message)
-    return prefix + [trigger]
+    if transition and transition.id in path.transition_ids:
+        index = path.transition_ids.index(transition.id)
+        return messages[:index] + [trigger]
+    if trigger in messages:
+        return messages[: messages.index(trigger) + 1]
+    return messages + [trigger]
+
+
+def _resolve_transition(fsm: ProtocolFSM | None, transition_id: str) -> StateTransition | None:
+    if fsm is None:
+        return None
+    for transition in fsm.transitions:
+        if transition.id == transition_id:
+            return transition
+    return None
 
 
 def _missing_guard_messages(messages: list[str], guards: str, protocol: str, last_index: int) -> list[str]:
@@ -248,8 +272,13 @@ def _append_directive(message: str, directive: str) -> str:
     return message if f"--{directive}" in message else f"{message} --{directive}"
 
 
-def _clean_messages(messages: list[str]) -> list[str]:
-    return [str(message).strip() for message in messages if str(message).strip()]
+def _clean_messages(messages: list[str], protocol: str) -> list[str]:
+    return [
+        normalized
+        for message in messages
+        for normalized in [client_seed_message(str(message), protocol)]
+        if normalized
+    ]
 
 
 def _method(message: str) -> str:

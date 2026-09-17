@@ -374,7 +374,7 @@ class ProtoLensPipeline:
                          selected=len(planned_paths), probes=calibration["probe_count"],
                          statuses=calibration["status_counts"])
         planned_paths.extend(self.cross_layer_fuzzer.synthesize_interleavings(conflicts))
-        seed_intents = self.state_aware_synthesizer.synthesize(planned_paths, conflicts, self.config.protocol)
+        seed_intents = self.state_aware_synthesizer.synthesize(planned_paths, conflicts, self.config.protocol, fsm=fsm)
         transport_manifest = self.cross_layer_fuzzer.transport_harness_manifest(planned_paths)
         self.logger.debug("wrote artifact", path=self.store.write_json("planned_paths.json", planned_paths))
         self.logger.debug("wrote artifact", path=self.store.write_json("seed_intents.json", seed_intents))

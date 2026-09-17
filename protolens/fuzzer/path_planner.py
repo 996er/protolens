@@ -6,6 +6,7 @@ import json
 import re
 
 from protolens.fsm.fsm_model import Conflict, PlannedStatePath, ProtocolFSM, StateTransition
+from protolens.utils.client_messages import transition_client_seed_message
 
 
 class PathPlanner:
@@ -53,7 +54,14 @@ class PathPlanner:
             transitions = transitions + [disputed]
             states = states + [disputed.target]
         guards = [transition.guard for transition in transitions if transition.guard]
-        messages = [transition.trigger for transition in transitions]
+        client_steps = [
+            (transition, message)
+            for transition in transitions
+            for message in [transition_client_seed_message(transition, fsm.protocol)]
+            if message
+        ]
+        messages = [message for _, message in client_steps]
+        transition_ids = [transition.id for transition, _ in client_steps]
         identity = json.dumps([conflict.id, states, [item.id for item in transitions], messages, guards], ensure_ascii=True)
         if conflict.transition:
             mutation_points = [max(len(messages) - 1, 0)]
@@ -68,7 +76,7 @@ class PathPlanner:
             reachable=True,
             reason="graph candidate; guards and runtime state are not yet verified",
             candidate_id="path_" + hashlib.sha256(identity.encode()).hexdigest()[:24],
-            transition_ids=[item.id for item in transitions],
+            transition_ids=transition_ids,
             calibration={"status": "candidate", "accepted_prefix_length": 0, "state_verified": False},
         )
 
@@ -101,6 +109,9 @@ class PathPlanner:
 def _find_disputed_transition(fsm: ProtocolFSM, source: str, label: str | None) -> StateTransition | None:
     if not label:
         return None
+    for transition in fsm.transitions:
+        if transition.id == label:
+            return transition
     trigger, target = _parse_transition_label(label)
     for transition in fsm.outgoing(source):
         trigger_matches = not trigger or transition.trigger.lower() == trigger.lower()
