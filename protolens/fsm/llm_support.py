@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 import json
 import re
@@ -98,6 +98,7 @@ class LLMConversationRecorder:
         payload: dict[str, Any],
         schema: dict[str, Any],
         schema_name: str,
+        validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         return self._call(
             system=system,
@@ -106,6 +107,7 @@ class LLMConversationRecorder:
             schema_name=schema_name,
             web_search=False,
             allowed_domains=None,
+            validator=validator,
         )
 
     def call_web(
@@ -163,6 +165,7 @@ class LLMConversationRecorder:
         web_search: bool,
         allowed_domains: list[str] | None,
         max_tool_calls: int | None = None,
+        validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         data, _ = self._call_with_response(
             system=system,
@@ -172,6 +175,7 @@ class LLMConversationRecorder:
             web_search=web_search,
             allowed_domains=allowed_domains,
             max_tool_calls=max_tool_calls,
+            validator=validator,
         )
         return data
 
@@ -185,6 +189,7 @@ class LLMConversationRecorder:
         web_search: bool,
         allowed_domains: list[str] | None,
         max_tool_calls: int | None = None,
+        validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         last_error: Exception | None = None
@@ -224,6 +229,8 @@ class LLMConversationRecorder:
                 }
                 data = load_json_object(response.text)
                 validate_json_schema(data, schema)
+                if validator is not None:
+                    validator(data)
                 record["final_status"] = "success"
                 self._conversations.append(record)
                 return data, response
@@ -276,7 +283,13 @@ def validate_fsm(fsm: ProtocolFSM) -> None:
     transition_ids: set[str] = set()
     for transition in fsm.transitions:
         if transition.source not in fsm.states or transition.target not in fsm.states:
-            raise ValueError(f"transition {transition.id!r} references an unknown state")
+            missing = sorted({transition.source, transition.target} - set(fsm.states))
+            raise ValueError(
+                f"transition {transition.id!r} references an unknown state: "
+                f"source={transition.source!r}, target={transition.target!r}, missing={missing!r}. "
+                "Each endpoint must exactly match a declared states[].name; "
+                "correct the endpoint or declare the evidence-backed state."
+            )
         if transition.id in transition_ids:
             raise ValueError(f"duplicate transition id: {transition.id}")
         transition_ids.add(transition.id)

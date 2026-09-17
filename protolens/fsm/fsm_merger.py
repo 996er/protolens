@@ -85,11 +85,19 @@ class FSMMerger:
                 "Do not silently drop any input transition.",
                 "Map every input transition id in transition_sources to its unified transition.",
                 "Never cite evidence absent from the two input FSMs.",
+                "Every transition source and target must exactly match a name in unified_fsm.states.",
+                "When renaming or merging states, update all transition endpoints and initial/terminal/error state references.",
             ],
             "specification_fsm": spec_fsm.to_dict(),
             "implementation_fsm": impl_fsm.to_dict(),
         }
-        data = self.recorder.call_chat(
+        result: tuple[ProtocolFSM, list[Divergence]] | None = None
+
+        def validate_result(data: dict[str, Any]) -> None:
+            nonlocal result
+            result = self._parse_merge_result(data, spec_fsm, impl_fsm)
+
+        self.recorder.call_chat(
             system=(
                 "You are ProtoLens FSM conflict analyst and merger. Compare the two evidence-backed models. "
                 "The specification is normative; implementation behavior remains in the unified graph so later "
@@ -98,7 +106,14 @@ class FSMMerger:
             payload=payload,
             schema=MERGE_RESULT_SCHEMA,
             schema_name="protolens_fsm_merge",
+            validator=validate_result,
         )
+        assert result is not None
+        return result
+
+    def _parse_merge_result(
+        self, data: dict[str, Any], spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM
+    ) -> tuple[ProtocolFSM, list[Divergence]]:
         unified = fsm_from_llm(
             data.get("unified_fsm"),
             builder="LLMFSMMerger",
