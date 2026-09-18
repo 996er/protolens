@@ -8,6 +8,11 @@
   "run_command": "/home/ubuntu/experiments/LightFTP/Source/Release/fftp /home/ubuntu/experiments/lightftp/fftp.conf 2200",
   "host": "127.0.0.1",
   "port": 2200,
+  "transport_harness": {
+  "enabled": true,
+  "timeout_seconds": 3.0,
+  "max_actions": 20
+  },
   "run_dir": "/home/ubuntu/experiments/runs/ftp-fftp-openai",
   "aflnet": {
     "binary": "/home/ubuntu/protolens/afl-fuzz",

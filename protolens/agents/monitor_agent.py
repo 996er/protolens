@@ -291,6 +291,10 @@ class MonitorAgent:
             "conflicts": _conflict_context(conflicts),
             "seed_feedback": _seed_feedback_context(seed_feedback),
             "monitor_seed_feedback": _monitor_seed_feedback_context(self._load_seed_manifest(config)),
+            "frontier_feedback": _frontier_feedback_context(
+                self._load_seed_manifest(config),
+                config.monitor_agent.frontier_failure_threshold,
+            ),
             "heuristic_seed_templates": _heuristic_seed_templates(planned_paths, config.protocol),
             "previous_monitor_seeds": _previous_seed_context(self._load_seed_manifest(config)),
             "required_output": {
@@ -404,6 +408,24 @@ class MonitorAgent:
                     }
                 )
                 continue
+            frontier_key = _candidate_frontier_key(candidate, messages, frontier_match)
+            bucket = _frontier_bucket_status(
+                self._manifest_seeds,
+                frontier_key,
+                config.monitor_agent.frontier_failure_threshold,
+            )
+            if bucket.get("suppressed"):
+                skipped.append(
+                    {
+                        "conflict_id": conflict_id,
+                        "candidate_id": candidate_id,
+                        "reason": "frontier_bucket_suppressed",
+                        "frontier_key": frontier_key,
+                        "failed_without_new_coverage": bucket.get("failed_without_new_coverage", 0),
+                        "failure_threshold": bucket.get("failure_threshold", 0),
+                    }
+                )
+                continue
             canonical_key = _candidate_key(path.candidate_id or conflict_id, messages)
             payload_path = PlannedStatePath(
                 conflict_id=f"{conflict_id}.monitor",
@@ -446,6 +468,9 @@ class MonitorAgent:
                 "canonical_key": canonical_key,
                 "conflict_id": conflict_id,
                 "source_candidate_id": path.candidate_id,
+                "frontier_key": frontier_key,
+                "frontier_queue_id": str(candidate.get("frontier_queue_id", "")).strip(),
+                "frontier_commands": frontier_match.get("frontier_commands", []) if isinstance(frontier_match, dict) else [],
                 "priority": conflict.priority if conflict else "P2",
                 "states": path.states,
                 "messages": messages,
@@ -692,6 +717,7 @@ def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
             {
                 "conflict_id": conflict_id,
                 "candidate_id": str(item.get("candidate_id", "")).strip(),
+                "frontier_queue_id": str(item.get("frontier_queue_id", "")).strip(),
                 "messages": messages[:32],
                 "rationale": rationale,
                 "expected_new_coverage": expected,
@@ -929,10 +955,71 @@ def _monitor_seed_feedback_context(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _frontier_feedback_context(manifest: dict[str, Any], failure_threshold: int) -> dict[str, Any]:
+    seeds = [seed for seed in manifest.get("seeds", []) if isinstance(seed, dict)] if isinstance(manifest, dict) else []
+    buckets: dict[str, dict[str, Any]] = {}
+    for seed in seeds:
+        key = str(seed.get("frontier_key", "") or "").strip()
+        if not key:
+            messages = list(seed.get("messages", [])) if isinstance(seed.get("messages"), list) else []
+            key = _frontier_key_from_messages(messages)
+        if not key:
+            continue
+        bucket = buckets.setdefault(
+            key,
+            {
+                "frontier_key": key,
+                "seed_count": 0,
+                "processed_count": 0,
+                "saved_interesting_count": 0,
+                "failed_without_new_coverage": 0,
+                "pending_count": 0,
+                "suppressed": False,
+                "failure_threshold": failure_threshold,
+                "recent_messages": [],
+            },
+        )
+        bucket["seed_count"] += 1
+        receipt = seed.get("execution_receipt") if isinstance(seed.get("execution_receipt"), dict) else {}
+        if receipt.get("processed"):
+            bucket["processed_count"] += 1
+            if receipt.get("saved_interesting"):
+                bucket["saved_interesting_count"] += 1
+            else:
+                bucket["failed_without_new_coverage"] += 1
+        else:
+            bucket["pending_count"] += 1
+        messages = list(seed.get("messages", []))[:12] if isinstance(seed.get("messages"), list) else []
+        if messages:
+            bucket["recent_messages"] = messages
+    for bucket in buckets.values():
+        bucket["suppressed"] = (
+            bucket["saved_interesting_count"] == 0
+            and bucket["failed_without_new_coverage"] >= failure_threshold
+        )
+    ordered = sorted(
+        buckets.values(),
+        key=lambda item: (
+            not bool(item["suppressed"]),
+            -int(item["failed_without_new_coverage"]),
+            str(item["frontier_key"]),
+        ),
+    )
+    return {
+        "present": bool(ordered),
+        "failure_threshold": failure_threshold,
+        "bucket_count": len(ordered),
+        "suppressed_count": sum(1 for item in ordered if item["suppressed"]),
+        "buckets": ordered[:40],
+        "policy": "do not generate more seeds for a frontier bucket after repeated processed_no_new_coverage receipts",
+    }
+
+
 def _monitor_seed_sample(seed: dict[str, Any]) -> dict[str, Any]:
     return {
         "conflict_id": seed.get("conflict_id", ""),
         "source_candidate_id": seed.get("source_candidate_id", ""),
+        "frontier_key": seed.get("frontier_key", ""),
         "canonical_key": seed.get("canonical_key", ""),
         "messages": list(seed.get("messages", []))[:12] if isinstance(seed.get("messages"), list) else [],
         "expected_new_coverage": seed.get("expected_new_coverage", ""),
@@ -956,6 +1043,44 @@ def _compact_receipt(receipt: Any) -> dict[str, Any]:
         "queue_files",
     )
     return {key: receipt[key] for key in keys if key in receipt}
+
+
+def _frontier_bucket_status(seeds: list[dict[str, Any]], frontier_key: str, failure_threshold: int) -> dict[str, Any]:
+    if not frontier_key:
+        return {"frontier_key": "", "suppressed": False, "failure_threshold": failure_threshold}
+    manifest = {"seeds": seeds}
+    for bucket in _frontier_feedback_context(manifest, failure_threshold).get("buckets", []):
+        if bucket.get("frontier_key") == frontier_key:
+            return bucket
+    return {
+        "frontier_key": frontier_key,
+        "seed_count": 0,
+        "processed_count": 0,
+        "saved_interesting_count": 0,
+        "failed_without_new_coverage": 0,
+        "pending_count": 0,
+        "suppressed": False,
+        "failure_threshold": failure_threshold,
+    }
+
+
+def _candidate_frontier_key(candidate: dict[str, Any], messages: list[str], frontier_match: dict[str, Any] | None) -> str:
+    queue_id = str(candidate.get("frontier_queue_id", "") or "").strip()
+    if queue_id:
+        return "queue:" + queue_id
+    if isinstance(frontier_match, dict):
+        commands = [str(item).upper() for item in frontier_match.get("frontier_commands", []) if str(item)]
+        if commands:
+            return "cmd:" + "/".join(commands[:6])
+    return _frontier_key_from_messages(messages)
+
+
+def _frontier_key_from_messages(messages: list[str]) -> str:
+    commands = [_message_method(message) for message in messages]
+    commands = [command for command in commands if command]
+    if not commands:
+        return ""
+    return "cmd:" + "/".join(commands[:6])
 
 
 def _seed_feedback_context(seed_feedback: dict[str, Any] | None) -> dict[str, Any]:

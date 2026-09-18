@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 import re
 
+from protolens.utils.client_messages import normalize_transition_client_send
+
 Priority = Literal["P0", "P1", "P2"]
 
 
@@ -108,6 +110,10 @@ class ProtocolFSM:
     error_states: set[str] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        for transition in self.transitions:
+            normalize_transition_client_send(transition, self.protocol)
+
     def add_state(self, name: str, description: str = "", evidence: Evidence | None = None) -> None:
         if name not in self.states:
             self.states[name] = State(name=name, description=description)
@@ -115,6 +121,7 @@ class ProtocolFSM:
             self.states[name].evidence.append(evidence)
 
     def add_transition(self, transition: StateTransition) -> None:
+        normalize_transition_client_send(transition, self.protocol)
         self.add_state(transition.source)
         self.add_state(transition.target)
         for existing in self.transitions:

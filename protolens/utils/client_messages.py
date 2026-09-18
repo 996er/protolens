@@ -31,6 +31,16 @@ _CLIENT_SEND_TYPES = {
     "client_request",
     "client-request",
 }
+_SERVER_OR_INTERNAL_TYPES = {
+    "accept",
+    "ftp_client_thread",
+    "ftpmain",
+    "main",
+    "recvcmd",
+    "server_send",
+    "server_internal",
+    "workerthreadcleanup",
+}
 _SEMANTIC_ARGUMENT_LEADERS = {
     "after",
     "and",
@@ -87,6 +97,21 @@ def transition_client_seed_message(transition: Any, protocol: str) -> str | None
     if not is_client_send_transition(transition):
         return None
     return client_seed_message(str(getattr(transition, "trigger", "") or ""), protocol)
+
+
+def normalize_transition_client_send(transition: Any, protocol: str) -> None:
+    """Mark protocol-command transitions as client_send while leaving server/internal events intact."""
+
+    message_type = str(getattr(transition, "message_type", "") or "").strip()
+    normalized_type = re.sub(r"[^a-z0-9]+", "_", message_type.lower()).strip("_")
+    if is_client_send_transition(transition) or normalized_type in _SERVER_OR_INTERNAL_TYPES:
+        return
+    if normalized_type in _INTERNAL_TOKENS:
+        return
+    trigger_message = client_seed_message(str(getattr(transition, "trigger", "") or ""), protocol)
+    type_message = client_seed_message(message_type, protocol) if message_type else None
+    if trigger_message or type_message:
+        setattr(transition, "message_type", "client_send")
 
 
 def client_seed_message(message: str, protocol: str) -> str | None:

@@ -55,6 +55,7 @@ class AFLNetMonitorConfig:
     max_seed_batch: int = 8
     max_llm_calls_per_stagnation_signature: int = 1
     max_llm_failures_per_stagnation_signature: int = 3
+    frontier_failure_threshold: int = 3
     llm_failure_backoff_seconds: float = 120.0
     import_dir: Path | None = None
 
@@ -74,6 +75,7 @@ class AFLNetMonitorConfig:
             max_llm_failures_per_stagnation_signature=int(
                 data.get("max_llm_failures_per_stagnation_signature", 3)
             ),
+            frontier_failure_threshold=int(data.get("frontier_failure_threshold", 3)),
             llm_failure_backoff_seconds=float(data.get("llm_failure_backoff_seconds", 120.0)),
             import_dir=_resolve_path(base_dir or Path.cwd(), import_dir_value) if import_dir_value else None,
         )
@@ -340,6 +342,8 @@ class ProtoLensConfig:
             raise ValueError("monitor_agent.max_seed_batch must be positive")
         if self.monitor_agent.max_llm_calls_per_stagnation_signature <= 0:
             raise ValueError("monitor_agent.max_llm_calls_per_stagnation_signature must be positive")
+        if self.monitor_agent.frontier_failure_threshold <= 0:
+            raise ValueError("monitor_agent.frontier_failure_threshold must be positive")
         if self.transport_harness.timeout_seconds <= 0:
             raise ValueError("transport_harness.timeout_seconds must be positive")
         if self.transport_harness.max_actions < 0:
