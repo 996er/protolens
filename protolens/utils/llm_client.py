@@ -172,6 +172,7 @@ class LLMClient:
             "input": user,
             "max_output_tokens": self.max_tokens,
             "store": False,
+            "stream": True,
             "text": {
                 "format": {
                     "type": "json_schema",
@@ -201,7 +202,7 @@ class LLMClient:
 
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "text/event-stream",
             **self.extra_headers,
         }
         if api_key:
@@ -336,13 +337,30 @@ class LLMClient:
             ) as client:
                 resource = client.chat.completions if api == "chat" else client.responses
                 # Keep compatible-server extension fields and exact evidence artifacts.
-                response = resource.with_raw_response.create(**payload, extra_headers=headers)
-                try:
-                    raw = json.loads(response.text)
-                except (ValueError, UnicodeError) as exc:
-                    raise RuntimeError(
-                        f"LLM returned non-JSON HTTP content: {response.text[:400]}"
-                    ) from exc
+                if api == "responses" and payload.get("stream") is True:
+                    with resource.with_streaming_response.create(
+                        **payload,
+                        extra_headers=headers,
+                    ) as response:
+                        content_type = response.headers.get("content-type", "")
+                        if "text/event-stream" in content_type.lower():
+                            raw = _read_responses_stream(response.iter_lines())
+                        else:
+                            body = response.text
+                            try:
+                                raw = json.loads(body)
+                            except (ValueError, UnicodeError) as exc:
+                                raise RuntimeError(
+                                    f"LLM returned non-JSON HTTP content: {body[:400]}"
+                                ) from exc
+                else:
+                    response = resource.with_raw_response.create(**payload, extra_headers=headers)
+                    try:
+                        raw = json.loads(response.text)
+                    except (ValueError, UnicodeError) as exc:
+                        raise RuntimeError(
+                            f"LLM returned non-JSON HTTP content: {response.text[:400]}"
+                        ) from exc
         except APIConnectionError as exc:
             raise RuntimeError(_connection_error_message(exc)) from exc
         if not isinstance(raw, dict):
@@ -546,6 +564,96 @@ def _extract_response_text(raw: dict[str, Any]) -> str:
     if text.strip():
         return text
     return ""
+
+
+def _read_responses_stream(lines: Any) -> dict[str, Any]:
+    """Collect a Responses SSE stream into a response object usable by the normal parser."""
+
+    terminal_response: dict[str, Any] | None = None
+    terminal_error: dict[str, Any] | None = None
+    delta_parts: dict[tuple[str, int], list[str]] = {}
+    completed_parts: dict[tuple[str, int], str] = {}
+    event_name = ""
+    data_lines: list[str] = []
+
+    def consume_event() -> None:
+        nonlocal terminal_response, terminal_error, event_name, data_lines
+        if not data_lines:
+            event_name = ""
+            return
+        data_text = "\n".join(data_lines)
+        data_lines = []
+        current_event_name = event_name
+        event_name = ""
+        if data_text.strip() == "[DONE]":
+            return
+        try:
+            event = json.loads(data_text)
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(event, dict):
+            return
+
+        event_type = str(event.get("type") or current_event_name)
+        key = (
+            str(event.get("item_id") or event.get("output_index") or "0"),
+            int(event.get("content_index") or 0),
+        )
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                delta_parts.setdefault(key, []).append(delta)
+        elif event_type == "response.output_text.done":
+            text = event.get("text")
+            if isinstance(text, str):
+                completed_parts[key] = text
+
+        if event_type in {
+            "response.completed",
+            "response.incomplete",
+            "response.failed",
+            "response.cancelled",
+        }:
+            value = event.get("response")
+            if isinstance(value, dict):
+                terminal_response = value
+            elif event.get("object") == "response":
+                terminal_response = event
+        elif event_type == "error":
+            error = event.get("error")
+            terminal_error = error if isinstance(error, dict) else event
+
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+        if not line:
+            consume_event()
+        elif line.startswith(":"):
+            continue
+        elif line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    consume_event()
+
+    part_keys = dict.fromkeys([*delta_parts, *completed_parts])
+    streamed_text = "".join(
+        completed_parts.get(key, "".join(delta_parts.get(key, [])))
+        for key in part_keys
+    )
+    if terminal_response is None:
+        if terminal_error is not None:
+            return {"status": "failed", "error": terminal_error, "output": []}
+        if not streamed_text:
+            raise RuntimeError("LLM Responses stream ended without a final response or output text")
+        terminal_response = {"status": "completed", "output": []}
+
+    if streamed_text and not _extract_response_text(terminal_response).strip():
+        # Some compatible gateways send text deltas but omit their text from the
+        # terminal response object. Preserve the streamed answer for JSON parsing.
+        terminal_response = dict(terminal_response)
+        terminal_response["output_text"] = streamed_text
+    return terminal_response
 
 
 def _response_error(raw: dict[str, Any]) -> str:
