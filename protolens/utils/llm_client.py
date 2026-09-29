@@ -104,6 +104,7 @@ class LLMClient:
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "stream": True,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -119,7 +120,7 @@ class LLMClient:
             payloads.append(relaxed)
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "text/event-stream",
             **self.extra_headers,
         }
         if api_key:
@@ -337,14 +338,17 @@ class LLMClient:
             ) as client:
                 resource = client.chat.completions if api == "chat" else client.responses
                 # Keep compatible-server extension fields and exact evidence artifacts.
-                if api == "responses" and payload.get("stream") is True:
+                if payload.get("stream") is True:
                     with resource.with_streaming_response.create(
                         **payload,
                         extra_headers=headers,
                     ) as response:
                         content_type = response.headers.get("content-type", "")
                         if "text/event-stream" in content_type.lower():
-                            raw = _read_responses_stream(response.iter_lines())
+                            if api == "responses":
+                                raw = _read_responses_stream(response.iter_lines())
+                            else:
+                                raw = _read_chat_completions_stream(response.iter_lines())
                         else:
                             body = response.text
                             try:
@@ -654,6 +658,100 @@ def _read_responses_stream(lines: Any) -> dict[str, Any]:
         terminal_response = dict(terminal_response)
         terminal_response["output_text"] = streamed_text
     return terminal_response
+
+
+def _read_chat_completions_stream(lines: Any) -> dict[str, Any]:
+    """Collect a Chat Completions SSE stream into a normal response object."""
+
+    content_parts: dict[int, list[str]] = {}
+    reasoning_parts: dict[int, list[str]] = {}
+    tool_calls: dict[int, dict[str, Any]] = {}
+    finishes: dict[int, str | None] = {}
+    metadata: dict[str, Any] = {}
+    stream_error: dict[str, Any] | None = None
+    data_lines: list[str] = []
+
+    def consume_event() -> None:
+        nonlocal stream_error
+        if not data_lines:
+            return
+        data_text = "\n".join(data_lines)
+        data_lines.clear()
+        if data_text.strip() == "[DONE]":
+            return
+        try:
+            event = json.loads(data_text)
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        error = event.get("error")
+        if isinstance(error, dict):
+            stream_error = error
+            return
+        for key in ("id", "object", "created", "model", "system_fingerprint", "usage"):
+            if key in event:
+                metadata[key] = event[key]
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            return
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            index = int(choice.get("index", 0))
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                for key, target in (("content", content_parts), ("reasoning_content", reasoning_parts)):
+                    value = delta.get(key)
+                    if isinstance(value, str):
+                        target.setdefault(index, []).append(value)
+                calls = delta.get("tool_calls")
+                if isinstance(calls, list):
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        call_index = int(call.get("index", 0))
+                        current = tool_calls.setdefault(call_index, {"type": "function", "function": {"arguments": ""}})
+                        if "id" in call:
+                            current["id"] = call["id"]
+                        function = call.get("function")
+                        if isinstance(function, dict):
+                            target_function = current["function"]
+                            if "name" in function:
+                                target_function["name"] = function["name"]
+                            arguments = function.get("arguments")
+                            if isinstance(arguments, str):
+                                target_function["arguments"] += arguments
+            finish_reason = choice.get("finish_reason")
+            if finish_reason is not None:
+                finishes[index] = finish_reason
+
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+        if not line:
+            consume_event()
+        elif line.startswith(":") or line.startswith("event:"):
+            continue
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    consume_event()
+
+    if stream_error is not None:
+        return {**metadata, "error": stream_error, "choices": []}
+    if not content_parts and not reasoning_parts and not tool_calls:
+        raise RuntimeError("LLM Chat Completions stream ended without output text")
+    indices = sorted(set(content_parts) | set(reasoning_parts) | set(finishes) | {0})
+    choices = []
+    for index in indices:
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts.get(index, []))}
+        reasoning = "".join(reasoning_parts.get(index, []))
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        if tool_calls and index == 0:
+            message["tool_calls"] = [tool_calls[key] for key in sorted(tool_calls)]
+        choices.append({"index": index, "message": message, "finish_reason": finishes.get(index)})
+    return {**metadata, "choices": choices}
 
 
 def _response_error(raw: dict[str, Any]) -> str:
