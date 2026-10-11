@@ -1,34 +1,40 @@
 {
   "protocol": "rtsp",
-  "target_name": "sample-live555-openai",
-  "spec_paths": ["/home/ubuntu/protolens/benchmarks/specs/rtsp_minimal.txt"],
-  "source_root": "./sample_targets",
-  "entrypoints": ["rtsp_server.c"],
+  "target_name": "live555-openai",
+  "spec_paths": [
+    "/home/ubuntu/protolens/benchmarks/specs/rtsp_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/live555",
+  "entrypoints": [
+    "testProgs/testOnDemandRTSPServer.cpp",
+    "liveMedia/RTSPServer.cpp",
+    "liveMedia/GenericMediaServer.cpp"
+  ],
   "build_command": "",
-  "run_command": "./testOnDemandRTSPServer 8554",
+  "run_command": "/home/ubuntu/experiments/live555/testProgs/testOnDemandRTSPServer 8554",
   "host": "127.0.0.1",
   "port": 8554,
-  "run_dir": "../runs/rtsp-sample-openai",
+  "run_dir": "/home/ubuntu/experiments/runs/rtsp-live555-openai",
   "aflnet": {
     "binary": "/home/ubuntu/protolens/afl-fuzz",
-    "timeout_ms": 1000,
+    "timeout_ms": 5000,
     "duration_seconds": 0,
     "dry_run": false,
     "cmd": [
       "/home/ubuntu/protolens/afl-fuzz",
       "-d",
       "-i",
-      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/in-rtsp",
+      "/home/ubuntu/experiments/in-rtsp",
       "-o",
-      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/output",
+      "/home/ubuntu/experiments/runs/rtsp-live555-openai/output",
+      "-x",
+      "/home/ubuntu/experiments/rtsp.dict",
       "-N",
       "tcp://127.0.0.1/8554",
-      "-x",
-      "/home/ubuntu/profuzzbench/subjects/RTSP/Live555/rtsp.dict",
       "-P",
       "RTSP",
       "-D",
-      "1000000",
+      "10000",
       "-q",
       "3",
       "-s",
@@ -36,36 +42,64 @@
       "-E",
       "-K",
       "-R",
+      "-m",
+      "none",
+      "-t",
+      "5000",
       "--",
-      "./testOnDemandRTSPServer",
+      "/home/ubuntu/experiments/live555/testProgs/testOnDemandRTSPServer",
       "8554"
     ]
   },
   "fsm_build": {
     "rfc_queries": [
-      "latest authoritative RTSP RFCs including updates and obsolete relationships"
+      "latest authoritative RTSP RFCs including security extensions, updates, and obsolete relationships"
     ],
     "rfc_analysis_scope": [
-      "control connection lifecycle and states",
-      "authentication and command sequencing",
-      "data connection establishment",
-      "TLS and protocol security extensions",
-      "optional extensions evidenced as supported by the target implementation"
+      "RTSP connection and session lifecycle",
+      "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE and TEARDOWN sequencing",
+      "CSeq, Session headers, authentication and error responses",
+      "RTP/RTCP transport negotiation and interleaved data",
+      "target-supported RTSP versions and extensions"
     ],
     "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
     "allowed_rfc_domains": [
       "rfc-editor.org",
       "datatracker.ietf.org",
       "ietf.org"
     ],
-    "source_extensions": [".c", ".cc", ".cpp", ".h", ".hpp"],
+    "source_extensions": [
+      ".c",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".h",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
     "chunk_chars": 80000,
     "max_file_bytes": 2000000,
     "max_web_search_calls": 8
   },
   "llm": {
     "provider": "openai-compatible",
-    "model": "deepseek-v4-flash",
+    "model": "deepseek-v4-pro",
     "temperature": 0.0,
     "timeout_seconds": 180,
     "response_format": "json_object",
