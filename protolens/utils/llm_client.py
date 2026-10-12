@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 import json
+import logging
+import math
 import os
 import re
 import time
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -126,24 +132,26 @@ class LLMClient:
         if api_key:
             headers.setdefault("Authorization", f"Bearer {api_key}")
         last_error: Exception | None = None
+        attempts_used = 0
         for payload_index, candidate_payload in enumerate(payloads):
             for attempt in range(self.retries + 1):
+                attempts_used += 1
                 try:
                     return self._request_json("chat", candidate_payload, headers)
                 except APIStatusError as exc:
                     last_error = RuntimeError(_http_error_message(exc))
-                    if attempt >= self.retries:
+                    if attempt >= self.retries or not _is_retryable_http_error(exc):
                         break
-                    time.sleep(min(2**attempt, 8))
+                    self._wait_before_retry(attempt, exc)
                 except (APIError, TimeoutError, RuntimeError) as exc:
                     last_error = exc
                     if attempt >= self.retries:
                         break
-                    time.sleep(min(2**attempt, 8))
+                    self._wait_before_retry(attempt)
             if payload_index == 0 and _is_empty_response_error(last_error):
                 continue
             break
-        raise RuntimeError(f"LLM request failed after {self.retries + 1} attempt(s): {last_error}")
+        raise RuntimeError(f"LLM request failed after {attempts_used} attempt(s): {last_error}")
 
     def responses_json(
         self,
@@ -211,7 +219,9 @@ class LLMClient:
 
         last_error: Exception | None = None
         candidate_payload = dict(payload)
+        attempts_used = 0
         for attempt in range(self.retries + 1):
+            attempts_used += 1
             try:
                 response = self._request_json(
                     "responses",
@@ -219,41 +229,37 @@ class LLMClient:
                     headers,
                     allow_empty=web_search,
                 )
-                if web_search and not response.text.strip():
-                    return self._finalize_web_research(
-                        payload=candidate_payload,
-                        headers=headers,
-                        research_response=response,
-                    )
-                return response
             except IncompleteLLMResponse as exc:
                 last_error = exc
                 if web_search and _raw_used_web_search(exc.raw):
-                    return self._finalize_web_research(
-                        payload=candidate_payload,
-                        headers=headers,
-                        research_response=LLMResponse(
-                            text="",
-                            provider=self.provider,
-                            model=self.model,
-                            raw=exc.raw,
-                        ),
+                    response = LLMResponse(
+                        text="", provider=self.provider, model=self.model, raw=exc.raw,
                     )
-                if attempt >= self.retries or not _increase_output_limit(candidate_payload):
-                    break
+                else:
+                    if attempt >= self.retries or not _increase_output_limit(candidate_payload):
+                        break
+                    continue
             except APIStatusError as exc:
                 last_error = RuntimeError(_http_error_message(exc))
-                if attempt >= self.retries:
+                if attempt >= self.retries or not _is_retryable_http_error(exc):
                     break
-                time.sleep(min(2**attempt, 8))
+                self._wait_before_retry(attempt, exc)
+                continue
             except (APIError, TimeoutError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
-                time.sleep(min(2**attempt, 8))
+                self._wait_before_retry(attempt)
+                continue
+            # Finalization owns its retry budget. Its failures must not repeat web research.
+            if web_search and not response.text.strip():
+                return self._finalize_web_research(
+                    payload=candidate_payload, headers=headers, research_response=response,
+                )
+            return response
         if isinstance(last_error, IncompleteLLMResponse):
             raise last_error
-        raise RuntimeError(f"LLM Responses request failed after {self.retries + 1} attempt(s): {last_error}")
+        raise RuntimeError(f"LLM Responses request failed after {attempts_used} attempt(s): {last_error}")
 
     def _finalize_web_research(
         self,
@@ -288,7 +294,9 @@ class LLMClient:
         initial_limit = int(final_payload.get("max_output_tokens", self.max_tokens))
         final_payload["max_output_tokens"] = min(max(initial_limit * 2, 24000), 128000)
         last_error: Exception | None = None
+        attempts_used = 0
         for attempt in range(self.retries + 1):
+            attempts_used += 1
             try:
                 final_response = self._request_json("responses", final_payload, headers)
                 combined_raw = dict(final_response.raw or {})
@@ -305,20 +313,42 @@ class LLMClient:
                     break
             except APIStatusError as exc:
                 last_error = RuntimeError(_http_error_message(exc))
-                if attempt >= self.retries:
+                if attempt >= self.retries or not _is_retryable_http_error(exc):
                     break
-                time.sleep(min(2**attempt, 8))
+                self._wait_before_retry(attempt, exc)
             except (APIError, TimeoutError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
-                time.sleep(min(2**attempt, 8))
+                self._wait_before_retry(attempt)
         if isinstance(last_error, IncompleteLLMResponse):
             raise last_error
         raise RuntimeError(
-            f"LLM web research produced no structured final output after {self.retries + 1} "
+            f"LLM web research produced no structured final output after {attempts_used} "
             f"finalization attempt(s): {last_error}"
         )
+
+    def _wait_before_retry(self, attempt: int, error: APIStatusError | None = None) -> None:
+        # Give unavailable upstreams time to recover; bound each wait to one minute.
+        delay = min((5 if error is not None else 1) * 2 ** min(attempt, 6), 60)
+        if error is not None:
+            retry_after = error.response.headers.get("retry-after")
+            if retry_after:
+                try:
+                    seconds = float(retry_after)
+                except ValueError:
+                    try:
+                        seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                    except (ValueError, TypeError, OverflowError):
+                        seconds = 0
+                if math.isfinite(seconds):
+                    delay = min(max(delay, seconds), 60)
+        logger.warning(
+            "LLM request failed (%s); retry %d/%d in %.1fs",
+            f"HTTP {error.status_code}" if error is not None else "transport or response error",
+            attempt + 1, self.retries, delay,
+        )
+        time.sleep(delay)
 
     def _request_json(
         self,
@@ -350,7 +380,7 @@ class LLMClient:
                             else:
                                 raw = _read_chat_completions_stream(response.iter_lines())
                         else:
-                            body = response.text
+                            body = response.text()
                             try:
                                 raw = json.loads(body)
                             except (ValueError, UnicodeError) as exc:
@@ -498,6 +528,10 @@ def _is_local_url(url: str) -> bool:
 
 def _is_empty_response_error(error: Exception | None) -> bool:
     return bool(error and "LLM returned an empty response" in str(error))
+
+
+def _is_retryable_http_error(error: APIStatusError) -> bool:
+    return error.status_code in {408, 409, 429} or error.status_code >= 500
 
 
 def _http_error_message(error: APIStatusError, max_body_chars: int = 2000) -> str:
