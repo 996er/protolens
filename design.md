@@ -238,7 +238,9 @@ ImplementationFSMBuilder.build(config)
   -> 遍历 source_root，按配置过滤源码后缀和生成目录
   -> 读取文本并按 chunk_chars 切块；本地不做任何协议语义抽取
   -> 每个 chunk 调用模型，只输出 TransitionFact[]、analyzed_files 和 uncertainties
-  -> chunk 输出立即校验证据；唯一的纯空白差异映射回源码原文字节并修正行号，省略号/改写/歧义证据携带 transition id 自动要求模型重生
+  -> chunk 输出立即校验证据；唯一的纯空白差异映射回源码原文字节并修正行号
+  -> 省略号/改写/错误路径证据只对失败的 transition 发起修复：模型选择当前 chunk 的源码片段和局部行号范围，本地直接复制原文并记录真实字符位置，保留已验证事实
+  -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
   -> 所有 compact TransitionFact 只调用一次 LLM assembler，输出状态、边和 fact_ids，不传源码摘录
   -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验

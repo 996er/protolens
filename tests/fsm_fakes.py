@@ -87,6 +87,11 @@ class FakeFSMClient:
         payload = json.loads(user)
         if schema_name.startswith("protolens_impl_transition_facts_chunk_"):
             result = self._implementation_chunk_facts(payload)
+        elif schema_name == "protolens_impl_transition_evidence_repair":
+            result = {
+                "repairs": [],
+                "unresolved_transition_indices": [item["transition_index"] for item in payload["transitions"]],
+            }
         elif schema_name == "protolens_impl_fsm_assemble":
             result = self._implementation_assembly(payload)
         elif schema_name == "protolens_fsm_merge":
