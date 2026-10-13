@@ -121,7 +121,6 @@ class ProtoLensPipeline:
             return self._load_implementation_fsm(), True
 
         self.checkpoints.invalidate("implementation", "specification", "merge")
-        self.store.path("findings/fsm_implementation.llm.jsonl").unlink(missing_ok=True)
         self.logger.info("building implementation transition facts and FSM")
         self.logger.debug(
             "implementation input paths",
@@ -129,7 +128,7 @@ class ProtoLensPipeline:
             entrypoints=self.config.entrypoints,
         )
         try:
-            impl_fsm = self.impl_builder.build(self.config)
+            impl_fsm = self.impl_builder.build(self.config, force=force, on_progress=self.logger.info)
         finally:
             self._write_fsm_llm_conversations(self.impl_builder)
             if self.impl_builder.last_manifest:
@@ -181,7 +180,6 @@ class ProtoLensPipeline:
             return ProtocolFSM.from_dict(self.store.read_json("spec_fsm.json")), True
 
         self.checkpoints.invalidate("specification", "merge")
-        self.store.path("findings/fsm_specification.llm.jsonl").unlink(missing_ok=True)
         self.logger.info("building scoped specification FSM")
         self.logger.debug("spec input paths", spec_paths=[str(path) for path in self.config.spec_paths])
         try:
@@ -225,7 +223,6 @@ class ProtoLensPipeline:
             return unified, divergences, True
 
         self.checkpoints.invalidate("merge")
-        self.store.path("findings/fsm_merge.llm.jsonl").unlink(missing_ok=True)
         self.logger.info("merging FSMs and detecting divergences")
         try:
             unified_fsm, divergences = self.merger.merge(spec_fsm, impl_fsm)
@@ -771,15 +768,7 @@ def _code_evidence_from_fsm(fsm: ProtocolFSM) -> list[Evidence]:
 
 
 def _llm_cache_identity(config: ProtoLensConfig) -> dict[str, object]:
-    return {
-        "provider": config.llm.provider,
-        "model": config.llm.model,
-        "temperature": config.llm.temperature,
-        "base_url": config.llm.base_url,
-        "max_tokens": config.llm.max_tokens,
-        "response_format": config.llm.response_format,
-        "extra_headers": config.llm.extra_headers,
-    }
+    return LLMClient.from_config(config.llm).cache_identity()
 
 
 def _pending_crash_replay(fuzz_result: FuzzResult) -> dict[str, object]:

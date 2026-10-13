@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
 import json
+import math
 import re
 
 from protolens.fsm.fsm_model import Divergence, ProtocolFSM
-from protolens.utils.llm_client import LLMClient, LLMResponse
+from protolens.utils.llm_client import IncompleteLLMResponse, LLMClient, LLMResponse
 
 
 EVIDENCE_SCHEMA: dict[str, Any] = {
@@ -70,10 +72,11 @@ FSM_SCHEMA: dict[str, Any] = {
     "properties": {
         "protocol": {"type": "string", "minLength": 1},
         "version": {"type": ["string", "null"]},
-        "states": {"type": "array", "items": STATE_SCHEMA, "maxItems": 500},
+        "states": {"type": "array", "items": STATE_SCHEMA, "minItems": 1, "maxItems": 500},
         "transitions": {
             "type": "array",
             "items": TRANSITION_SCHEMA,
+            "minItems": 1,
             "maxItems": 1000,
         },
         "initial_state": {"type": "string", "minLength": 1},
@@ -81,6 +84,10 @@ FSM_SCHEMA: dict[str, Any] = {
         "error_states": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
     },
 }
+
+
+class LLMValidationError(ValueError):
+    """A model result exhausted its structural/semantic validation budget."""
 
 
 @dataclass
@@ -99,6 +106,7 @@ class LLMConversationRecorder:
         schema: dict[str, Any],
         schema_name: str,
         validator: Callable[[dict[str, Any]], None] | None = None,
+        validation_retries: int | None = None,
     ) -> dict[str, Any]:
         return self._call(
             system=system,
@@ -108,6 +116,7 @@ class LLMConversationRecorder:
             web_search=False,
             allowed_domains=None,
             validator=validator,
+            validation_retries=validation_retries,
         )
 
     def call_web(
@@ -119,6 +128,8 @@ class LLMConversationRecorder:
         schema_name: str,
         allowed_domains: list[str],
         max_tool_calls: int,
+        validator: Callable[[dict[str, Any]], None] | None = None,
+        response_validator: Callable[[dict[str, Any], LLMResponse], None] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         data, response = self._call_with_response(
             system=system,
@@ -128,6 +139,8 @@ class LLMConversationRecorder:
             web_search=True,
             allowed_domains=allowed_domains,
             max_tool_calls=max_tool_calls,
+            validator=validator,
+            response_validator=response_validator,
         )
         return data, response
 
@@ -166,6 +179,7 @@ class LLMConversationRecorder:
         allowed_domains: list[str] | None,
         max_tool_calls: int | None = None,
         validator: Callable[[dict[str, Any]], None] | None = None,
+        validation_retries: int | None = None,
     ) -> dict[str, Any]:
         data, _ = self._call_with_response(
             system=system,
@@ -176,6 +190,7 @@ class LLMConversationRecorder:
             allowed_domains=allowed_domains,
             max_tool_calls=max_tool_calls,
             validator=validator,
+            validation_retries=validation_retries,
         )
         return data
 
@@ -190,10 +205,13 @@ class LLMConversationRecorder:
         allowed_domains: list[str] | None,
         max_tool_calls: int | None = None,
         validator: Callable[[dict[str, Any]], None] | None = None,
+        response_validator: Callable[[dict[str, Any], LLMResponse], None] | None = None,
+        validation_retries: int | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         last_error: Exception | None = None
-        for attempt in range(self.llm_client.retries + 1):
+        retries = self.llm_client.retries if validation_retries is None else validation_retries
+        for attempt in range(retries + 1):
             user = base_user
             if last_error is not None:
                 user += (
@@ -201,6 +219,7 @@ class LLMConversationRecorder:
                     f"{type(last_error).__name__}: {last_error}. Regenerate the complete JSON object."
                 )
             record: dict[str, Any] = {
+                "started_at": datetime.now(timezone.utc).isoformat(),
                 "component": self.name,
                 "provider": self.llm_client.provider,
                 "model": self.llm_client.model,
@@ -211,6 +230,7 @@ class LLMConversationRecorder:
                 "json_schema": schema,
                 "web_search": web_search,
             }
+            received_response = False
             try:
                 response = self.llm_client.responses_json(
                     system=system,
@@ -221,6 +241,7 @@ class LLMConversationRecorder:
                     allowed_domains=allowed_domains,
                     max_tool_calls=max_tool_calls,
                 )
+                received_response = True
                 record["response"] = {
                     "text": response.text,
                     "provider": response.provider,
@@ -231,6 +252,8 @@ class LLMConversationRecorder:
                 validate_json_schema(data, schema)
                 if validator is not None:
                     validator(data)
+                if response_validator is not None:
+                    response_validator(data, response)
                 record["final_status"] = "success"
                 self._conversations.append(record)
                 return data, response
@@ -245,18 +268,33 @@ class LLMConversationRecorder:
                         "raw": raw,
                     }
                 record["error"] = {"type": type(exc).__name__, "message": str(exc)}
-                record["final_status"] = "retrying" if attempt < self.llm_client.retries else "failed"
+                # Transport/output-budget retries belong to LLMClient. Retrying them
+                # here multiplies request counts and worsens upstream rate limits.
+                retryable = received_response and isinstance(exc, ValueError)
+                record["final_status"] = "retrying" if retryable and attempt < retries else "failed"
                 self._conversations.append(record)
+                if not retryable:
+                    if isinstance(exc, IncompleteLLMResponse):
+                        raise
+                    raise RuntimeError(f"{self.name}/{schema_name} request failed: {exc}") from exc
         assert last_error is not None
-        raise last_error
+        raise LLMValidationError(
+            f"{self.name}/{schema_name}: invalid LLM result after {retries + 1} attempt(s): {last_error}"
+        ) from last_error
 
 
 def fsm_from_llm(data: Any, *, builder: str, metadata: dict[str, Any] | None = None) -> ProtocolFSM:
+    validate_json_schema(data, FSM_SCHEMA)
     if not isinstance(data, dict):
         raise ValueError("LLM FSM must be an object")
     states = data.get("states")
     if not isinstance(states, list):
         raise ValueError("LLM FSM states must be an array")
+    names = [item["name"] for item in states]
+    if len(set(names)) != len(names):
+        raise ValueError("LLM FSM contains duplicate state names; every state name must be unique")
+    if any(name != name.strip() for name in names):
+        raise ValueError("LLM FSM state names must not have leading or trailing whitespace")
     normalized = dict(data)
     normalized["states"] = {
         str(item.get("name", "")): item
@@ -361,7 +399,10 @@ def load_json_object(text: str) -> dict[str, Any]:
         stripped = stripped[first_newline + 1 :] if first_newline >= 0 else ""
         if stripped.endswith("```"):
             stripped = stripped[:-3]
-    data = json.loads(stripped)
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"LLM output contains non-finite JSON number {value}")
+
+    data = json.loads(stripped, parse_constant=reject_constant)
     if not isinstance(data, dict):
         raise ValueError("LLM output must be a JSON object")
     return data
@@ -400,9 +441,11 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
             for index, item in enumerate(value):
                 validate_json_schema(item, item_schema, f"{path}[{index}]")
 
-    if isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
+    if isinstance(value, str) and "minLength" in schema and len(value.strip()) < int(schema["minLength"]):
         raise ValueError(f"{path} must contain at least {schema['minLength']} characters")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{path} must be a finite number")
         if "minimum" in schema and value < schema["minimum"]:
             raise ValueError(f"{path} must be >= {schema['minimum']}")
         if "maximum" in schema and value > schema["maximum"]:

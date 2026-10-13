@@ -203,6 +203,10 @@ build_fsm(force=false)
 
 checkpoint 同时校验输入 fingerprint、应有工件集合及每个输出文件的 SHA-256。源码、构建范围、实现能力、模型配置或上游 FSM 任一变化都会使对应阶段失效；前置阶段成功重建后会删除下游 checkpoint。`--force` 忽略指定阶段 checkpoint，`build-fsm --force` 和 `run --force-fsm` 强制重建全部 FSM 阶段。失败阶段不会写完成记录，因此再次执行会从最后一个成功阶段恢复。
 
+ImplementationFSM 还会将每个通过校验的源码块原子保存到 `checkpoints/implementation_chunks/<fingerprint>/chunk_XXXXX.json`。中途请求失败或最终组装失败后，重跑相同命令会复用这些块；读取时重新检查内容 SHA-256、JSON Schema、文件覆盖和源码证据。损坏的块只重做该块。fingerprint 包含完整源码清单、分块设置、目标、模型和解析环境变量后的实际网关地址；重试次数、超时等传输设置不使缓存失效。`--force` 同时跳过分块缓存。全源码都返回空 facts 时会丢弃本轮空缓存，避免后续运行被空结果锁住。
+
+FSM 对话审计日志跨运行追加保存，每条记录包含开始时间、schema/stage、原始响应和校验失败原因。结构化结果的 Schema 校验和语义校验共用有界重试预算；空 states/transitions、重复状态、未知端点、错误协议、缺失事实映射等都在接受结果前验证并向模型反馈。传输重试由 LLMClient 负责，耗尽后 recorder 不再次重复整组请求。最终错误标明组件和 schema，方便从 `findings/fsm_implementation.llm.jsonl` 等文件定位。
+
 #### 4.1 SpecificationFSMBuilder
 
 规范 FSM 构建只走在线模型：
@@ -242,7 +246,7 @@ ImplementationFSMBuilder.build(config)
   -> 省略号/改写/错误路径证据只对失败的 transition 发起修复：模型选择当前 chunk 的源码片段和局部行号范围，本地直接复制原文并记录真实字符位置，保留已验证事实
   -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
-  -> 所有 compact TransitionFact 只调用一次 LLM assembler，输出状态、边和 fact_ids，不传源码摘录
+  -> 所有 compact TransitionFact 交给 LLM assembler，输出状态、边和 fact_ids，不传源码摘录；不合格输出在配置预算内重试
   -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验
   -> 校验协议名、FSM 结构和每条 transition 的源码证据
   -> evidence.excerpt 必须是已读取源码中的精确原文，否则构建失败
@@ -250,6 +254,8 @@ ImplementationFSMBuilder.build(config)
 ```
 
 空白或无状态语义的 chunk 可以返回空 TransitionFact 数组，全部 chunk 合并后不允许为空。超出 `max_file_bytes` 的源码会明确报错并终止，不会跳过后伪称已分析。`implementation_evidence_table.json` 是结构化 FSM 工件中源码摘录的唯一存储位置；`implementation_transition_facts.json` 和 `impl_fsm.json` 只保存 `evidence_ids`。`merge-fsm` 在内存中解析引用后再调用 FSMMerger。自动恢复、丢弃和重试过的证据只记录位置和摘要，不在 FSM metadata 重复保存源码原文；LLM 原始结果及 rejected 状态保留在 `findings/fsm_implementation.llm.jsonl` 供调用审计。
+
+内部的分块恢复缓存会保存完整且已验证的块结果（含源码摘录），以便在最终 EvidenceTable 尚未生成时恢复；它不是对外 FSM 工件。新的分块缓存仅能恢复该版本写出的检查点，旧运行没有检查点的源码块仍需分析一次。
 
 #### 4.3 FSMMerger
 

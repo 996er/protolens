@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import hashlib
 import json
 import re
@@ -13,9 +13,12 @@ from protolens.fsm.llm_support import (
     LLMConversationRecorder,
     fsm_from_llm,
     normalize_fsm_protocol,
+    validate_json_schema,
 )
 from protolens.fsm.fsm_model import stable_id
 from protolens.utils.llm_client import LLMClient
+from protolens.utils.artifact_store import ArtifactStore
+from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
 TRANSITION_FACT_SCHEMA: dict[str, Any] = {
@@ -133,8 +136,8 @@ IMPLEMENTATION_ASSEMBLY_SCHEMA: dict[str, Any] = {
     "properties": {
         "protocol": {"type": "string", "minLength": 1},
         "version": {"type": ["string", "null"]},
-        "states": {"type": "array", "items": ASSEMBLY_STATE_SCHEMA, "maxItems": 500},
-        "transitions": {"type": "array", "items": ASSEMBLY_TRANSITION_SCHEMA, "maxItems": 1000},
+        "states": {"type": "array", "items": ASSEMBLY_STATE_SCHEMA, "minItems": 1, "maxItems": 500},
+        "transitions": {"type": "array", "items": ASSEMBLY_TRANSITION_SCHEMA, "minItems": 1, "maxItems": 1000},
         "initial_state": {"type": "string", "minLength": 1},
         "terminal_states": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
         "error_states": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
@@ -155,8 +158,12 @@ class ImplementationFSMBuilder:
         self.last_evidence_table: dict[str, Any] = {}
         self._source_texts: dict[str, str] = {}
         self._evidence_repairs: list[dict[str, Any]] = []
+        self.last_reused_chunks = 0
 
-    def build(self, config: ProtoLensConfig) -> ProtocolFSM:
+    def build(
+        self, config: ProtoLensConfig, *, force: bool = False,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> ProtocolFSM:
         if self.recorder.llm_client.is_offline:
             raise RuntimeError(
                 "ImplementationFSM requires an online LLM; "
@@ -164,13 +171,68 @@ class ImplementationFSMBuilder:
             )
         chunks, manifest = self._collect_source_chunks(config)
         self._evidence_repairs = []
+        self.last_reused_chunks = 0
+        self.last_transition_facts = {}
+        self.last_evidence_table = {}
         self.last_manifest = manifest
         if not chunks:
             raise ValueError(f"no analyzable source files found under {config.source_root}")
 
+        store = ArtifactStore(config.run_dir)
+        fingerprint = stable_fingerprint({
+            "version": "implementation-chunks-v1",
+            "builder": self.CACHE_VERSION,
+            "protocol": config.protocol,
+            "target_name": config.target_name,
+            "source_manifest": manifest,
+            "entrypoints": config.entrypoints,
+            "chunk_chars": config.fsm_build.chunk_chars,
+            "llm": LLMClient.from_config(config.llm).cache_identity(),
+        })
         partials: list[dict[str, Any]] = []
         for index, chunk in enumerate(chunks):
-            partials.append(self._analyze_chunk(config, chunk, index, len(chunks)))
+            checkpoint = f"checkpoints/implementation_chunks/{fingerprint}/chunk_{index + 1:05d}.json"
+            partial = None
+            repair_start = len(self._evidence_repairs)
+            if not force and store.path(checkpoint).is_file():
+                try:
+                    saved = store.read_json(checkpoint)
+                    content = saved["content"]
+                    if saved.get("sha256") != stable_fingerprint(content):
+                        raise ValueError("chunk checkpoint checksum mismatch")
+                    candidate = content["result"]
+                    validate_json_schema(candidate, TRANSITION_FACT_RESULT_SCHEMA)
+                    expected = {piece["path"] for piece in chunk["files"]}
+                    if set(candidate["analyzed_files"]) != expected:
+                        raise ValueError("chunk checkpoint file coverage mismatch")
+                    if self._normalize_transition_evidence(candidate["transition_facts"], stage=f"cached_chunk_{index + 1}"):
+                        raise ValueError("chunk checkpoint contains unverified source evidence")
+                    self._evidence_repairs.extend(content["evidence_repairs"])
+                    partial = candidate
+                    self.last_reused_chunks += 1
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    del self._evidence_repairs[repair_start:]
+                    if on_progress:
+                        on_progress(f"implementation chunk {index + 1}/{len(chunks)}: rebuilding invalid checkpoint ({exc})")
+            if partial is None:
+                if on_progress:
+                    on_progress(f"implementation chunk {index + 1}/{len(chunks)}: analyzing source")
+                partial = self._analyze_chunk(config, chunk, index, len(chunks))
+                content = {"result": partial, "evidence_repairs": self._evidence_repairs[repair_start:]}
+                store.write_json(checkpoint, {"content": content, "sha256": stable_fingerprint(content)})
+            elif on_progress:
+                on_progress(f"implementation chunk {index + 1}/{len(chunks)}: reused validated checkpoint")
+            partials.append(partial)
+
+        if not any(partial["transition_facts"] for partial in partials):
+            # Empty chunks are legitimate, but an entirely empty extraction must
+            # not become a permanent cache hit that prevents a fresh analysis.
+            for index in range(len(chunks)):
+                store.path(f"checkpoints/implementation_chunks/{fingerprint}/chunk_{index + 1:05d}.json").unlink(missing_ok=True)
+            raise ValueError(
+                "ImplementationFSM contains no transition facts across the source corpus; "
+                "empty chunk checkpoints were discarded so the next run can reanalyze the source"
+            )
 
         expected_files = {str(item["path"]) for item in manifest["files"]}
         reported_files = {
@@ -197,7 +259,9 @@ class ImplementationFSMBuilder:
             "source_root": str(config.source_root),
             "entries": evidence_table,
         }
-        assembled = self._assemble_fsm(config, facts)
+        if on_progress:
+            on_progress(f"assembling implementation FSM from {len(facts)} verified transition facts")
+        assembled = self._assemble_fsm(config, facts, evidence_table)
         materialized = self._materialize_assembled_fsm(assembled, facts, evidence_table)
         fsm = fsm_from_llm(
             materialized,
@@ -361,16 +425,17 @@ class ImplementationFSMBuilder:
                         "contiguous source excerpt verbatim, including punctuation; never use ellipses or paraphrases."
                     ),
                 }
-            result = self.recorder.call_chat(
-                system=(
-                    "You are ProtoLens ImplementationFSMBuilder. Analyze only the supplied project source. "
-                    "No regex-derived or heuristic FSM exists outside this prompt. Produce auditable state-machine facts."
-                ),
-                payload=payload,
-                schema=TRANSITION_FACT_RESULT_SCHEMA,
-                schema_name=f"protolens_impl_transition_facts_chunk_{index + 1}",
-            )
             try:
+                result = self.recorder.call_chat(
+                    system=(
+                        "You are ProtoLens ImplementationFSMBuilder. Analyze only the supplied project source. "
+                        "No regex-derived or heuristic FSM exists outside this prompt. Produce auditable state-machine facts."
+                    ),
+                    payload=payload,
+                    schema=TRANSITION_FACT_RESULT_SCHEMA,
+                    schema_name=f"protolens_impl_transition_facts_chunk_{index + 1}",
+                    validation_retries=0,
+                )
                 reported_files = {str(item) for item in result.get("analyzed_files", [])}
                 if reported_files != expected_files:
                     raise ValueError(
@@ -561,7 +626,10 @@ class ImplementationFSMBuilder:
             raise ValueError("ImplementationFSM contains no transition facts")
         return facts, evidence_table, list(dict.fromkeys(uncertainties))
 
-    def _assemble_fsm(self, config: ProtoLensConfig, facts: list[dict[str, Any]]) -> dict[str, Any]:
+    def _assemble_fsm(
+        self, config: ProtoLensConfig, facts: list[dict[str, Any]],
+        evidence_table: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         payload = {
             "task": "Assemble one coherent implementation FSM from compact transition facts.",
             "protocol": config.protocol,
@@ -571,36 +639,32 @@ class ImplementationFSMBuilder:
                 "Deduplicate facts without dropping distinct guards, actions, or error paths.",
                 "Do not invent behavior absent from transition_facts.",
                 "Every input fact id must appear in exactly one or more output transition fact_ids arrays.",
+                "Return non-empty states and transitions arrays; every state name and transition id must be unique.",
+                "Every source, target, initial_state, terminal_states and error_states reference must match a declared state name exactly.",
+                "Declare all evidence-backed states needed for the supplied facts, including implementation-only states.",
                 "Evidence source text is stored separately; do not request or reproduce excerpts.",
             ],
             "transition_facts": facts,
         }
-        last_error: ValueError | None = None
-        for validation_attempt in range(self.recorder.llm_client.retries + 1):
-            if last_error is not None:
-                payload["assembly_validation_feedback"] = {
-                    "previous_error": str(last_error),
-                    "required_action": "Regenerate the complete assembly and map every supplied fact id.",
-                }
-            result = self.recorder.call_chat(
-                system=(
-                    "You are ProtoLens ImplementationFSM assembler. Build states and transitions only from the "
-                    "supplied compact facts. Evidence text is managed by ProtoLens and must not be reproduced."
-                ),
-                payload=payload,
-                schema=IMPLEMENTATION_ASSEMBLY_SCHEMA,
-                schema_name="protolens_impl_fsm_assemble",
+        def validate_result(result: dict[str, Any]) -> None:
+            self._validate_fact_coverage(result, facts)
+            fsm = fsm_from_llm(
+                self._materialize_assembled_fsm(result, facts, evidence_table),
+                builder="LLMImplementationFSMBuilder",
             )
-            try:
-                self._validate_fact_coverage(result, facts)
-                return result
-            except ValueError as exc:
-                last_error = exc
-                self.recorder.mark_last_rejected(exc)
-                if validation_attempt >= self.recorder.llm_client.retries:
-                    raise
-        assert last_error is not None
-        raise last_error
+            normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
+            self._validate_code_evidence(fsm)
+
+        return self.recorder.call_chat(
+            system=(
+                "You are ProtoLens ImplementationFSM assembler. Build states and transitions only from the "
+                "supplied compact facts. Evidence text is managed by ProtoLens and must not be reproduced."
+            ),
+            payload=payload,
+            schema=IMPLEMENTATION_ASSEMBLY_SCHEMA,
+            schema_name="protolens_impl_fsm_assemble",
+            validator=validate_result,
+        )
 
     def _validate_fact_coverage(self, assembled: dict[str, Any], facts: list[dict[str, Any]]) -> None:
         expected = {str(item["id"]) for item in facts}

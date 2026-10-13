@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 import json
+import hashlib
 import logging
 import math
 import os
@@ -65,6 +66,17 @@ class LLMClient:
     @property
     def is_offline(self) -> bool:
         return self.provider in self.OFFLINE_PROVIDERS
+
+    def cache_identity(self) -> dict[str, Any]:
+        """Only output-affecting settings; hash custom headers rather than persisting secrets."""
+        return {
+            "provider": self.provider, "model": self.model,
+            "base_url": self.base_url, "temperature": self.temperature,
+            "max_tokens": self.max_tokens, "response_format": self.response_format,
+            "extra_headers_sha256": hashlib.sha256(
+                json.dumps(self.extra_headers, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        }
 
     @classmethod
     def from_config(cls, config: Any) -> "LLMClient":
