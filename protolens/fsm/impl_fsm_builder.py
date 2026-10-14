@@ -97,11 +97,14 @@ TRANSITION_EVIDENCE_REPAIR_SCHEMA: dict[str, Any] = {
 ASSEMBLY_STATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["name", "description", "confidence"],
+    "required": ["name", "description", "confidence", "is_initial", "is_terminal", "is_error"],
     "properties": {
         "name": {"type": "string", "minLength": 1},
         "description": {"type": "string"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "is_initial": {"type": "boolean"},
+        "is_terminal": {"type": "boolean"},
+        "is_error": {"type": "boolean"},
     },
 }
 
@@ -130,17 +133,13 @@ IMPLEMENTATION_ASSEMBLY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
-        "protocol", "version", "states", "transitions", "initial_state", "terminal_states",
-        "error_states", "uncertainties",
+        "protocol", "version", "states", "transitions", "uncertainties",
     ],
     "properties": {
         "protocol": {"type": "string", "minLength": 1},
         "version": {"type": ["string", "null"]},
         "states": {"type": "array", "items": ASSEMBLY_STATE_SCHEMA, "minItems": 1, "maxItems": 500},
         "transitions": {"type": "array", "items": ASSEMBLY_TRANSITION_SCHEMA, "minItems": 1, "maxItems": 1000},
-        "initial_state": {"type": "string", "minLength": 1},
-        "terminal_states": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
-        "error_states": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
         "uncertainties": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
     },
 }
@@ -640,7 +639,13 @@ class ImplementationFSMBuilder:
                 "Do not invent behavior absent from transition_facts.",
                 "Every input fact id must appear in exactly one or more output transition fact_ids arrays.",
                 "Return non-empty states and transitions arrays; every state name and transition id must be unique.",
-                "Every source, target, initial_state, terminal_states and error_states reference must match a declared state name exactly.",
+                "Every transition source and target must match a declared states[].name exactly.",
+                "Classify each declared state using boolean is_initial, is_terminal and is_error fields. "
+                "Exactly one state must have is_initial=true; any number may have is_terminal or is_error=true.",
+                "A state may be both terminal and error. Classify states only when the facts support that role; "
+                "do not infer terminal status merely from having no outgoing facts, or error status from its name.",
+                "ProtoLens derives initial_state, terminal_states and error_states from these flags; "
+                "do not output separate state-reference fields.",
                 "Declare all evidence-backed states needed for the supplied facts, including implementation-only states.",
                 "Evidence source text is stored separately; do not request or reproduce excerpts.",
             ],
@@ -690,6 +695,17 @@ class ImplementationFSMBuilder:
         facts: list[dict[str, Any]],
         evidence_table: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
+        # Keep roles on declarations in the model-facing format. Deriving the
+        # public FSM references here makes dangling role references impossible.
+        states = assembled["states"]
+        initial = [state["name"] for state in states if state["is_initial"]]
+        if len(initial) != 1:
+            raise ValueError(
+                "implementation assembly requires exactly one state with is_initial=true; "
+                f"got {len(initial)}: {initial!r}. "
+                f"Declared states: {[state['name'] for state in states]!r}. "
+                "Select the evidence-backed entry state and set is_initial=false on all others."
+            )
         facts_by_id = {str(item["id"]): item for item in facts}
         transitions: list[dict[str, Any]] = []
         for source_transition in assembled.get("transitions", []):
@@ -708,13 +724,14 @@ class ImplementationFSMBuilder:
             "protocol": assembled.get("protocol"),
             "version": assembled.get("version"),
             "states": [
-                {**state, "evidence": []}
-                for state in assembled.get("states", [])
+                {"name": state["name"], "description": state["description"],
+                 "confidence": state["confidence"], "evidence": []}
+                for state in states
             ],
             "transitions": transitions,
-            "initial_state": assembled.get("initial_state"),
-            "terminal_states": assembled.get("terminal_states", []),
-            "error_states": assembled.get("error_states", []),
+            "initial_state": initial[0],
+            "terminal_states": [state["name"] for state in states if state["is_terminal"]],
+            "error_states": [state["name"] for state in states if state["is_error"]],
         }
 
     def _normalize_transition_evidence(self, transitions: Any, *, stage: str) -> list[str]:

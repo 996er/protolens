@@ -313,18 +313,30 @@ def validate_fsm(fsm: ProtocolFSM) -> None:
     if not fsm.transitions:
         raise ValueError("LLM FSM contains no transitions")
     if fsm.initial_state not in fsm.states:
-        raise ValueError(f"initial state {fsm.initial_state!r} is absent from states")
+        raise ValueError(
+            f"initial state {fsm.initial_state!r} is absent from states; "
+            f"declared states={sorted(fsm.states)!r}. "
+            "Use an exact declared state name, or declare the evidence-backed entry state."
+        )
     unknown_terminal = fsm.terminal_states - set(fsm.states)
     unknown_error = fsm.error_states - set(fsm.states)
     if unknown_terminal or unknown_error:
-        raise ValueError("terminal_states/error_states contain unknown state names")
+        raise ValueError(
+            "terminal_states/error_states contain unknown state names: "
+            f"unknown terminal_states={sorted(unknown_terminal)!r}, "
+            f"unknown error_states={sorted(unknown_error)!r}; "
+            f"declared states={sorted(fsm.states)!r}. "
+            "Use exact declared names for aliases, declare omitted evidence-backed states, "
+            "or remove classifications unsupported by the evidence."
+        )
     transition_ids: set[str] = set()
     for transition in fsm.transitions:
         if transition.source not in fsm.states or transition.target not in fsm.states:
             missing = sorted({transition.source, transition.target} - set(fsm.states))
             raise ValueError(
                 f"transition {transition.id!r} references an unknown state: "
-                f"source={transition.source!r}, target={transition.target!r}, missing={missing!r}. "
+                f"source={transition.source!r}, target={transition.target!r}, missing={missing!r}; "
+                f"declared states={sorted(fsm.states)!r}. "
                 "Each endpoint must exactly match a declared states[].name; "
                 "correct the endpoint or declare the evidence-backed state."
             )

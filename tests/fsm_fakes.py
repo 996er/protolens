@@ -139,13 +139,11 @@ class FakeFSMClient:
             "protocol": payload["protocol"],
             "version": "implementation",
             "states": [
-                {"name": name, "description": "", "confidence": 1.0}
+                {"name": name, "description": "", "confidence": 1.0,
+                 "is_initial": name == "START", "is_terminal": False, "is_error": False}
                 for name in sorted(states)
             ],
             "transitions": transitions,
-            "initial_state": "START",
-            "terminal_states": [],
-            "error_states": [],
             "uncertainties": [],
         }
 
