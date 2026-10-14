@@ -292,7 +292,16 @@ def fsm_from_llm(data: Any, *, builder: str, metadata: dict[str, Any] | None = N
         raise ValueError("LLM FSM states must be an array")
     names = [item["name"] for item in states]
     if len(set(names)) != len(names):
-        raise ValueError("LLM FSM contains duplicate state names; every state name must be unique")
+        positions: dict[str, list[int]] = {}
+        for index, name in enumerate(names):
+            positions.setdefault(name, []).append(index)
+        duplicates = {name: indices for name, indices in positions.items() if len(indices) > 1}
+        raise ValueError(
+            "LLM FSM contains duplicate state names; every state name must be unique: "
+            f"{json.dumps(duplicates, ensure_ascii=False)} (zero-based states[] positions). "
+            "Consolidate declarations of the same state without losing evidence; "
+            "if they represent distinct states, give them distinct names and update their references."
+        )
     if any(name != name.strip() for name in names):
         raise ValueError("LLM FSM state names must not have leading or trailing whitespace")
     normalized = dict(data)

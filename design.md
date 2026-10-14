@@ -248,6 +248,7 @@ ImplementationFSMBuilder.build(config)
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
   -> 所有 compact TransitionFact 交给 LLM assembler，输出状态、边和 fact_ids，不传源码摘录；不合格输出在配置预算内重试
   -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
+  -> 同名且角色属性一致的重复状态声明在计数和图校验前合并，保留所有不同描述并取最低置信度；不改动边或推断名称别名。角色冲突列出名称、声明位置和冲突字段后重试；成功的合并记录在 metadata.state_declaration_repairs，原始响应保留在对话日志
   -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验
   -> 校验协议名、FSM 结构和每条 transition 的源码证据
   -> evidence.excerpt 必须是已读取源码中的精确原文，否则构建失败

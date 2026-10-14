@@ -158,6 +158,7 @@ class ImplementationFSMBuilder:
         self.last_evidence_table: dict[str, Any] = {}
         self._source_texts: dict[str, str] = {}
         self._evidence_repairs: list[dict[str, Any]] = []
+        self._state_declaration_repairs: list[dict[str, Any]] = []
         self.last_reused_chunks = 0
 
     def build(
@@ -171,6 +172,7 @@ class ImplementationFSMBuilder:
             )
         chunks, manifest = self._collect_source_chunks(config)
         self._evidence_repairs = []
+        self._state_declaration_repairs = []
         self.last_reused_chunks = 0
         self.last_transition_facts = {}
         self.last_evidence_table = {}
@@ -277,6 +279,7 @@ class ImplementationFSMBuilder:
                 "transition_fact_count": len(facts),
                 "evidence_count": len(evidence_table),
                 "evidence_repairs": self._evidence_repairs,
+                "state_declaration_repairs": self._state_declaration_repairs,
             },
         )
         normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
@@ -657,13 +660,19 @@ class ImplementationFSMBuilder:
             "transition_facts": facts,
         }
         def validate_result(result: dict[str, Any]) -> None:
+            states, repairs = self._coalesce_assembly_states(result["states"])
+            candidate = {**result, "states": states}
             self._validate_fact_coverage(result, facts)
             fsm = fsm_from_llm(
-                self._materialize_assembled_fsm(result, facts, evidence_table),
+                self._materialize_assembled_fsm(candidate, facts, evidence_table),
                 builder="LLMImplementationFSMBuilder",
             )
             normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
             self._validate_code_evidence(fsm)
+            # Commit normalization only after every assembly check succeeds.
+            # The recorder retains the unmodified model response for auditing.
+            result["states"] = states
+            self._state_declaration_repairs = repairs
 
         return self.recorder.call_chat(
             system=(
@@ -675,6 +684,53 @@ class ImplementationFSMBuilder:
             schema_name="protolens_impl_fsm_assemble",
             validator=validate_result,
         )
+
+    @staticmethod
+    def _coalesce_assembly_states(
+        states: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Coalesce repeated identifiers, without inferring state aliases or roles."""
+        groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for index, state in enumerate(states):
+            groups.setdefault(state["name"], []).append((index, state))
+        normalized: list[dict[str, Any]] = []
+        repairs: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        for name, declarations in groups.items():
+            role_conflicts = {
+                role: [{"index": index, "value": state[role]} for index, state in declarations]
+                for role in ("is_initial", "is_terminal", "is_error")
+                if len({state[role] for _, state in declarations}) > 1
+            }
+            if role_conflicts:
+                conflicts.append({"name": name, "conflicting_roles": role_conflicts})
+                continue
+            state = dict(declarations[0][1])
+            if len(declarations) > 1:
+                # Descriptions are annotations on an exact FSM identifier.
+                # Retain all distinct annotations and do not inflate confidence.
+                descriptions = list(dict.fromkeys(
+                    item["description"] for _, item in declarations if item["description"]
+                ))
+                state["description"] = "\n\n".join(descriptions)
+                state["confidence"] = min(item["confidence"] for _, item in declarations)
+                repairs.append({
+                    "action": "coalesced_duplicate_state_declarations",
+                    "name": name,
+                    "declaration_indices": [index for index, _ in declarations],
+                    "description_count": len(descriptions),
+                    "confidence_policy": "minimum",
+                })
+            normalized.append(state)
+        if conflicts:
+            raise ValueError(
+                "duplicate state names have conflicting role declarations: "
+                f"{json.dumps(conflicts, ensure_ascii=False)}. Indices are zero-based states[] positions. "
+                "Return one declaration per state name with evidence-backed roles. "
+                "If these represent different states, assign distinct names and update the affected "
+                "transition endpoints consistently; preserve every transition fact."
+            )
+        return normalized, repairs
 
     def _validate_fact_coverage(self, assembled: dict[str, Any], facts: list[dict[str, Any]]) -> None:
         expected = {str(item["id"]) for item in facts}
