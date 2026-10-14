@@ -159,6 +159,7 @@ class ImplementationFSMBuilder:
         self._source_texts: dict[str, str] = {}
         self._evidence_repairs: list[dict[str, Any]] = []
         self._state_declaration_repairs: list[dict[str, Any]] = []
+        self._state_reference_repairs: list[dict[str, Any]] = []
         self.last_reused_chunks = 0
 
     def build(
@@ -173,6 +174,7 @@ class ImplementationFSMBuilder:
         chunks, manifest = self._collect_source_chunks(config)
         self._evidence_repairs = []
         self._state_declaration_repairs = []
+        self._state_reference_repairs = []
         self.last_reused_chunks = 0
         self.last_transition_facts = {}
         self.last_evidence_table = {}
@@ -280,6 +282,7 @@ class ImplementationFSMBuilder:
                 "evidence_count": len(evidence_table),
                 "evidence_repairs": self._evidence_repairs,
                 "state_declaration_repairs": self._state_declaration_repairs,
+                "state_reference_repairs": self._state_reference_repairs,
             },
         )
         normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
@@ -663,6 +666,9 @@ class ImplementationFSMBuilder:
             states, repairs = self._coalesce_assembly_states(result["states"])
             candidate = {**result, "states": states}
             self._validate_fact_coverage(result, facts)
+            candidate, reference_repairs = self._repair_assembly_state_references(
+                config, candidate, facts, evidence_table,
+            )
             fsm = fsm_from_llm(
                 self._materialize_assembled_fsm(candidate, facts, evidence_table),
                 builder="LLMImplementationFSMBuilder",
@@ -671,8 +677,9 @@ class ImplementationFSMBuilder:
             self._validate_code_evidence(fsm)
             # Commit normalization only after every assembly check succeeds.
             # The recorder retains the unmodified model response for auditing.
-            result["states"] = states
+            result.update(candidate)
             self._state_declaration_repairs = repairs
+            self._state_reference_repairs = reference_repairs
 
         return self.recorder.call_chat(
             system=(
@@ -684,6 +691,128 @@ class ImplementationFSMBuilder:
             schema_name="protolens_impl_fsm_assemble",
             validator=validate_result,
         )
+
+    def _repair_assembly_state_references(
+        self, config: ProtoLensConfig, assembled: dict[str, Any],
+        facts: list[dict[str, Any]], evidence_table: dict[str, dict[str, Any]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        declared = {state["name"] for state in assembled["states"]}
+        transitions = {item["id"]: item for item in assembled["transitions"]}
+        missing = {
+            (item["id"], endpoint): item[endpoint]
+            for item in assembled["transitions"]
+            for endpoint in ("source", "target") if item[endpoint] not in declared
+        }
+        if not missing:
+            return assembled, []
+        facts_by_id = {fact["id"]: fact for fact in facts}
+        affected_ids = {transition_id for transition_id, _ in missing}
+        related_fact_ids = {
+            fact_id for transition_id in affected_ids for fact_id in transitions[transition_id]["fact_ids"]
+        }
+        # New declarations may only use a missing name already present on the
+        # corresponding endpoint of that transition's verified source facts.
+        declarable = {
+            name for (transition_id, endpoint), name in missing.items()
+            if any(facts_by_id[fact_id][endpoint] == name
+                   for fact_id in transitions[transition_id]["fact_ids"])
+        }
+        state_schema = {
+            **ASSEMBLY_STATE_SCHEMA,
+            "properties": {**ASSEMBLY_STATE_SCHEMA["properties"],
+                           "name": {"type": "string", "enum": sorted(declarable or declared)}},
+        }
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["repairs", "new_states"],
+            "properties": {
+                "new_states": {"type": "array", "items": state_schema, "maxItems": len(declarable)},
+                "repairs": {
+                    "type": "array", "minItems": len(missing), "maxItems": len(missing),
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["transition_id", "endpoint", "state_name", "supporting_fact_ids", "rationale"],
+                        "properties": {
+                            "transition_id": {"type": "string", "enum": sorted(affected_ids)},
+                            "endpoint": {"type": "string", "enum": ["source", "target"]},
+                            "state_name": {"type": "string", "enum": sorted(declared | declarable)},
+                            "supporting_fact_ids": {"type": "array", "minItems": 1,
+                                                    "items": {"type": "string", "enum": sorted(related_fact_ids)}},
+                            "rationale": {"type": "string", "minLength": 1},
+                        },
+                    },
+                },
+            },
+        }
+
+        def apply_repairs(result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            new_names = [state["name"] for state in result["new_states"]]
+            if len(new_names) != len(set(new_names)) or not set(new_names) <= declarable:
+                raise ValueError("state reference repair must declare unique, fact-backed missing names only")
+            remaining = set(missing)
+            patched = {key: dict(value) for key, value in transitions.items()}
+            audit: list[dict[str, Any]] = []
+            used_new: set[str] = set()
+            for repair in result["repairs"]:
+                key = (repair["transition_id"], repair["endpoint"])
+                if key not in remaining:
+                    raise ValueError(f"state reference repair repeats or changes an unaffected endpoint: {key!r}")
+                remaining.remove(key)
+                transition_id, endpoint = key
+                support = set(repair["supporting_fact_ids"])
+                if not support <= set(transitions[transition_id]["fact_ids"]):
+                    raise ValueError(f"state reference repair uses unrelated facts for {key!r}")
+                name = repair["state_name"]
+                if name not in declared | set(new_names):
+                    raise ValueError(f"state reference repair still references an undeclared state: {name!r}")
+                if name in new_names:
+                    if not any(facts_by_id[fact_id][endpoint] == name for fact_id in support):
+                        raise ValueError(f"new state {name!r} lacks supporting endpoint facts for {key!r}")
+                    used_new.add(name)
+                patched[transition_id][endpoint] = name
+                audit.append({**repair, "original_state": missing[key],
+                              "action": "declared_missing_state" if name in new_names else "resolved_state_alias"})
+            if remaining or used_new != set(new_names):
+                raise ValueError("state reference repair omitted endpoints or added unused states")
+            candidate = {**assembled, "states": assembled["states"] + result["new_states"],
+                         "transitions": list(patched.values())}
+            return candidate, audit
+
+        def validate_repair(result: dict[str, Any]) -> None:
+            candidate, _ = apply_repairs(result)
+            validate_json_schema(candidate, IMPLEMENTATION_ASSEMBLY_SCHEMA)
+            self._validate_fact_coverage(candidate, facts)
+            fsm = fsm_from_llm(self._materialize_assembled_fsm(candidate, facts, evidence_table),
+                               builder="LLMImplementationFSMBuilder")
+            normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
+            self._validate_code_evidence(fsm)
+
+        result = self.recorder.call_chat(
+            system="You are ProtoLens implementation FSM state-reference repairer. Ground every decision in the supplied transition facts.",
+            payload={
+                "task": "Repair all undeclared transition endpoints without regenerating the FSM.",
+                "protocol": config.protocol,
+                "requirements": [
+                    "Return exactly one repair per missing endpoint. Never change valid endpoints or transition semantics.",
+                    "Resolve an alias only when the related facts support equivalence with a declared state; do not guess from spelling similarity.",
+                    "If a declaration was omitted, new_states may declare only a declarable_missing_state_names entry supported by that endpoint's facts.",
+                    "Choose evidence-backed state roles; do not infer terminal or error roles from the name or absent outgoing edges.",
+                    "Cite supporting_fact_ids from the affected transition and explain each choice. Do not invent states or behavior to satisfy validation.",
+                ],
+                "declared_states": assembled["states"],
+                "missing_endpoints": [{"transition_id": key[0], "endpoint": key[1], "unknown_state": name}
+                                      for key, name in missing.items()],
+                "declarable_missing_state_names": sorted(declarable),
+                "affected_transitions": [item for item in assembled["transitions"] if item["id"] in affected_ids],
+                "transition_facts": [fact for fact in facts if fact["id"] in related_fact_ids],
+            },
+            schema=schema, schema_name="protolens_impl_state_reference_repair",
+            validator=validate_repair,
+            # One targeted attempt per assembly candidate, then the existing
+            # assembly validation budget applies. Do not multiply retry budgets.
+            validation_retries=0,
+        )
+        return apply_repairs(result)
 
     @staticmethod
     def _coalesce_assembly_states(

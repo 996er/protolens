@@ -249,6 +249,7 @@ ImplementationFSMBuilder.build(config)
   -> 所有 compact TransitionFact 交给 LLM assembler，输出状态、边和 fact_ids，不传源码摘录；不合格输出在配置预算内重试
   -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
   -> 同名且角色属性一致的重复状态声明在计数和图校验前合并，保留所有不同描述并取最低置信度；不改动边或推断名称别名。角色冲突列出名称、声明位置和冲突字段后重试；成功的合并记录在 metadata.state_declaration_repairs，原始响应保留在对话日志
+  -> 未声明的边端点集中发起一次定向 LLM 修复：别名只能选择已声明名称；新增声明只能使用相关 fact 同侧端点中已经出现的缺失名称。每项修复须引用该边的支持事实并解释依据；本地仅应用端点修改与受支持的声明，保留其余边属性和事实引用，重新校验完整 FSM，记录 metadata.state_reference_repairs。每个组装候选最多一次定向修复，不合格则使用原有组装重试预算
   -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验
   -> 校验协议名、FSM 结构和每条 transition 的源码证据
   -> evidence.excerpt 必须是已读取源码中的精确原文，否则构建失败
