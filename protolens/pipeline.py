@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import inspect
 import json
 import traceback
@@ -844,8 +845,11 @@ def _implementation_fsm_with_evidence_refs(
     if not isinstance(evidence_artifact, dict) or not isinstance(evidence_artifact.get("entries"), dict):
         raise ValueError("implementation evidence table is unavailable")
     entries = evidence_artifact["entries"]
+    # Compare the model representation, not raw JSON encodings (1 != 1.0
+    # when hashed). Normalize both sides so older evidence tables also work.
+    # All evidence fields, including confidence, remain part of the match.
     evidence_ids_by_value = {
-        stable_fingerprint(value): evidence_id
+        stable_fingerprint(asdict(Evidence.from_dict(value))): evidence_id
         for evidence_id, value in entries.items()
     }
     artifact = fsm.to_dict()
@@ -854,7 +858,9 @@ def _implementation_fsm_with_evidence_refs(
         transition = dict(source_transition)
         evidence_ids: list[str] = []
         for evidence in transition.pop("evidence", []):
-            evidence_id = evidence_ids_by_value.get(stable_fingerprint(evidence))
+            evidence_id = evidence_ids_by_value.get(
+                stable_fingerprint(asdict(Evidence.from_dict(evidence)))
+            )
             if evidence_id is None:
                 raise ValueError(
                     f"implementation transition {transition.get('id')!r} contains evidence absent from EvidenceTable"

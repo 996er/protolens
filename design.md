@@ -247,6 +247,7 @@ ImplementationFSMBuilder.build(config)
   -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
   -> 所有 compact TransitionFact 交给 LLM assembler，输出状态、边和 fact_ids，不传源码摘录；不合格输出在配置预算内重试
+  -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
   -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验
   -> 校验协议名、FSM 结构和每条 transition 的源码证据
   -> evidence.excerpt 必须是已读取源码中的精确原文，否则构建失败
@@ -924,7 +925,7 @@ class Conflict:
 1. 本地遍历、读取、分块源码，不执行正则、AST 或启发式协议语义抽取。
 2. LLM 对每个源码 chunk 分析网络入口、parser、state variable、dispatch、guard、side effect、error return，只返回 TransitionFact。
 3. Builder 验证证据原文后建立去重 EvidenceTable，facts 和后续 assembler 只传递 evidence ID。
-4. 所有 compact facts 进入一次 LLM FSM assembler，处理跨文件调用、状态别名并返回 fact 覆盖映射。
+4. 所有 compact facts 进入一次 LLM FSM assembler，处理跨文件调用、状态别名并返回 fact 覆盖映射。状态角色使用声明内的布尔属性，由本地转换为公共 FSM 的状态引用字段；边端点仍须精确匹配声明名称。该组装格式变更不影响已验证的源码分块缓存。
 5. Builder 验证每个 fact 都被覆盖，并验证每条最终实现边至少有一段可在项目源码中精确找到的证据原文。
 6. 输出 `impl_fsm.json`、`implementation_transition_facts.json`、`implementation_evidence_table.json`、source manifest 和对话审计文件。
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 import hashlib
@@ -7,7 +8,7 @@ import json
 import re
 
 from protolens.config import ProtoLensConfig
-from protolens.fsm.fsm_model import ProtocolFSM
+from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
     LLMConversationRecorder,
@@ -592,6 +593,10 @@ class ImplementationFSMBuilder:
                 seen_fact_ids.add(fact_id)
                 evidence_ids: list[str] = []
                 for evidence in fact.pop("evidence", []):
+                    # JSON numbers may be integers, while FSM hydration stores
+                    # confidence as float. Use the same representation at both
+                    # ends, including when rebuilding from older chunk caches.
+                    evidence = asdict(Evidence.from_dict(evidence))
                     identity = {
                         "source_type": evidence.get("source_type"),
                         "location": evidence.get("location"),
