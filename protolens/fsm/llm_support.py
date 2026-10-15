@@ -360,6 +360,21 @@ def _normalize_fsm_metadata(
                     value[key] = default
                     changes.append({"path": f"{path}.{key}", "value": default,
                                     "reason": "omitted_state_annotation"})
+            # Entry/exit annotations can describe actions or conditions; they
+            # do not reliably identify initial or terminal states. Preserve
+            # their content in the supported description field and the audit,
+            # without inferring graph roles or changing transition actions.
+            for key in ("entry", "exit"):
+                if key not in value or key in properties:
+                    continue
+                annotation = value.pop(key)
+                changes.append({"path": f"{path}.{key}", "value": annotation,
+                                "reason": "state_annotation_preserved_in_description_and_audit"})
+                if isinstance(value.get("description"), str):
+                    description = value["description"]
+                    separator = "\n" if description else ""
+                    rendered = json.dumps(annotation, ensure_ascii=False)
+                    value["description"] = f"{description}{separator}{key}: {rendered}"
         for key, item in value.items():
             if isinstance(properties.get(key), dict):
                 changes.extend(_normalize_fsm_metadata(item, properties[key], f"{path}.{key}", protocol=protocol))
