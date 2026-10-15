@@ -275,7 +275,7 @@ class LLMClient:
                 continue
             # Finalization owns its retry budget. Its failures must not repeat web research.
             if (web_search and _raw_used_web_search(response.raw or {})
-                    and _structured_output_error(response.text, response_schema)):
+                    and _structured_output_error(response.text, response_schema, defer_leaf_fields=True)):
                 return self._finalize_web_research(
                     payload=candidate_payload, headers=headers, research_response=response,
                 )
@@ -333,7 +333,7 @@ class LLMClient:
                 ]
                 combined_raw["protolens_web_research_finalized"] = True
                 final_response.raw = combined_raw
-                error = _structured_output_error(final_response.text, schema)
+                error = _structured_output_error(final_response.text, schema, defer_leaf_fields=True)
                 if error:
                     raise InvalidStructuredOutput(error, final_response)
                 return final_response
@@ -597,12 +597,22 @@ def _connection_error_message(error: APIConnectionError) -> str:
     return f"LLM connection failed: {type(cause).__name__}: {str(cause)[:2000]}"
 
 
-def _structured_output_error(text: str, schema: dict[str, Any]) -> str:
+def _structured_output_error(
+    text: str, schema: dict[str, Any], *, defer_leaf_fields: bool = False,
+) -> str:
     try:
         data = load_json_object(text)
     except ValueError as exc:
         return str(exc)
     missing = [key for key in schema.get("required", []) if key not in data]
+    if defer_leaf_fields:
+        # Do not preempt the recorder's targeted field repair by regenerating
+        # a usable graph just because an annotation or role field is absent.
+        properties = schema.get("properties", {})
+        missing = [key for key in missing if not (
+            properties.get(key, {}).get("type") in ("string", "number", "integer", "boolean", "null")
+            or (properties.get(key, {}).get("type") == "array" and properties[key].get("minItems", 0) == 0)
+        )]
     return f"JSON object is missing required top-level fields: {missing!r}" if missing else ""
 
 

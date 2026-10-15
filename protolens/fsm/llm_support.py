@@ -253,7 +253,7 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 data = load_json_object(response.text)
-                normalizations = _normalize_missing_fsm_versions(data, schema)
+                normalizations = _normalize_fsm_metadata(data, schema, protocol=payload.get("protocol"))
                 if normalizations:
                     record["normalizations"] = normalizations
                 try:
@@ -297,30 +297,48 @@ class LLMConversationRecorder:
         ) from last_error
 
 
-def _normalize_missing_fsm_versions(
-    value: Any, schema: dict[str, Any], path: str = "$",
+def _normalize_fsm_metadata(
+    value: Any, schema: dict[str, Any], path: str = "$", *, protocol: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Make omitted, nullable FSM version metadata explicitly unknown.
+    """Restore known task identity and explicitly unknown version metadata.
 
-    Apply only this metadata default, never defaults for graph semantics or
+    Apply only these explicit metadata defaults, never defaults for graph semantics or
     evidence. The recorder retains the raw response and audits each change.
     """
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        is_fsm = {"protocol", "states", "transitions", "version"} <= properties.keys()
+        if is_fsm and "protocol" not in value and isinstance(protocol, str) and protocol.strip():
+            value["protocol"] = protocol
+            changes.append({"path": f"{path}.protocol", "value": protocol,
+                            "reason": "protocol_from_request_context"})
         version_types = properties.get("version", {}).get("type", [])
-        if ({"protocol", "states", "transitions", "version"} <= properties.keys()
+        if (is_fsm
                 and isinstance(version_types, list) and "null" in version_types
                 and "version" not in value):
             value["version"] = None
             changes.append({"path": f"{path}.version", "value": None,
                             "reason": "omitted_nullable_fsm_version"})
+        # State annotations are optional in the in-memory model. An empty
+        # description or citation list records their absence, not a new fact.
+        # Never apply this to transition evidence (which requires minItems=1).
+        if {"name", "description", "confidence"} <= properties.keys():
+            defaults: dict[str, Any] = {"description": ""}
+            evidence_schema = properties.get("evidence", {})
+            if evidence_schema.get("type") == "array" and evidence_schema.get("minItems", 0) == 0:
+                defaults["evidence"] = []
+            for key, default in defaults.items():
+                if key not in value:
+                    value[key] = default
+                    changes.append({"path": f"{path}.{key}", "value": default,
+                                    "reason": "omitted_state_annotation"})
         for key, item in value.items():
             if isinstance(properties.get(key), dict):
-                changes.extend(_normalize_missing_fsm_versions(item, properties[key], f"{path}.{key}"))
+                changes.extend(_normalize_fsm_metadata(item, properties[key], f"{path}.{key}", protocol=protocol))
     elif isinstance(value, list) and isinstance(schema.get("items"), dict):
         for index, item in enumerate(value):
-            changes.extend(_normalize_missing_fsm_versions(item, schema["items"], f"{path}[{index}]"))
+            changes.extend(_normalize_fsm_metadata(item, schema["items"], f"{path}[{index}]", protocol=protocol))
     return changes
 
 
@@ -454,7 +472,9 @@ def validate_divergences(items: Any) -> list[Divergence]:
     return result
 
 
-def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+def validate_json_schema(
+    value: Any, schema: dict[str, Any], path: str = "$", *, allow_missing: bool = False,
+) -> None:
     expected_type = schema.get("type")
     if expected_type is not None and not _matches_json_type(value, expected_type):
         raise ValueError(f"{path} must have JSON type {expected_type!r}, got {type(value).__name__}")
@@ -465,7 +485,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
     if isinstance(value, dict):
         required = schema.get("required", [])
         missing = [key for key in required if key not in value]
-        if missing:
+        if missing and not allow_missing:
             raise ValueError(f"{path} is missing required keys: {missing}")
         properties = schema.get("properties", {})
         if schema.get("additionalProperties") is False:
@@ -475,7 +495,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
         for key, item in value.items():
             child_schema = properties.get(key)
             if isinstance(child_schema, dict):
-                validate_json_schema(item, child_schema, f"{path}.{key}")
+                validate_json_schema(item, child_schema, f"{path}.{key}", allow_missing=allow_missing)
 
     if isinstance(value, list):
         if "minItems" in schema and len(value) < int(schema["minItems"]):
@@ -485,7 +505,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
-                validate_json_schema(item, item_schema, f"{path}[{index}]")
+                validate_json_schema(item, item_schema, f"{path}[{index}]", allow_missing=allow_missing)
 
     if isinstance(value, str) and "minLength" in schema and len(value.strip()) < int(schema["minLength"]):
         raise ValueError(f"{path} must contain at least {schema['minLength']} characters")

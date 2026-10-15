@@ -77,6 +77,7 @@ class FSMMerger:
         if self.recorder.llm_client.is_offline:
             raise RuntimeError("FSM comparison and merge require an online LLM")
         payload = {
+            "protocol": spec_fsm.protocol,
             "task": "Compare SpecificationFSM and ImplementationFSM, report conflicts, and produce UnifiedFSM.",
             "requirements": [
                 "Reason semantically about state aliases, guards, side effects, and error behavior.",

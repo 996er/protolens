@@ -207,7 +207,7 @@ ImplementationFSM 还会将每个通过校验的源码块原子保存到 `checkp
 
 FSM 对话审计日志跨运行追加保存，每条记录包含开始时间、schema/stage、原始响应和校验失败原因。结构化结果的 Schema 校验和语义校验共用有界重试预算；空 states/transitions、重复状态、未知端点、错误协议、缺失事实映射等都在接受结果前验证并向模型反馈。传输重试由 LLMClient 负责，耗尽后 recorder 不再次重复整组请求。最终错误标明组件和 schema，方便从 `findings/fsm_implementation.llm.jsonl` 等文件定位。
 
-共享响应入口对规范、实现和合并 FSM 的缺失 `version` 统一补为 `null`（版本未知），前提是对应 Schema 允许空值，并在对话记录的 `normalizations` 中保存字段路径及原因。已有版本值不覆盖，类型错误仍拒绝；不为协议、状态、边或证据补造默认值。此处理先于 Schema 校验和状态角色定向补全，因此版本与状态角色同时遗漏也可恢复。
+共享响应入口对规范、实现和合并 FSM 的缺失 `protocol` 从受信任的请求上下文补齐，缺失 `version` 补为 `null`（仅当 Schema 允许空值）。未提供的状态说明记为空字符串，未提供的状态级引用在 Schema 允许空列表时记为 `[]`；边上必须存在的证据不适用此规则。每项处理在对话记录的 `normalizations` 中保存字段路径及原因。已有值不覆盖，类型错误和协议冲突仍拒绝；不补造状态、边或证据内容。此处理先于 Schema 校验和缺失字段定向补全，因此多字段同时遗漏也可恢复。
 
 #### 4.1 SpecificationFSMBuilder
 
@@ -220,7 +220,7 @@ SpecificationFSMBuilder.build(config, implementation_capabilities)
   -> LLMClient.responses_json(web_search=true, tool_choice=required)
   -> max_web_search_calls 限制工具调用；有实际 Web Search 记录时，空正文、非 JSON 正文或缺少必需顶层字段都会触发无工具 Schema 补全请求。补全结果仍无效时只重试最终 JSON，反馈具体错误，不重复检索；耗尽后保留最后正文与检索记录
   -> 最终正文提取不回退读取 reasoning_content、encrypted_content 或工具参数。JSON 解析接受 BOM 和完整代码围栏，拒绝混入说明文字、HTML、多个 JSON 对象或非对象结果；完整 Schema 和 FSM 语义仍由 builder 校验
-  -> fsm 缺少 initial_state/terminal_states/error_states 时，先验证其余 Schema、实际检索记录和来源域名，再发起仅补全缺失字段的无工具请求；模型依据原图中的 RFC 证据从已声明状态中选择角色，不默认首个状态或空数组。完整结果重新执行 Schema、图结构和来源证据校验；原始响应、补全理由及 metadata.state_role_repairs 保留，补全耗尽重试后不会重启检索
+  -> 缺字段时按 Schema 递归收集所有缺失位置，验证已有值、实际检索记录和来源域名后，将可修复字段一次性提交给无工具补全请求。响应 Schema 为每个缺失位置分配独立字段，本地仅写入这些位置，不覆盖已有值；状态角色只能选择已声明名称。缺失整个图、状态名、来源 URL 或证据文本等核心数据时拒绝补造。补全结果重新执行完整 Schema、图结构和来源证据校验，记录 metadata.field_repairs；仅含角色字段时保留 metadata.state_role_repairs。补全耗尽重试后不会重启检索。客户端对缺少顶层说明字段的可解析结果交由此流程处理，避免提前重生整张图
   -> status=incomplete 且 reason=max_output_tokens 时保留原始响应：已完成 Web Search 的请求回放原始输入、搜索输出和加密推理上下文后进入无工具收口，其他请求按 2 倍提高 max_output_tokens 后重试；收口预算最低 24000，逐次倍增，上限 128000
   -> 失败的 incomplete 原始响应及 usage 会写入 findings/fsm_*.llm.jsonl，便于区分模型输出耗尽与空响应
   -> Web Search 仅允许 rfc-editor.org / datatracker.ietf.org / ietf.org
