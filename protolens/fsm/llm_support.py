@@ -321,6 +321,32 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if {"source_type", "location", "excerpt", "confidence"} <= properties.keys():
+            # Normalize citation aliases before the extension filter can move
+            # the only supplied quotation or URL out of the evidence object.
+            for alias, canonical in (
+                ("quote", "excerpt"), ("quotation", "excerpt"),
+                ("source_url", "location"), ("url", "location"),
+                ("type", "source_type"),
+            ):
+                if alias not in value or alias in properties:
+                    continue
+                if (canonical == "location" and isinstance(value.get(canonical), str)
+                        and isinstance(value[alias], str) and canonical_source_url(value[canonical])
+                        and canonical_source_url(value[canonical]) == canonical_source_url(value[alias])):
+                    # Keep the canonical location's section when an additional
+                    # source URL names the same RFC without its fragment.
+                    changes.append({"path": f"{path}.{alias}", "value": value.pop(alias),
+                                    "reason": "redundant_evidence_source_url"})
+                    continue
+                if canonical in value and value[canonical] != value[alias]:
+                    raise ValueError(
+                        f"{path} contains conflicting citation fields: "
+                        f"{canonical}={value[canonical]!r}, {alias}={value[alias]!r}"
+                    )
+                value[canonical] = value.pop(alias)
+                changes.append({"path": f"{path}.{canonical}", "value": value[canonical],
+                                "original_path": f"{path}.{alias}", "reason": "evidence_field_alias"})
         # Repair rationales are audit commentary, not the values being patched.
         # Keep strict output schemas for providers, but do not retry a valid
         # repair solely because this commentary was omitted or structured.
