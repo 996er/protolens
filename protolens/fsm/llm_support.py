@@ -310,6 +310,20 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        uncertainties_schema = properties.get("uncertainties", {})
+        if (uncertainties_schema.get("type") == "array"
+                and uncertainties_schema.get("items", {}).get("type") == "string"
+                and isinstance(value.get("uncertainties"), list)):
+            for index, uncertainty in enumerate(value["uncertainties"]):
+                if isinstance(uncertainty, (dict, list)):
+                    # Preserve every detail of structured commentary, including
+                    # nested citations, instead of selecting one text field.
+                    # This conversion must not apply to state names or evidence.
+                    rendered = json.dumps(uncertainty, ensure_ascii=False, sort_keys=True)
+                    value["uncertainties"][index] = rendered
+                    changes.append({"path": f"{path}.uncertainties[{index}]",
+                                    "original_value": uncertainty, "value": rendered,
+                                    "reason": "structured_uncertainty_to_string"})
         evidence_schema = properties.get("evidence", {})
         if (evidence_schema.get("type") == "array"
                 and evidence_schema.get("items", {}).get("type") == "object"
