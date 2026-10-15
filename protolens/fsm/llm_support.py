@@ -300,15 +300,33 @@ class LLMConversationRecorder:
 def _normalize_fsm_metadata(
     value: Any, schema: dict[str, Any], path: str = "$", *, protocol: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize known FSM metadata before strict schema validation.
+    """Normalize known FSM metadata and field aliases before strict validation.
 
-    Apply only explicit metadata compatibility rules, never defaults for graph
-    semantics or evidence. The recorder retains the raw response and audits each
-    change, including annotations removed from the schema-constrained object.
+    Apply only explicit compatibility rules, never defaults for graph semantics
+    or evidence. Conflicting aliases are rejected rather than choosing an edge.
+    The recorder retains the raw response and audits each change, including
+    annotations removed from the schema-constrained object.
     """
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if {"id", "source", "target", "trigger", "evidence"} <= properties.keys():
+            # Accept common endpoint aliases only on transition objects. The
+            # canonical endpoint values still undergo type and state checks.
+            for alias, canonical in (("from", "source"), ("to", "target")):
+                if alias not in value or alias in properties:
+                    continue
+                if canonical in value and value[canonical] != value[alias]:
+                    raise ValueError(
+                        f"{path} contains conflicting endpoint fields: "
+                        f"{canonical}={value[canonical]!r}, {alias}={value[alias]!r}. "
+                        f"Use only {canonical} with the evidence-backed state name."
+                    )
+                endpoint = value.pop(alias)
+                value[canonical] = endpoint
+                changes.append({"path": f"{path}.{canonical}", "value": endpoint,
+                                "original_path": f"{path}.{alias}",
+                                "reason": "transition_endpoint_alias"})
         is_fsm = {"protocol", "states", "transitions", "version"} <= properties.keys()
         # Some providers add a specification annotation to an otherwise valid
         # FSM. Keep it in the conversation audit, outside the strict graph
