@@ -321,6 +321,28 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if (properties.get("confidence", {}).get("type") == "number"
+                and isinstance(value.get("confidence"), str)):
+            original = value["confidence"]
+            numeric_text = original.strip()
+            percentage = numeric_text.endswith("%")
+            if percentage:
+                numeric_text = numeric_text[:-1].strip()
+            # Normalize explicit numbers only. Labels such as "high" have no
+            # defined numeric meaning; bare 95 must not silently become 0.95.
+            if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", numeric_text):
+                raise ValueError(
+                    f"{path}.confidence must be numeric or an explicit percentage, got {original!r}"
+                )
+            confidence = float(numeric_text)
+            if percentage:
+                confidence /= 100
+            if not math.isfinite(confidence):
+                raise ValueError(f"{path}.confidence must be finite, got {original!r}")
+            value["confidence"] = confidence
+            changes.append({"path": f"{path}.confidence", "original_value": original,
+                            "value": confidence, "reason": "numeric_confidence_string"})
+            # The original schema still checks the permitted range below.
         if {"source_type", "location", "excerpt", "confidence"} <= properties.keys():
             # Normalize citation aliases before the extension filter can move
             # the only supplied quotation or URL out of the evidence object.
