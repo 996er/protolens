@@ -381,8 +381,25 @@ def _normalize_fsm_metadata(
             if isinstance(properties.get(key), dict):
                 changes.extend(_normalize_fsm_metadata(item, properties[key], f"{path}.{key}", protocol=protocol))
     elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        item_schema = schema["items"]
+        is_state = (
+            item_schema.get("type") == "object"
+            and {"name", "description", "evidence", "confidence"}
+            <= item_schema.get("properties", {}).keys()
+        )
         for index, item in enumerate(value):
-            changes.extend(_normalize_fsm_metadata(item, schema["items"], f"{path}[{index}]", protocol=protocol))
+            if is_state and isinstance(item, str):
+                # A bare string explicitly declares a state name, but supplies
+                # no annotations or supporting evidence. Do not invent either
+                # or inherit the in-memory model's default full confidence.
+                # Keep the name unchanged so empty/duplicate names and endpoint
+                # mismatches still fail the normal schema/graph validation.
+                original = item
+                item = {"name": original, "description": "", "evidence": [], "confidence": 0.0}
+                value[index] = item
+                changes.append({"path": f"{path}[{index}]", "original_value": original,
+                                "value": dict(item), "reason": "state_name_string_to_object"})
+            changes.extend(_normalize_fsm_metadata(item, item_schema, f"{path}[{index}]", protocol=protocol))
     return changes
 
 
