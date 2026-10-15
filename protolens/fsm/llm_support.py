@@ -10,6 +10,7 @@ import re
 
 from protolens.fsm.fsm_model import Divergence, ProtocolFSM
 from protolens.utils.llm_client import IncompleteLLMResponse, LLMClient, LLMResponse
+from protolens.utils.json_output import load_json_object
 
 
 EVIDENCE_SCHEMA: dict[str, Any] = {
@@ -262,7 +263,7 @@ class LLMConversationRecorder:
                 raw = getattr(exc, "raw", None)
                 if isinstance(raw, dict):
                     record["response"] = {
-                        "text": "",
+                        "text": getattr(exc, "text", ""),
                         "provider": self.llm_client.provider,
                         "model": self.llm_client.model,
                         "raw": raw,
@@ -411,22 +412,6 @@ def validate_divergences(items: Any) -> list[Divergence]:
             raise ValueError(f"unsupported divergence severity: {item.get('severity')!r}")
         result.append(Divergence.from_dict(item))
     return result
-
-
-def load_json_object(text: str) -> dict[str, Any]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        first_newline = stripped.find("\n")
-        stripped = stripped[first_newline + 1 :] if first_newline >= 0 else ""
-        if stripped.endswith("```"):
-            stripped = stripped[:-3]
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"LLM output contains non-finite JSON number {value}")
-
-    data = json.loads(stripped, parse_constant=reject_constant)
-    if not isinstance(data, dict):
-        raise ValueError("LLM output must be a JSON object")
-    return data
 
 
 def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
