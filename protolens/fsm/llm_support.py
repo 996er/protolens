@@ -300,15 +300,24 @@ class LLMConversationRecorder:
 def _normalize_fsm_metadata(
     value: Any, schema: dict[str, Any], path: str = "$", *, protocol: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Restore known task identity and explicitly unknown version metadata.
+    """Normalize known FSM metadata before strict schema validation.
 
-    Apply only these explicit metadata defaults, never defaults for graph semantics or
-    evidence. The recorder retains the raw response and audits each change.
+    Apply only explicit metadata compatibility rules, never defaults for graph
+    semantics or evidence. The recorder retains the raw response and audits each
+    change, including annotations removed from the schema-constrained object.
     """
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
         is_fsm = {"protocol", "states", "transitions", "version"} <= properties.keys()
+        # Some providers add a specification annotation to an otherwise valid
+        # FSM. Keep it in the conversation audit, outside the strict graph
+        # object. It must not substitute for states, transitions, or the
+        # top-level sources: those still undergo their normal validation.
+        if is_fsm and "specification" in value and "specification" not in properties:
+            annotation = value.pop("specification")
+            changes.append({"path": f"{path}.specification", "value": annotation,
+                            "reason": "fsm_annotation_preserved_in_audit"})
         if is_fsm and "protocol" not in value and isinstance(protocol, str) and protocol.strip():
             value["protocol"] = protocol
             changes.append({"path": f"{path}.protocol", "value": protocol,
