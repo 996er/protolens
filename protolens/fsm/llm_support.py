@@ -300,12 +300,12 @@ class LLMConversationRecorder:
 def _normalize_fsm_metadata(
     value: Any, schema: dict[str, Any], path: str = "$", *, protocol: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Normalize known FSM metadata and field aliases before strict validation.
+    """Normalize FSM aliases and separate extensions before strict validation.
 
-    Apply only explicit compatibility rules, never defaults for graph semantics
-    or evidence. Conflicting aliases are rejected rather than choosing an edge.
-    The recorder retains the raw response and audits each change, including
-    annotations removed from the schema-constrained object.
+    Apply known aliases before moving undeclared fields to the audit. Required
+    fields, supplied values and graph semantics still undergo strict validation;
+    extensions cannot substitute for evidence or missing graph fields. Schemas
+    that permit additional properties retain them. The raw response is preserved.
     """
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
@@ -327,21 +327,7 @@ def _normalize_fsm_metadata(
                 changes.append({"path": f"{path}.{canonical}", "value": endpoint,
                                 "original_path": f"{path}.{alias}",
                                 "reason": "transition_endpoint_alias"})
-            # Notes are supplementary model commentary, not transition actions
-            # or evidence. Retain them in the audit outside the strict graph.
-            if "notes" in value and "notes" not in properties:
-                annotation = value.pop("notes")
-                changes.append({"path": f"{path}.notes", "value": annotation,
-                                "reason": "transition_annotation_preserved_in_audit"})
         is_fsm = {"protocol", "states", "transitions", "version"} <= properties.keys()
-        # Some providers add a specification annotation to an otherwise valid
-        # FSM. Keep it in the conversation audit, outside the strict graph
-        # object. It must not substitute for states, transitions, or the
-        # top-level sources: those still undergo their normal validation.
-        if is_fsm and "specification" in value and "specification" not in properties:
-            annotation = value.pop("specification")
-            changes.append({"path": f"{path}.specification", "value": annotation,
-                            "reason": "fsm_annotation_preserved_in_audit"})
         if is_fsm and "protocol" not in value and isinstance(protocol, str) and protocol.strip():
             value["protocol"] = protocol
             changes.append({"path": f"{path}.protocol", "value": protocol,
@@ -381,6 +367,16 @@ def _normalize_fsm_metadata(
                     separator = "\n" if description else ""
                     rendered = json.dumps(annotation, ensure_ascii=False)
                     value["description"] = f"{description}{separator}{key}: {rendered}"
+        # Provider outputs often include descriptive extensions such as FSM
+        # name/specification or transition notes. Handle all undeclared keys
+        # consistently at every schema level, instead of maintaining a growing
+        # allowlist. Never copy an unknown field into a semantic field or relax
+        # the schema validator: required fields and known values remain checked.
+        if schema.get("additionalProperties") is False:
+            for key in sorted(set(value) - set(properties)):
+                extension = value.pop(key)
+                changes.append({"path": f"{path}.{key}", "value": extension,
+                                "reason": "unexpected_field_preserved_in_audit"})
         for key, item in value.items():
             if isinstance(properties.get(key), dict):
                 changes.extend(_normalize_fsm_metadata(item, properties[key], f"{path}.{key}", protocol=protocol))
