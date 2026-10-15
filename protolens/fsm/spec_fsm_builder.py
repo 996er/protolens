@@ -11,6 +11,7 @@ from protolens.fsm.llm_support import (
     FSM_SCHEMA,
     LLMConversationRecorder,
     LLMValidationError,
+    _normalize_fsm_metadata,
     canonical_source_url,
     fsm_from_llm,
     normalize_fsm_protocol,
@@ -322,6 +323,29 @@ class SpecificationFSMBuilder:
                 target[path[-1]] = result[slot]
             return candidate
 
+        def normalize_repair(result: dict[str, Any]) -> list[dict[str, Any]]:
+            changes: list[dict[str, Any]] = []
+            for slot, path in slots.items():
+                if slot not in result:
+                    # Missing repair values still require a real model answer.
+                    continue
+                field = str(path[-1])
+                wrapper = {field: result[slot]}
+                wrapper_schema = {"type": "object", "properties": {field: properties[slot]}}
+                parent_path = "$" + "".join(
+                    f"[{part}]" if isinstance(part, int) else f".{part}"
+                    for part in path[:-1]
+                )
+                # Opaque field_N slots otherwise hide their field identity from
+                # the shared normalizer (e.g. structured uncertainties). Apply
+                # exactly the same compatibility rules as the original result,
+                # before slot validation, and retain the changes in the audit.
+                changes.extend(_normalize_fsm_metadata(
+                    wrapper, wrapper_schema, parent_path, protocol=config.protocol,
+                ))
+                result[slot] = wrapper[field]
+            return changes
+
         def validate_repair(result: dict[str, Any]) -> None:
             candidate = patched(result)
             validate_json_schema(candidate, SPECIFICATION_RESULT_SCHEMA)
@@ -350,6 +374,7 @@ class SpecificationFSMBuilder:
                 schema=schema, schema_name=("protolens_specification_state_roles_repair" if role_only
                                             else "protolens_specification_fields_repair"),
                 validator=validate_repair,
+                result_normalizer=normalize_repair,
             )
         except LLMValidationError as exc:
             # This narrow repair owns its validation budget; exhausting it must

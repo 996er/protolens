@@ -108,6 +108,7 @@ class LLMConversationRecorder:
         schema_name: str,
         validator: Callable[[dict[str, Any]], None] | None = None,
         validation_retries: int | None = None,
+        result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         return self._call(
             system=system,
@@ -118,6 +119,7 @@ class LLMConversationRecorder:
             allowed_domains=None,
             validator=validator,
             validation_retries=validation_retries,
+            result_normalizer=result_normalizer,
         )
 
     def call_web(
@@ -183,6 +185,7 @@ class LLMConversationRecorder:
         max_tool_calls: int | None = None,
         validator: Callable[[dict[str, Any]], None] | None = None,
         validation_retries: int | None = None,
+        result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         data, _ = self._call_with_response(
             system=system,
@@ -194,6 +197,7 @@ class LLMConversationRecorder:
             max_tool_calls=max_tool_calls,
             validator=validator,
             validation_retries=validation_retries,
+            result_normalizer=result_normalizer,
         )
         return data
 
@@ -211,6 +215,7 @@ class LLMConversationRecorder:
         response_validator: Callable[[dict[str, Any], LLMResponse], None] | None = None,
         schema_repairer: Callable[[dict[str, Any], LLMResponse, ValueError], dict[str, Any]] | None = None,
         validation_retries: int | None = None,
+        result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         last_error: Exception | None = None
@@ -253,7 +258,12 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 data = load_json_object(response.text)
-                normalizations = _normalize_fsm_metadata(data, schema, protocol=payload.get("protocol"))
+                normalizations = _normalize_fsm_metadata(
+                    data, schema, protocol=payload.get("protocol"),
+                    repair_response=schema_name.endswith("_repair"),
+                )
+                if result_normalizer is not None:
+                    normalizations.extend(result_normalizer(data))
                 if normalizations:
                     record["normalizations"] = normalizations
                 try:
@@ -299,6 +309,7 @@ class LLMConversationRecorder:
 
 def _normalize_fsm_metadata(
     value: Any, schema: dict[str, Any], path: str = "$", *, protocol: str | None = None,
+    repair_response: bool = False,
 ) -> list[dict[str, Any]]:
     """Normalize FSM aliases and separate extensions before strict validation.
 
@@ -310,6 +321,22 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        # Repair rationales are audit commentary, not the values being patched.
+        # Keep strict output schemas for providers, but do not retry a valid
+        # repair solely because this commentary was omitted or structured.
+        # This policy does not apply to merge/latestness rationales or evidence.
+        if repair_response and properties.get("rationale", {}).get("type") == "string":
+            rationale = value.get("rationale")
+            rendered = None
+            if rationale is None or (isinstance(rationale, str) and not rationale.strip()):
+                rendered = "[ProtoLens audit] Model supplied no repair rationale; no justification was inferred."
+            elif isinstance(rationale, (dict, list)):
+                rendered = json.dumps(rationale, ensure_ascii=False, sort_keys=True)
+            if rendered is not None:
+                changes.append({"path": f"{path}.rationale", "original_value": rationale,
+                                "was_missing": "rationale" not in value, "value": rendered,
+                                "reason": "repair_rationale_annotation_normalized"})
+                value["rationale"] = rendered
         uncertainties_schema = properties.get("uncertainties", {})
         if (uncertainties_schema.get("type") == "array"
                 and uncertainties_schema.get("items", {}).get("type") == "string"
@@ -403,7 +430,10 @@ def _normalize_fsm_metadata(
                                 "reason": "unexpected_field_preserved_in_audit"})
         for key, item in value.items():
             if isinstance(properties.get(key), dict):
-                changes.extend(_normalize_fsm_metadata(item, properties[key], f"{path}.{key}", protocol=protocol))
+                changes.extend(_normalize_fsm_metadata(
+                    item, properties[key], f"{path}.{key}", protocol=protocol,
+                    repair_response=repair_response,
+                ))
     elif isinstance(value, list) and isinstance(schema.get("items"), dict):
         item_schema = schema["items"]
         is_state = (
@@ -423,7 +453,10 @@ def _normalize_fsm_metadata(
                 value[index] = item
                 changes.append({"path": f"{path}[{index}]", "original_value": original,
                                 "value": dict(item), "reason": "state_name_string_to_object"})
-            changes.extend(_normalize_fsm_metadata(item, item_schema, f"{path}[{index}]", protocol=protocol))
+            changes.extend(_normalize_fsm_metadata(
+                item, item_schema, f"{path}[{index}]", protocol=protocol,
+                repair_response=repair_response,
+            ))
     return changes
 
 
