@@ -327,6 +327,12 @@ def _normalize_fsm_metadata(
                 changes.append({"path": f"{path}.{canonical}", "value": endpoint,
                                 "original_path": f"{path}.{alias}",
                                 "reason": "transition_endpoint_alias"})
+            # Notes are supplementary model commentary, not transition actions
+            # or evidence. Retain them in the audit outside the strict graph.
+            if "notes" in value and "notes" not in properties:
+                annotation = value.pop("notes")
+                changes.append({"path": f"{path}.notes", "value": annotation,
+                                "reason": "transition_annotation_preserved_in_audit"})
         is_fsm = {"protocol", "states", "transitions", "version"} <= properties.keys()
         # Some providers add a specification annotation to an otherwise valid
         # FSM. Keep it in the conversation audit, outside the strict graph
