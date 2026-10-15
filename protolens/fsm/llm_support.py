@@ -131,6 +131,7 @@ class LLMConversationRecorder:
         max_tool_calls: int,
         validator: Callable[[dict[str, Any]], None] | None = None,
         response_validator: Callable[[dict[str, Any], LLMResponse], None] | None = None,
+        schema_repairer: Callable[[dict[str, Any], LLMResponse, ValueError], dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         data, response = self._call_with_response(
             system=system,
@@ -142,6 +143,7 @@ class LLMConversationRecorder:
             max_tool_calls=max_tool_calls,
             validator=validator,
             response_validator=response_validator,
+            schema_repairer=schema_repairer,
         )
         return data, response
 
@@ -207,6 +209,7 @@ class LLMConversationRecorder:
         max_tool_calls: int | None = None,
         validator: Callable[[dict[str, Any]], None] | None = None,
         response_validator: Callable[[dict[str, Any], LLMResponse], None] | None = None,
+        schema_repairer: Callable[[dict[str, Any], LLMResponse, ValueError], dict[str, Any]] | None = None,
         validation_retries: int | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -250,7 +253,14 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 data = load_json_object(response.text)
-                validate_json_schema(data, schema)
+                try:
+                    validate_json_schema(data, schema)
+                except ValueError as schema_error:
+                    if schema_repairer is None:
+                        raise
+                    record["schema_error_before_repair"] = str(schema_error)
+                    data = schema_repairer(data, response, schema_error)
+                    validate_json_schema(data, schema)
                 if validator is not None:
                     validator(data)
                 if response_validator is not None:

@@ -218,6 +218,7 @@ SpecificationFSMBuilder.build(config, implementation_capabilities)
   -> LLMClient.responses_json(web_search=true, tool_choice=required)
   -> max_web_search_calls 限制工具调用；有实际 Web Search 记录时，空正文、非 JSON 正文或缺少必需顶层字段都会触发无工具 Schema 补全请求。补全结果仍无效时只重试最终 JSON，反馈具体错误，不重复检索；耗尽后保留最后正文与检索记录
   -> 最终正文提取不回退读取 reasoning_content、encrypted_content 或工具参数。JSON 解析接受 BOM 和完整代码围栏，拒绝混入说明文字、HTML、多个 JSON 对象或非对象结果；完整 Schema 和 FSM 语义仍由 builder 校验
+  -> fsm 缺少 initial_state/terminal_states/error_states 时，先验证其余 Schema、实际检索记录和来源域名，再发起仅补全缺失字段的无工具请求；模型依据原图中的 RFC 证据从已声明状态中选择角色，不默认首个状态或空数组。完整结果重新执行 Schema、图结构和来源证据校验；原始响应、补全理由及 metadata.state_role_repairs 保留，补全耗尽重试后不会重启检索
   -> status=incomplete 且 reason=max_output_tokens 时保留原始响应：已完成 Web Search 的请求回放原始输入、搜索输出和加密推理上下文后进入无工具收口，其他请求按 2 倍提高 max_output_tokens 后重试；收口预算最低 24000，逐次倍增，上限 128000
   -> 失败的 incomplete 原始响应及 usage 会写入 findings/fsm_*.llm.jsonl，便于区分模型输出耗尽与空响应
   -> Web Search 仅允许 rfc-editor.org / datatracker.ietf.org / ietf.org
