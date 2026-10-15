@@ -310,6 +310,16 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        evidence_schema = properties.get("evidence", {})
+        if (evidence_schema.get("type") == "array"
+                and evidence_schema.get("items", {}).get("type") == "object"
+                and isinstance(value.get("evidence"), dict)):
+            # Accept a single citation wherever an evidence array is expected.
+            # Preserve the supplied object and validate it recursively below;
+            # empty or malformed citations must not become valid evidence.
+            value["evidence"] = [value["evidence"]]
+            changes.append({"path": f"{path}.evidence", "original_type": "object",
+                            "reason": "single_evidence_object_to_array"})
         if {"id", "source", "target", "trigger", "evidence"} <= properties.keys():
             # Accept common endpoint aliases only on transition objects. The
             # canonical endpoint values still undergo type and state checks.
