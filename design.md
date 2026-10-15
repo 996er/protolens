@@ -207,6 +207,8 @@ ImplementationFSM 还会将每个通过校验的源码块原子保存到 `checkp
 
 FSM 对话审计日志跨运行追加保存，每条记录包含开始时间、schema/stage、原始响应和校验失败原因。结构化结果的 Schema 校验和语义校验共用有界重试预算；空 states/transitions、重复状态、未知端点、错误协议、缺失事实映射等都在接受结果前验证并向模型反馈。传输重试由 LLMClient 负责，耗尽后 recorder 不再次重复整组请求。最终错误标明组件和 schema，方便从 `findings/fsm_implementation.llm.jsonl` 等文件定位。
 
+共享响应入口对规范、实现和合并 FSM 的缺失 `version` 统一补为 `null`（版本未知），前提是对应 Schema 允许空值，并在对话记录的 `normalizations` 中保存字段路径及原因。已有版本值不覆盖，类型错误仍拒绝；不为协议、状态、边或证据补造默认值。此处理先于 Schema 校验和状态角色定向补全，因此版本与状态角色同时遗漏也可恢复。
+
 #### 4.1 SpecificationFSMBuilder
 
 规范 FSM 构建只走在线模型：

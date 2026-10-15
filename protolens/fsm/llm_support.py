@@ -253,6 +253,9 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 data = load_json_object(response.text)
+                normalizations = _normalize_missing_fsm_versions(data, schema)
+                if normalizations:
+                    record["normalizations"] = normalizations
                 try:
                     validate_json_schema(data, schema)
                 except ValueError as schema_error:
@@ -292,6 +295,33 @@ class LLMConversationRecorder:
         raise LLMValidationError(
             f"{self.name}/{schema_name}: invalid LLM result after {retries + 1} attempt(s): {last_error}"
         ) from last_error
+
+
+def _normalize_missing_fsm_versions(
+    value: Any, schema: dict[str, Any], path: str = "$",
+) -> list[dict[str, Any]]:
+    """Make omitted, nullable FSM version metadata explicitly unknown.
+
+    Apply only this metadata default, never defaults for graph semantics or
+    evidence. The recorder retains the raw response and audits each change.
+    """
+    changes: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        version_types = properties.get("version", {}).get("type", [])
+        if ({"protocol", "states", "transitions", "version"} <= properties.keys()
+                and isinstance(version_types, list) and "null" in version_types
+                and "version" not in value):
+            value["version"] = None
+            changes.append({"path": f"{path}.version", "value": None,
+                            "reason": "omitted_nullable_fsm_version"})
+        for key, item in value.items():
+            if isinstance(properties.get(key), dict):
+                changes.extend(_normalize_missing_fsm_versions(item, properties[key], f"{path}.{key}"))
+    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for index, item in enumerate(value):
+            changes.extend(_normalize_missing_fsm_versions(item, schema["items"], f"{path}[{index}]"))
+    return changes
 
 
 def fsm_from_llm(data: Any, *, builder: str, metadata: dict[str, Any] | None = None) -> ProtocolFSM:
