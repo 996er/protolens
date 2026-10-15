@@ -76,6 +76,12 @@ class FSMMerger:
     def merge(self, spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM) -> tuple[ProtocolFSM, list[Divergence]]:
         if self.recorder.llm_client.is_offline:
             raise RuntimeError("FSM comparison and merge require an online LLM")
+        # Match the model-facing output schema instead of teaching the model
+        # the name-indexed state representation used by persisted artifacts.
+        spec_payload = spec_fsm.to_dict()
+        impl_payload = impl_fsm.to_dict()
+        spec_payload["states"] = list(spec_payload["states"].values())
+        impl_payload["states"] = list(impl_payload["states"].values())
         payload = {
             "protocol": spec_fsm.protocol,
             "task": "Compare SpecificationFSM and ImplementationFSM, report conflicts, and produce UnifiedFSM.",
@@ -86,11 +92,12 @@ class FSMMerger:
                 "Do not silently drop any input transition.",
                 "Map every input transition id in transition_sources to its unified transition.",
                 "Never cite evidence absent from the two input FSMs.",
+                "Return unified_fsm.states as an array of state objects, each with name, description, evidence and confidence.",
                 "Every transition source and target must exactly match a name in unified_fsm.states.",
                 "When renaming or merging states, update all transition endpoints and initial/terminal/error state references.",
             ],
-            "specification_fsm": spec_fsm.to_dict(),
-            "implementation_fsm": impl_fsm.to_dict(),
+            "specification_fsm": spec_payload,
+            "implementation_fsm": impl_payload,
         }
         result: tuple[ProtocolFSM, list[Divergence]] | None = None
 

@@ -321,6 +321,29 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        states_schema = properties.get("states", {})
+        state_schema = states_schema.get("items", {})
+        if (states_schema.get("type") == "array" and state_schema.get("type") == "object"
+                and {"name", "description", "evidence", "confidence"}
+                <= state_schema.get("properties", {}).keys()
+                and isinstance(value.get("states"), dict)):
+            # ProtocolFSM's persisted representation indexes states by name;
+            # providers may copy it even when the output schema uses an array.
+            # Convert the container without dropping annotations or silently
+            # choosing between conflicting identities.
+            states = []
+            for name, state in value["states"].items():
+                if not isinstance(state, dict):
+                    raise ValueError(f"{path}.states[{name!r}] must be a state object")
+                if "name" in state and state["name"] != name:
+                    raise ValueError(
+                        f"{path}.states contains conflicting state names: "
+                        f"dictionary key={name!r}, name={state['name']!r}"
+                    )
+                states.append({**state, "name": name})
+            changes.append({"path": f"{path}.states", "state_names": list(value["states"]),
+                            "reason": "state_mapping_to_array"})
+            value["states"] = states
         if (properties.get("confidence", {}).get("type") == "number"
                 and isinstance(value.get("confidence"), str)):
             original = value["confidence"]
