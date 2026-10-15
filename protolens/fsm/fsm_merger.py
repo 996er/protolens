@@ -7,9 +7,11 @@ from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
     FSM_SCHEMA,
     LLMConversationRecorder,
+    LLMValidationError,
     fsm_from_llm,
     normalize_fsm_protocol,
     validate_divergences,
+    validate_json_schema,
 )
 from protolens.utils.llm_client import LLMClient
 
@@ -91,6 +93,7 @@ class FSMMerger:
                 "Report every material conflict as a typed divergence with security-aware priority.",
                 "Do not silently drop any input transition.",
                 "Map every input transition id in transition_sources to its unified transition.",
+                "Every transition_sources entry must include spec_transition_ids and impl_transition_ids arrays; use [] only for a side with no supporting input transition.",
                 "Never cite evidence absent from the two input FSMs.",
                 "Return unified_fsm.states as an array of state objects, each with name, description, evidence and confidence.",
                 "Every transition source and target must exactly match a name in unified_fsm.states.",
@@ -115,9 +118,87 @@ class FSMMerger:
             schema=MERGE_RESULT_SCHEMA,
             schema_name="protolens_fsm_merge",
             validator=validate_result,
+            result_normalizer=lambda data: self._repair_transition_source_fields(data, spec_fsm, impl_fsm),
         )
         assert result is not None
         return result
+
+    def _repair_transition_source_fields(
+        self, data: dict[str, Any], spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM,
+    ) -> list[dict[str, Any]]:
+        mappings = data.get("transition_sources")
+        if not isinstance(mappings, list):
+            return []
+        fields = ("spec_transition_ids", "impl_transition_ids")
+        missing = {index: [field for field in fields if field not in mapping]
+                   for index, mapping in enumerate(mappings) if isinstance(mapping, dict)
+                   and any(field not in mapping for field in fields)}
+        if not missing:
+            return []
+        validate_json_schema(data, MERGE_RESULT_SCHEMA, allow_missing=True)
+        if any("unified_transition_id" not in mappings[index] for index in missing):
+            return []  # No unambiguous target; let the ordinary schema retry handle it.
+        source_schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["mapping_index", *fields],
+            "properties": {
+                "mapping_index": {"type": "integer", "enum": list(missing)},
+                "spec_transition_ids": {"type": "array", "items": {
+                    "type": "string", "enum": [transition.id for transition in spec_fsm.transitions]}},
+                "impl_transition_ids": {"type": "array", "items": {
+                    "type": "string", "enum": [transition.id for transition in impl_fsm.transitions]}},
+            },
+        }
+        schema = {
+            "type": "object", "additionalProperties": False, "required": ["repairs"],
+            "properties": {"repairs": {"type": "array", "items": source_schema,
+                                       "minItems": len(missing), "maxItems": len(missing)}},
+        }
+
+        def patched(result: dict[str, Any]) -> list[dict[str, Any]]:
+            indices = [repair["mapping_index"] for repair in result["repairs"]]
+            if len(set(indices)) != len(indices) or set(indices) != set(missing):
+                raise ValueError("source mapping repair must cover each incomplete entry exactly once")
+            candidate = [dict(mapping) for mapping in mappings]
+            for repair in result["repairs"]:
+                index = repair["mapping_index"]
+                for field in fields:
+                    if field not in missing[index] and candidate[index][field] != repair[field]:
+                        raise ValueError(f"source mapping repair changed existing transition_sources[{index}].{field}")
+                    candidate[index][field] = repair[field]
+            return candidate
+
+        def validate_repair(result: dict[str, Any]) -> None:
+            self._parse_merge_result({**data, "transition_sources": patched(result)}, spec_fsm, impl_fsm)
+
+        try:
+            result = self.recorder.call_chat(
+                system="Complete missing source mappings for a fixed merged FSM using only the supplied input transitions.",
+                payload={
+                    "protocol": spec_fsm.protocol,
+                    "missing_fields": [{"mapping_index": index, "fields": fields} for index, fields in missing.items()],
+                    "transition_sources": mappings,
+                    "unified_fsm": data.get("unified_fsm"),
+                    "spec_transitions": spec_fsm.to_dict()["transitions"],
+                    "impl_transitions": impl_fsm.to_dict()["transitions"],
+                    "requirements": [
+                        "Match source transitions using behavior and evidence, never ID spelling alone.",
+                        "Fill only missing lists; copy existing lists unchanged. Do not modify the FSM.",
+                        "Use [] only when that side has no supporting transition; every merged transition needs a source.",
+                        "Across all mappings, preserve coverage of every specification and implementation input transition.",
+                    ],
+                },
+                schema=schema, schema_name="protolens_merge_source_mapping_repair",
+                validator=validate_repair,
+            )
+        except LLMValidationError as exc:
+            raise RuntimeError(f"FSM merge source mapping repair failed: {exc}") from exc
+        repaired = patched(result)
+        changes = [{"path": f"$.transition_sources[{index}].{field}", "value": repaired[index][field],
+                    "reason": "missing_transition_sources_repaired"}
+                   for index, fields in missing.items() for field in fields]
+        data["transition_sources"] = repaired
+        return changes
 
     def _parse_merge_result(
         self, data: dict[str, Any], spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM
@@ -155,6 +236,7 @@ class FSMMerger:
         unified_ids = {item.id for item in unified_fsm.transitions}
         seen_spec: set[str] = set()
         seen_impl: set[str] = set()
+        seen_unified: set[str] = set()
         for mapping in mappings:
             if not isinstance(mapping, dict):
                 raise ValueError("transition_sources entries must be objects")
@@ -163,12 +245,17 @@ class FSMMerger:
                 raise ValueError(f"transition_sources references unknown unified id: {unified_id!r}")
             spec_ids = {str(item) for item in mapping.get("spec_transition_ids", [])}
             impl_ids = {str(item) for item in mapping.get("impl_transition_ids", [])}
+            if not spec_ids and not impl_ids:
+                raise ValueError(f"transition_sources entry for {unified_id!r} has no input sources")
             if not spec_ids <= expected_spec:
                 raise ValueError(f"transition_sources contains unknown spec ids: {sorted(spec_ids - expected_spec)}")
             if not impl_ids <= expected_impl:
                 raise ValueError(f"transition_sources contains unknown impl ids: {sorted(impl_ids - expected_impl)}")
             seen_spec.update(spec_ids)
             seen_impl.update(impl_ids)
+            seen_unified.add(unified_id)
+        if seen_unified != unified_ids:
+            raise ValueError(f"transition_sources omitted unified transitions: {sorted(unified_ids - seen_unified)}")
         if seen_spec != expected_spec or seen_impl != expected_impl:
             raise ValueError(
                 "LLM merge omitted input transitions: "

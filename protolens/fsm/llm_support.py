@@ -321,6 +321,26 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if ({"spec_transition_ids", "impl_transition_ids"} <= properties.keys()
+                and ("unified_transition_id" in properties or "mapping_index" in properties)):
+            for canonical, aliases in (
+                ("spec_transition_ids", ("spec_transition_id", "spec_ids", "specification_transition_ids")),
+                ("impl_transition_ids", ("impl_transition_id", "impl_ids", "implementation_transition_ids")),
+            ):
+                for field in (canonical, *aliases):
+                    if isinstance(value.get(field), str):
+                        original = value[field]
+                        value[field] = [original]
+                        changes.append({"path": f"{path}.{field}", "original_value": original,
+                                        "value": [original], "reason": "single_transition_source_id"})
+                for alias in aliases:
+                    if alias not in value or alias in properties:
+                        continue
+                    if canonical in value and value[canonical] != value[alias]:
+                        raise ValueError(f"{path} contains conflicting source mappings: {canonical}, {alias}")
+                    value[canonical] = value.pop(alias)
+                    changes.append({"path": f"{path}.{canonical}", "original_path": f"{path}.{alias}",
+                                    "value": value[canonical], "reason": "transition_source_alias"})
         states_schema = properties.get("states", {})
         state_schema = states_schema.get("items", {})
         if (states_schema.get("type") == "array" and state_schema.get("type") == "object"
