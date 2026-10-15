@@ -332,6 +332,29 @@ def _normalize_fsm_metadata(
                 if alias not in value or alias in properties:
                     continue
                 if (canonical == "location" and isinstance(value.get(canonical), str)
+                        and value[canonical].strip() and not canonical_source_url(value[canonical])
+                        and isinstance(value[alias], str)
+                        and re.fullmatch(r"https?://\S+", value[alias].strip())
+                        and urlparse(value[alias].strip()).hostname):
+                    # A section title and a document URL are complementary.
+                    # Keep the title verbatim; do not invent a fragment whose
+                    # spelling may differ between RFC publishers/formats.
+                    location = value[canonical]
+                    source_url = value[alias].strip()
+                    source_id = canonical_source_url(source_url)
+                    named_rfcs = {f"rfc:{int(number)}" for number in re.findall(
+                        r"\bRFC\s*0*(\d+)\b", location, re.IGNORECASE,
+                    )}
+                    if not named_rfcs or named_rfcs == {source_id}:
+                        original_url = value.pop(alias)
+                        value[canonical] = f"{source_url} {location}"
+                        changes.append({
+                            "path": f"{path}.{canonical}", "value": value[canonical],
+                            "original_value": location, "original_path": f"{path}.{alias}",
+                            "original_url": original_url, "reason": "evidence_url_and_section_combined",
+                        })
+                        continue
+                if (canonical == "location" and isinstance(value.get(canonical), str)
                         and isinstance(value[alias], str) and canonical_source_url(value[canonical])
                         and canonical_source_url(value[canonical]) == canonical_source_url(value[alias])):
                     # Keep the canonical location's section when an additional
