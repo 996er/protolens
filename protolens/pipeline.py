@@ -57,7 +57,7 @@ class ProtoLensPipeline:
         self.llm_client = LLMClient.from_config(config.llm)
         self.spec_builder = SpecificationFSMBuilder(self.llm_client)
         self.impl_builder = ImplementationFSMBuilder(self.llm_client)
-        self.merger = FSMMerger(self.llm_client)
+        self.merger = FSMMerger(self.llm_client, config.fsm_build)
         self.direction_generator = DirectionGenerator()
         self.agents = [
             AttackerAgent(self.llm_client),
@@ -204,10 +204,11 @@ class ProtoLensPipeline:
                 raise ValueError(f"{name} is required before merge-fsm")
         spec_fsm = ProtocolFSM.from_dict(self.store.read_json("spec_fsm.json"))
         impl_fsm = self._load_implementation_fsm()
-        artifacts = ["unified_fsm.json", "divergences.json"]
+        artifacts = ["unified_fsm.json", "divergences.json", "merge_decisions.json"]
         fingerprint = stable_fingerprint(
             {
                 "builder": self.merger.CACHE_VERSION,
+                "merge_limits": self.merger.cache_settings(),
                 "spec_fsm_sha256": file_sha256(self.store.path("spec_fsm.json")),
                 "impl_fsm_sha256": file_sha256(self.store.path("impl_fsm.json")),
                 "implementation_evidence_sha256": file_sha256(
@@ -226,7 +227,10 @@ class ProtoLensPipeline:
         self.checkpoints.invalidate("merge")
         self.logger.info("merging FSMs and detecting divergences")
         try:
-            unified_fsm, divergences = self.merger.merge(spec_fsm, impl_fsm)
+            unified_fsm, divergences = self.merger.merge(
+                spec_fsm, impl_fsm, store=self.store, force=force,
+                on_progress=lambda message: self.logger.info(message),
+            )
         finally:
             self._write_fsm_llm_conversations(self.merger)
         self.store.write_json("unified_fsm.json", unified_fsm)

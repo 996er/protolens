@@ -860,6 +860,8 @@ def validate_json_schema(
 
     if isinstance(value, str) and "minLength" in schema and len(value.strip()) < int(schema["minLength"]):
         raise ValueError(f"{path} must contain at least {schema['minLength']} characters")
+    if isinstance(value, str) and "maxLength" in schema and len(value) > int(schema["maxLength"]):
+        raise ValueError(f"{path} must contain at most {schema['maxLength']} characters")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"{path} must be a finite number")

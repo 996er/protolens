@@ -10,7 +10,7 @@ ProtoLens 是一个面向有状态网络协议的缺陷发现系统。它把协�
 
 ## 当前实现完整性（2026-09）
 
-当前代码已经形成 LLM-native FSM 到 AFLNet 的闭环：在线模型检索权威 RFC 并构建 SpecificationFSM，模型分块读取项目源码并构建 ImplementationFSM，模型比较两侧语义并生成 UnifiedFSM/DivergenceMap，随后执行多 Agent 推理、路径规划、seed 生成、AFLNet campaign 和动态反馈分析。
+当前代码已经形成 LLM-native FSM 到 AFLNet 的闭环：在线模型检索权威 RFC 并构建 SpecificationFSM，模型分块读取项目源码并构建 ImplementationFSM，模型分批比较两侧语义，程序组装 UnifiedFSM/DivergenceMap，随后执行多 Agent 推理、路径规划、seed 生成、AFLNet campaign 和动态反馈分析。
 
 本轮完整性审查修复了以下会影响结果可信度的问题：
 
@@ -24,7 +24,7 @@ ProtoLens 是一个面向有状态网络协议的缺陷发现系统。它把协�
 
 1. FSM 构建链路不再调用 `RFCParser`。SpecificationFSMBuilder 强制模型通过 Responses API `web_search` 检索 RFC Editor/IETF 最新规范、更新和废止关系，并使用严格 JSON Schema 返回结果。
 2. FSM 构建链路不再调用 `StaticAnalysis`。ImplementationFSMBuilder 本地只读取、筛选和分块源码文本，所有状态、guard、action、错误路径语义均由模型恢复，并校验每条边的源码原文证据。
-3. FSMMerger 不再使用规则键匹配，改由模型做语义冲突分析和合并；`transition_sources` 完整性校验禁止静默遗漏任一输入 transition。
+3. FSMMerger 由模型分批判断语义匹配和差异，由程序生成稳定 ID、组装图、合并原始证据和生成 `transition_sources`；完整性校验禁止静默遗漏任一输入 transition。
 4. TCP reset、half-close、reconnect、TLS handshake 已通过 `TransportAwareHarness` 提供显式关闭的 socket 级执行骨架；TLS renegotiation 在标准 Python TLS 栈无法真实执行时会标记 `supported=false`，不伪造成功。
 5. 动态 AFLNet 输出分析、响应状态映射、闭环再规划建议、crash replay、删除式最小化和报告汇总已接入 pipeline。
 6. `mutation_points` 已生成 AFLNet queue weight schedule，并在仓库根目录 `afl-fuzz.c` 中通过 `AFLNET_PROTO_SCHEDULE` 接入 power score 调整。
@@ -64,7 +64,7 @@ Phase 1: FSM Construction
         +-------------------------+
                     |
                     v
-             LLM FSMMerger -> UnifiedFSM + DivergenceMap
+             分批语义判断 + 程序组装 -> UnifiedFSM + DivergenceMap
 
 Phase 2: Adversarial State Reasoning
   UnifiedFSM + DivergenceMap + Code Context
@@ -196,8 +196,8 @@ build_fsm(force=false)
      -> RFC 范围 + 能力 + 配置 + 模型形成 specification fingerprint
      -> checkpoint 有效则直接读取工件，否则执行限定范围的 RFC web search
   -> merge_fsms()
-     -> 两侧 FSM 文件 SHA-256 + 模型形成 merge fingerprint
-     -> checkpoint 有效则直接读取工件，否则做一次语义比较/合并
+     -> 两侧 FSM 文件 SHA-256 + 模型 + 批次限制形成 merge fingerprint
+     -> checkpoint 有效则直接读取工件，否则恢复已验证比较批次并完成剩余语义判断/本地组装
   -> 原子更新 checkpoints/fsm_stages.json
 ```
 
@@ -266,16 +266,27 @@ ImplementationFSMBuilder.build(config)
 
 #### 4.3 FSMMerger
 
-合并逻辑完全由模型完成：
+模型负责语义判断，程序负责身份、来源和图结构：
 
 ```text
 spec_fsm + impl_fsm
-  -> Responses API strict JSON Schema
-  -> 语义比较 state alias / trigger / guard / action / error handling
-  -> 输出 UnifiedFSM + DivergenceMap + transition_sources
-  -> 程序校验每个 spec/impl transition id 都被映射
-  -> 校验 unified transition id、divergence kind/severity 和 evidence
+  -> 程序为两侧输入状态、转换和证据生成稳定 ID
+  -> 有界候选块：语义比较 state alias / trigger / guard / action / error handling
+  -> records[{record_id, assessment, matches, differences, unrelated_ids, uncertain_ids, rationale}]
+  -> 格式兼容 -> 结构校验 -> 候选覆盖、引用、角色和端点语义校验
+  -> 只补齐不完整记录；主请求和修复请求使用同一记录 Schema 和 record_id
+  -> 程序合并等价元素，保留差异路径，恢复全部原始引用
+  -> 程序生成 UnifiedFSM + DivergenceMap + transition_sources
+  -> 校验图引用及每个 spec/impl transition 恰好保留一次
 ```
+
+比较会覆盖两侧的所有候选，不把未比较的候选视为无对应关系。默认每次最多 4 条判断记录、每条最多 16 个候选，请求内容预算为 60000 字节并预留反馈空间；证据按 ID 在请求中去重，候选块超过预算时继续拆分。单个比较仍超限时明确报错，不截断证据。可以通过 `fsm_build.merge_batch_records`（1..16）、`merge_candidate_limit`（1..64）和 `merge_request_bytes`（至少 8000）调整。完整候选覆盖会增加大图的请求次数；记录数和候选数限制约束单次请求的规模。
+
+完整且有效的记录不重生成。结构缺失时，定向修复返回同一完整记录并保持已有合法字段；语义错误时只修订该判断。缺少 kind、severity、rationale 等分析值时不分配默认值。明确标为不确定的候选写入 metadata.uncertainties，并保留两侧原始路径。只有所有对侧转换都已比较且没有已知或未决对应关系时，才单独请求 missing/extra 判断，避免把分块边界误报为差异。跨批次的等价关系若与差异判断矛盾，会拒绝组装并标明记录 ID。
+
+所有统一状态和转换 ID、差异 ID 都由程序生成。统一状态名称使用稳定 ID，原名称保存在 `metadata.state_sources` 和状态描述；两侧初始状态保存在 `metadata.input_initial_states`，图的单一初始状态采用规范侧映射。语义等价的转换采用规范侧字段作为展示值，所有原始字段写入 `metadata.transition_variants`，全部原始证据取并集。不同语义的转换分别保留。
+
+每个已验证批次原子保存到 `checkpoints/merge_decisions/<fingerprint>.json`，fingerprint 包含完整请求、记录契约和模型身份；重跑时重新验证摘要、结构和语义。`--force` 跳过这些缓存。最终 `merge_decisions.json` 保存稳定输入索引及所有语义判断，纳入阶段工件摘要；原始响应和格式处理记录继续写入 `findings/fsm_merge.llm.jsonl`。新合并契约会使旧合并 checkpoint 失效，已完成的规范和实现阶段可继续复用。
 
 当前会产生：
 
@@ -673,6 +684,7 @@ merge-fsm --config config.json
   -> 读取 spec_fsm.json / impl_fsm.json / implementation_evidence_table.json
   -> unified_fsm.json
   -> divergences.json
+  -> merge_decisions.json
 
 build-fsm --config config.json
   -> 按上述三个阶段执行或命中 checkpoint 后跳过
@@ -771,6 +783,7 @@ protolens/
 │   ├── llm_support.py
 │   ├── spec_fsm_builder.py
 │   ├── impl_fsm_builder.py
+│   ├── merge_records.py
 │   └── fsm_merger.py
 │
 ├── agents/
@@ -943,15 +956,16 @@ class Conflict:
 
 ### FSMMerger
 
-模型合并任务和程序硬校验：
+模型语义判断和程序硬校验：
 
 1. 模型从语义上判断状态别名、触发消息、guard、action 和错误处理是否匹配。
 2. 规范存在但实现缺失的 transition 标记为 `missing_transition`。
 3. 实现存在但规范缺失的 transition 标记为 `extra_transition`。
 4. guard 条件不同标记为 `guard_mismatch`。
 5. 错误处理差异标记为 `error_handling_mismatch`。
-6. 每个输入 transition id 必须出现在 `transition_sources`，否则整个构建失败。
+6. 程序组装图和 `transition_sources`，每个输入 transition 恰好保留一次；未匹配或不确定的路径同样保留。
 7. 完整 prompt、Schema、响应和错误写入 `findings/fsm_merge.llm.jsonl`。
+8. 主请求和定向修复共用稳定 record_id 和记录结构，按记录数、候选数及请求字节预算分批执行。
 
 优先级初始规则：
 

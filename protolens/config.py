@@ -151,8 +151,8 @@ class LLMConfig:
 class FSMBuildConfig:
     """LLM-native FSM construction controls.
 
-    Source files are only collected and chunked locally. All protocol semantics,
-    state recovery, divergence analysis, and merging are delegated to the LLM.
+    Source files are collected and chunked locally. The LLM judges protocol
+    semantics; merge identity, provenance and graph assembly are deterministic.
     """
 
     rfc_queries: list[str] = field(default_factory=list)
@@ -187,6 +187,9 @@ class FSMBuildConfig:
     chunk_chars: int = 80000
     max_file_bytes: int = 2_000_000
     max_web_search_calls: int = 8
+    merge_batch_records: int = 4
+    merge_candidate_limit: int = 16
+    merge_request_bytes: int = 60000
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "FSMBuildConfig":
@@ -220,6 +223,9 @@ class FSMBuildConfig:
             chunk_chars=int(data.get("chunk_chars", defaults.chunk_chars)),
             max_file_bytes=int(data.get("max_file_bytes", defaults.max_file_bytes)),
             max_web_search_calls=int(data.get("max_web_search_calls", defaults.max_web_search_calls)),
+            merge_batch_records=int(data.get("merge_batch_records", defaults.merge_batch_records)),
+            merge_candidate_limit=int(data.get("merge_candidate_limit", defaults.merge_candidate_limit)),
+            merge_request_bytes=int(data.get("merge_request_bytes", defaults.merge_request_bytes)),
         )
 
 
@@ -366,6 +372,12 @@ class ProtoLensConfig:
             raise ValueError("fsm_build.max_file_bytes must be positive")
         if self.fsm_build.max_web_search_calls <= 0:
             raise ValueError("fsm_build.max_web_search_calls must be positive")
+        if not 1 <= self.fsm_build.merge_batch_records <= 16:
+            raise ValueError("fsm_build.merge_batch_records must be between 1 and 16")
+        if not 1 <= self.fsm_build.merge_candidate_limit <= 64:
+            raise ValueError("fsm_build.merge_candidate_limit must be between 1 and 64")
+        if self.fsm_build.merge_request_bytes < 8000:
+            raise ValueError("fsm_build.merge_request_bytes must be at least 8000")
         if not self.fsm_build.allowed_rfc_domains:
             raise ValueError("fsm_build.allowed_rfc_domains must not be empty")
         if not self.fsm_build.rfc_analysis_scope:
