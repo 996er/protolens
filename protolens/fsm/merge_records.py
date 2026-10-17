@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Callable, Iterable
 import json
+import re
 
 from protolens.fsm.llm_support import LLMConversationRecorder, LLMValidationError, validate_json_schema
 from protolens.utils.artifact_store import ArtifactStore
@@ -43,6 +44,8 @@ SYSTEM = (
     "exactly once as equivalent (matches), behaviorally related but different (differences), "
     "unrelated (unrelated_ids), or unresolved (uncertain_ids). A candidate can have several "
     "different mismatch kinds. Set assessment=uncertain whenever uncertain_ids is nonempty. "
+    "assessment describes completion, not the relationship: its only values are complete and uncertain. "
+    "Relationship labels such as unrelated, equivalent and different belong in candidate classifications. "
     "An uncertain assessment with empty uncertain_ids expresses record-wide uncertainty: "
     "the program will preserve all original paths and defer this record's matches and findings. "
     "Equivalent means identical behavior including state roles, "
@@ -66,7 +69,97 @@ def record_wide_uncertainty(row: dict[str, Any]) -> bool:
     return row["assessment"] == "uncertain" and not row["uncertain_ids"]
 
 
-def normalize_decisions(data: dict[str, Any], expected: set[str]) -> list[dict[str, Any]]:
+def _enum_token(value: str) -> str:
+    """Canonical spelling only; category meanings are handled separately."""
+    value = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", value.strip())
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return re.sub(r"[_\s-]+", "_", value).strip("_").lower()
+
+
+def _difference_enum(field: str, value: Any) -> Any:
+    if not isinstance(value, str) or field not in {"kind", "severity"}:
+        return value
+    token = _enum_token(value)
+    if field == "severity":
+        priority = re.fullmatch(r"(?:p|priority)_?([012])", token)
+        return f"P{priority[1]}" if priority else value
+    if token in {"state_representation", "state_representation_mismatch", "state_representation_difference"}:
+        token = "state_mismatch"
+    return token if token in KINDS else value
+
+
+def _classified_assessment(row: dict[str, Any], job: dict[str, Any]) -> str | None:
+    """Summarize explicit classifications; never fill in unassessed candidates."""
+    try:
+        for field in ("matches", "unrelated_ids", "uncertain_ids"):
+            validate_json_schema(row.get(field), DECISION_SCHEMA["properties"][field])
+        differences = row.get("differences")
+        validate_json_schema(differences, {"type": "array", "maxItems": 256})
+        for difference in differences:
+            if not isinstance(difference, dict):
+                return None
+            # Extensions are audited by the recorder after normalization; they
+            # do not replace any required analysis field or candidate identity.
+            validate_json_schema({key: value for key, value in difference.items()
+                                  if key in DIFFERENCE_SCHEMA["properties"]}, DIFFERENCE_SCHEMA)
+    except ValueError:
+        return None
+    if job["task"].startswith("unmatched_"):
+        expected_kind = "missing_transition" if job["task"] == "unmatched_spec" else "extra_transition"
+        if (not any(row[field] for field in ("matches", "unrelated_ids", "uncertain_ids"))
+                and differences and all(item["candidate_id"] is None and item["kind"] == expected_kind
+                                        for item in differences)):
+            return "complete"
+        return None  # No finding does not prove that the analysis was completed.
+    groups = [set(row[field]) for field in ("matches", "unrelated_ids", "uncertain_ids")]
+    if any(len(group) != len(row[field]) for group, field in zip(groups, ("matches", "unrelated_ids", "uncertain_ids"))):
+        return None
+    groups.append({item["candidate_id"] for item in differences})
+    if any(left & right for index, left in enumerate(groups) for right in groups[index + 1:]):
+        return None
+    if set().union(*groups) != {item["id"] for item in job["candidates"]}:
+        return None
+    return "uncertain" if row["uncertain_ids"] else "complete"
+
+
+def _normalize_assessment(row: dict[str, Any], job: dict[str, Any] | None, path: str) -> list[dict[str, Any]]:
+    was_missing = "assessment" not in row
+    original = row.get("assessment")
+    token = _enum_token(original) if isinstance(original, str) else None
+    value, reason = None, "assessment_enum_spelling"
+    uncertainty_labels = {
+        "uncertain", "unknown", "unresolved", "undetermined", "indeterminate", "inconclusive",
+        "ambiguous", "insufficient_evidence", "needs_review", "tentative", "low_confidence",
+        "partial", "partially_complete", "partially_assessed", "incomplete",
+    }
+    if token in uncertainty_labels:
+        value, reason = "uncertain", "explicit_assessment_uncertainty"
+    elif token in {"complete", "completed", "fully_assessed", "assessed", "done"}:
+        value = "complete"
+    uncertain = row.get("uncertain_ids")
+    if isinstance(uncertain, list) and uncertain and all(isinstance(item, str) for item in uncertain):
+        value, reason = "uncertain", "assessment_from_explicit_uncertain_candidates"
+    # Relationship terms are not completion statuses. Only a fully classified
+    # supplied candidate set can establish the summary; the word alone cannot.
+    relationship_labels = {
+        "unrelated", "not_related", "no_match", "no_counterpart", "equivalent", "matched", "match",
+        "matching", "different", "mismatch", "related", "missing", "extra", "unmatched", "no_relation",
+        "not_equivalent", "non_equivalent", "conflict", "no_conflict", "compatible", "incompatible", *KINDS,
+    }
+    missing = original is None or (isinstance(original, str) and not original.strip())
+    if value is None and job is not None and (missing or token in relationship_labels):
+        value = _classified_assessment(row, job)
+        reason = "assessment_from_complete_candidate_classifications"
+    if value is None or original == value:
+        return []
+    row["assessment"] = value
+    return [{"path": f"{path}.assessment", "original_value": original,
+             "was_missing": was_missing, "value": value, "reason": reason}]
+
+
+def normalize_decisions(
+    data: dict[str, Any], expected: set[str], *, jobs: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Normalize formats and redundant summaries without inventing judgments."""
     notes: list[dict[str, Any]] = []
     envelopes = [key for key in ("records", "decisions", "results", "repairs", "result") if key in data]
@@ -109,37 +202,29 @@ def normalize_decisions(data: dict[str, Any], expected: set[str]) -> list[dict[s
                 row["record_id"] = next(iter(expected))
                 notes.append({"path": f"$.records[{index}].record_id", "value": row["record_id"],
                               "reason": "single_requested_record_identity"})
-            uncertain = row.get("uncertain_ids")
-            if (isinstance(uncertain, list) and uncertain and all(isinstance(item, str) for item in uncertain)
-                    and row.get("assessment") != "uncertain"):
-                # Explicit unresolved candidates determine the summary. Never
-                # perform the reverse conversion: an empty list does not erase
-                # a model's record-wide uncertainty or certify completeness.
-                notes.append({"path": f"$.records[{index}].assessment",
-                              "original_value": row.get("assessment"), "was_missing": "assessment" not in row,
-                              "value": "uncertain", "reason": "assessment_from_explicit_uncertain_candidates"})
-                row["assessment"] = "uncertain"
             for difference in row.get("differences", []) if isinstance(row.get("differences"), list) else []:
                 if not isinstance(difference, dict):
                     continue
                 for alias, canonical in (("type", "kind"), ("priority", "severity"), ("explanation", "rationale")):
                     if alias in difference:
-                        if canonical in difference and difference[canonical] != difference[alias]:
+                        if (canonical in difference
+                                and _difference_enum(canonical, difference[canonical]) != _difference_enum(canonical, difference[alias])):
                             raise ValueError(f"conflicting semantic difference fields: {alias}, {canonical}")
-                        difference[canonical] = difference.pop(alias)
+                        original_alias = difference.pop(alias)
+                        if canonical not in difference:
+                            difference[canonical] = original_alias
                         notes.append({"path": f"$.records[{index}].differences", "reason": "difference_field_alias",
-                                      "original_field": alias, "field": canonical})
+                                      "original_field": alias, "field": canonical, "original_value": original_alias})
                 for field in ("kind", "severity"):
                     old = difference.get(field)
-                    if not isinstance(old, str):
-                        continue
-                    value = old.strip().upper() if field == "severity" else old.strip().lower().replace("-", "_").replace(" ", "_")
-                    if field == "kind" and value in {"state_representation", "state_representation_mismatch", "state_representation_difference"}:
-                        value = "state_mismatch"
+                    value = _difference_enum(field, old)
                     if value != old and value in DIFFERENCE_SCHEMA["properties"][field]["enum"]:
                         difference[field] = value
                         notes.append({"path": f"$.records[{index}].differences", "reason": "difference_enum_spelling",
                                       "field": field, "original_value": old, "value": value})
+            identifier = row.get("record_id")
+            job = jobs.get(identifier) if jobs is not None and isinstance(identifier, str) else None
+            notes.extend(_normalize_assessment(row, job, f"$.records[{index}]"))
     return notes
 
 
@@ -297,7 +382,9 @@ class SemanticDecisionRunner:
                         system=SYSTEM + " Revise only the requested invalid record as a whole. Supplied record fields are unvalidated, not fixed facts. Return the full record using the original record_id; satisfy candidate identity, exclusive classification and complete coverage constraints.",
                         payload=self._payload([job], repair), schema=self._schema(1),
                         schema_name="protolens_merge_decisions_repair", validator=validate_repair,
-                        response_normalizer=lambda value, identifier=identifier: normalize_decisions(value, {identifier}),
+                        response_normalizer=lambda value, identifier=identifier, job=job: normalize_decisions(
+                            value, {identifier}, jobs={identifier: job},
+                        ),
                     )
                 except LLMValidationError as exc:
                     raise RuntimeError(f"semantic decision repair failed for {identifier}: {exc}") from exc
@@ -309,7 +396,7 @@ class SemanticDecisionRunner:
             result = self.recorder.call_chat(
                 system=SYSTEM, payload=payload, schema=self._schema(len(jobs)),
                 schema_name="protolens_merge_decisions", validator=validate_all,
-                response_normalizer=lambda data: normalize_decisions(data, set(expected)),
+                response_normalizer=lambda data: normalize_decisions(data, set(expected), jobs=expected),
                 result_normalizer=complete_partial,
             )
             if self.store is not None:

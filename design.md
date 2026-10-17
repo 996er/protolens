@@ -286,6 +286,8 @@ spec_fsm + impl_fsm
 
 `assessment` 是摘要，不与 `uncertain_ids` 强制双向等价。有明确未决候选时，程序将摘要同步为 `uncertain` 并记录原值；摘要为 `uncertain` 而候选列表为空时，保留为整条判断未决（`metadata.uncertainties.scope=record`）。该记录的匹配和差异仅保留在审计记录中，不用于合并元素、生成确定的差异或推断 missing/extra；其查询与整个候选块均受不确定性保护。候选身份、分类互斥及完整覆盖校验继续执行。不会因空的未决列表而擅自把不确定判断改为 complete。
 
+枚举归一化在主请求和修复请求中使用相同的候选上下文。`assessment` 的大小写和明确的完成／未决同义词统一规范化；误填 `unrelated`、`equivalent`、`different` 等关系类别或遗漏摘要时，仅在四类候选分类具有合法结构、互斥且完整覆盖本次请求候选集合时，由程序生成完成度摘要。unmatched 任务还必须已有明确的 missing/extra 差异记录，不能从空结果推导完成。差异 kind 统一处理大小写、空格、连字符及驼峰拼写，severity 只规范化明确的 P0/P1/P2 编号表达。未分类候选、未知 ID、歧义类别和无法解释的优先级继续定向修复，不从 high/low 等标签擅自分配 P 编号；所有归一化保留原值与原因。
+
 所有统一状态和转换 ID、差异 ID 都由程序生成。统一状态名称使用稳定 ID，原名称保存在 `metadata.state_sources` 和状态描述；两侧初始状态保存在 `metadata.input_initial_states`，图的单一初始状态采用规范侧映射。语义等价的转换采用规范侧字段作为展示值，所有原始字段写入 `metadata.transition_variants`，全部原始证据取并集。不同语义的转换分别保留。
 
 每个已验证批次原子保存到 `checkpoints/merge_decisions/<fingerprint>.json`，fingerprint 包含完整请求、记录契约和模型身份；重跑时重新验证摘要、结构和语义。`--force` 跳过这些缓存。最终 `merge_decisions.json` 保存稳定输入索引及所有语义判断，纳入阶段工件摘要；原始响应和格式处理记录继续写入 `findings/fsm_merge.llm.jsonl`。新合并契约会使旧合并 checkpoint 失效，已完成的规范和实现阶段可继续复用。
