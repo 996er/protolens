@@ -57,6 +57,15 @@ SYSTEM = (
     "transitions have already been compared: assess missing_transition/extra_transition "
     "respectively with candidate_id=null, or assessment=uncertain to defer judgment. "
     "Assign P0/P1/P2 from evidence and explain the security impact. Never invent citations. "
+    "State evidence_context contains selected incident transitions with original citations, not direct state annotations. "
+    "Use that context only for behavior actually supported by those transitions; samples do not prove absent behavior, "
+    "state roles, or the entirety of a state's semantics. If the context is insufficient, explicitly defer judgment. "
+    "Read each record's evidence_constraints. For a pair with no direct or contextual citations on either side, "
+    "do not assert a definite difference or assign its kind/severity. If unresolved, put that candidate only in "
+    "uncertain_ids, set assessment=uncertain, and omit differences for it; do not also classify it elsewhere. "
+    "Setting assessment alone does not turn an individual difference into an unresolved candidate. "
+    "An unsupported unmatched finding must use assessment=uncertain with "
+    "all four classification arrays empty. Never fabricate evidence to satisfy validation. "
     "Include a concise record-level rationale and an evidence-based rationale for every difference. "
     "Return {records:[...]} with the SAME complete record structure for initial and repair requests."
 )
@@ -69,6 +78,30 @@ def decision_id(task: str, query_id: str, candidate_ids: list[str]) -> str:
 def record_wide_uncertainty(row: dict[str, Any]) -> bool:
     """A summary may defer the entire record without naming specific candidates."""
     return row.get("assessment") == "uncertain" and row.get("uncertain_ids") == []
+
+
+def comparison_evidence_ids(element: dict[str, Any]) -> list[str]:
+    """Original citations visible for this comparison, with context kept separate."""
+    refs = set(element["evidence"])
+    for transition in element.get("evidence_context", {}).get("transitions", []):
+        refs.update(transition["evidence"])
+    return sorted(refs)
+
+
+def evidence_constraints(job: dict[str, Any]) -> dict[str, Any]:
+    """Describe actual evidence availability; never generate a model judgment."""
+    query_refs = comparison_evidence_ids(job["query"])
+    if job["task"].startswith("unmatched_"):
+        if not query_refs:
+            return {"unsupported_unmatched_finding": True,
+                    "requirement": "No input citations support a finding. Return assessment=uncertain and all classification arrays empty."}
+        return {}
+    unsupported = [item["id"] for item in job["candidates"]
+                   if not query_refs and not comparison_evidence_ids(item)]
+    if not unsupported:
+        return {}
+    return {"unsupported_difference_candidate_ids": sorted(unsupported),
+            "requirement": "No citations support a definite difference for these candidates. Put unresolved candidates only in uncertain_ids, set assessment=uncertain, and remove their differences. Continue classifying every other candidate exactly once. Do not invent citations or conclusions."}
 
 
 def _enum_token(value: str) -> str:
@@ -343,6 +376,10 @@ class SemanticDecisionRunner:
 
     def _payload(self, jobs: list[dict[str, Any]], repair: dict[str, Any] | None = None) -> dict[str, Any]:
         refs: set[str] = set()
+        records = []
+        for job in jobs:
+            constraints = evidence_constraints(job)
+            records.append({**job, **({"evidence_constraints": constraints} if constraints else {})})
 
         def visit(value: Any) -> None:
             if isinstance(value, dict):
@@ -354,8 +391,8 @@ class SemanticDecisionRunner:
             elif isinstance(value, list):
                 for item in value:
                     visit(item)
-        visit(jobs)
-        return {"protocol": self.protocol, "contract": self.version, "records": jobs,
+        visit(records)
+        return {"protocol": self.protocol, "contract": self.version, "records": records,
                 "evidence_table": {ref: self.evidence_table[ref] for ref in sorted(refs)},
                 **({"repair": repair} if repair else {})}
 

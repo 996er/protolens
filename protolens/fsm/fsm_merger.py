@@ -10,7 +10,9 @@ from protolens.fsm.fsm_model import Divergence, Evidence, ProtocolFSM, State, St
 from protolens.fsm.llm_support import (
     FSM_SCHEMA, LLMConversationRecorder, normalize_fsm_protocol, validate_fsm, validate_json_schema,
 )
-from protolens.fsm.merge_records import SemanticDecisionRunner, candidate_coverage, decision_id, record_wide_uncertainty
+from protolens.fsm.merge_records import (
+    SemanticDecisionRunner, candidate_coverage, comparison_evidence_ids, decision_id, record_wide_uncertainty,
+)
 from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.llm_client import LLMClient
 from protolens.utils.stage_checkpoints import stable_fingerprint
@@ -65,7 +67,10 @@ def _wire_graph(fsm: ProtocolFSM) -> dict[str, Any]:
 class FSMMerger:
     """Compare bounded candidate blocks, then assemble every input locally."""
 
-    CACHE_VERSION = "fsm-semantic-records-v3"
+    CACHE_VERSION = "fsm-semantic-records-v4"
+    # Evidence selection changes assembled results, while the record contract
+    # stays compatible. Reuse verified records whose exact inputs are unchanged.
+    DECISION_CONTRACT = "fsm-semantic-records-v3"
 
     def __init__(self, llm_client: LLMClient, config: FSMBuildConfig | None = None) -> None:
         self.recorder = LLMConversationRecorder("fsm_merge", llm_client)
@@ -93,7 +98,7 @@ class FSMMerger:
         elements, evidence_table = self._index_inputs(spec_fsm, impl_fsm)
         runner = SemanticDecisionRunner(
             self.recorder, protocol=spec_fsm.protocol, evidence_table=evidence_table,
-            version=self.CACHE_VERSION, batch_records=limits["batch_records"],
+            version=self.DECISION_CONTRACT, batch_records=limits["batch_records"],
             request_bytes=limits["request_bytes"], store=store, force=force, on_progress=on_progress,
         )
         state_inputs = {key: value for key, value in elements.items() if value["kind"] == "state"}
@@ -144,8 +149,9 @@ class FSMMerger:
         self._validate_transition_coverage(spec_fsm, impl_fsm, unified, mappings)
         if store is not None:
             store.write_json("merge_decisions.json", {
-                "contract": self.CACHE_VERSION, "decisions": runner.completed,
-                "input_index": {key: {field: value[field] for field in ("side", "kind", "original_id")}
+                "contract": self.DECISION_CONTRACT, "builder": self.CACHE_VERSION, "decisions": runner.completed,
+                "input_index": {key: {**{field: value[field] for field in ("side", "kind", "original_id")},
+                                      **({"evidence_context": value["evidence_context"]} if "evidence_context" in value else {})}
                                 for key, value in elements.items()},
             })
         return unified, divergences
@@ -173,6 +179,7 @@ class FSMMerger:
             return sorted(set(refs))
 
         for side, fsm in (("spec", spec), ("impl", impl)):
+            incident: dict[str, list[dict[str, Any]]] = {name: [] for name in fsm.states}
             for name, state in sorted(fsm.states.items()):
                 identifier = _id(f"{side}_state", name)
                 elements[identifier] = {
@@ -192,6 +199,30 @@ class FSMMerger:
                 if identifier in elements:
                     raise ValueError(f"input identifier collision: {identifier}")
                 elements[identifier] = wire
+                for name in {transition.source, transition.target}:
+                    incident[name].append(wire)
+            for name in sorted(fsm.states):
+                state = elements[_id(f"{side}_state", name)]
+                if state["evidence"] or not incident[name]:
+                    continue
+                # Supply bounded witnesses for states that have no direct
+                # annotations. Keep all original transition citations intact;
+                # a sample is explicitly not a complete behavioral account.
+                selected: dict[str, dict[str, Any]] = {}
+                for endpoint in ("source_name", "target_name"):
+                    witness = next((item for item in incident[name] if item[endpoint] == name), None)
+                    if witness is not None:
+                        selected[witness["id"]] = witness
+                fields = ("id", "original_id", "source_name", "target_name", "trigger", "message_type",
+                          "guard", "action", "error_handling", "confidence", "evidence")
+                state["evidence_context"] = {
+                    "origin": "incident_transitions", "total_incident_transitions": len(incident[name]),
+                    "complete": len(selected) == len(incident[name]),
+                    "transitions": [{**{field: deepcopy(item[field]) for field in fields},
+                                     "directions": [direction for field, direction in (("source_name", "outgoing"), ("target_name", "incoming"))
+                                                    if item[field] == name]}
+                                    for _, item in sorted(selected.items())],
+                }
         return elements, evidence_table
 
     def _comparison_jobs(
@@ -244,9 +275,19 @@ class FSMMerger:
                     "state_mismatch", "guard_mismatch", "action_mismatch", "error_handling_mismatch"}
                 if identifier not in candidates or kind not in allowed:
                     raise ValueError("difference references an unknown candidate or inappropriate kind")
-            citations = [*query["evidence"], *(candidates[identifier]["evidence"] if identifier in candidates else [])]
+            citations = [*comparison_evidence_ids(query),
+                         *(comparison_evidence_ids(candidates[identifier]) if identifier in candidates else [])]
             if not citations and not deferred:
-                raise ValueError("difference has no supporting input evidence; mark the comparison uncertain")
+                resolution = (
+                    "return assessment='uncertain' and empty matches/differences/unrelated_ids/uncertain_ids"
+                    if task.startswith("unmatched_") else
+                    f"remove differences for {identifier!r}, classify it only in uncertain_ids and set assessment='uncertain'; "
+                    "setting assessment alone does not defer this individual difference"
+                )
+                raise ValueError(
+                    f"difference has no supporting input evidence for query={query['id']!r}, candidate={identifier!r}, task={task!r}; "
+                    f"both direct citations and incident-transition context are empty; {resolution}; never fabricate evidence"
+                )
         if task.startswith("unmatched_"):
             if row["assessment"] == "complete" and not row["differences"]:
                 raise ValueError("unmatched assessment needs an evidenced finding or an explicit uncertain judgment")
@@ -281,8 +322,11 @@ class FSMMerger:
         return groups.members()
 
     @staticmethod
-    def _citations(members: list[dict[str, Any]], table: dict[str, dict[str, Any]]) -> list[Evidence]:
-        refs = sorted({ref for member in members for ref in member["evidence"]})
+    def _citations(
+        members: list[dict[str, Any]], table: dict[str, dict[str, Any]], *, include_context: bool = False,
+    ) -> list[Evidence]:
+        refs = sorted({ref for member in members
+                       for ref in (comparison_evidence_ids(member) if include_context else member["evidence"])})
         return [Evidence.from_dict(deepcopy(table[ref])) for ref in refs]
 
     def _assemble_states(
@@ -368,7 +412,7 @@ class FSMMerger:
                     id=identifier, kind=difference["kind"], severity=difference["severity"],
                     spec_element=spec["original_id"] if spec else None,
                     impl_element=impl["original_id"] if impl else None,
-                    rationale=difference["rationale"], evidence=self._citations(members, table),
+                    rationale=difference["rationale"], evidence=self._citations(members, table, include_context=True),
                 )
         return sorted(divergences.values(), key=lambda item: (item.severity, item.id))
 
