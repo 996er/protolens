@@ -8,6 +8,7 @@ import re
 
 from protolens.fsm.llm_support import LLMConversationRecorder, LLMValidationError, validate_json_schema
 from protolens.utils.artifact_store import ArtifactStore
+from protolens.utils.json_schema import FieldPolicy, collect_schema_issues, normalize_schema_fields
 from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
@@ -67,7 +68,7 @@ def decision_id(task: str, query_id: str, candidate_ids: list[str]) -> str:
 
 def record_wide_uncertainty(row: dict[str, Any]) -> bool:
     """A summary may defer the entire record without naming specific candidates."""
-    return row["assessment"] == "uncertain" and not row["uncertain_ids"]
+    return row.get("assessment") == "uncertain" and row.get("uncertain_ids") == []
 
 
 def _enum_token(value: str) -> str:
@@ -87,6 +88,35 @@ def _difference_enum(field: str, value: Any) -> Any:
     if token in {"state_representation", "state_representation_mismatch", "state_representation_difference"}:
         token = "state_mismatch"
     return token if token in KINDS else value
+
+
+_NORMALIZATION_SCHEMA = {
+    "type": "object", "properties": {"records": {"type": "array", "items": DECISION_SCHEMA}},
+}
+_FIELD_POLICIES = {
+    ("records",): FieldPolicy(role="collection", empty_if_absent=True, singleton=True),
+    ("records", "*", "record_id"): FieldPolicy(aliases=("decision_id",)),
+    ("records", "*", "assessment"): FieldPolicy(aliases=("status", "completion_status")),
+    ("records", "*", "rationale"): FieldPolicy(role="annotation", aliases=("explanation", "reason", "summary", "notes")),
+    ("records", "*", "differences", "*", "candidate_id"): FieldPolicy(aliases=("counterpart_id", "target_id", "candidate")),
+    ("records", "*", "differences", "*", "kind"): FieldPolicy(
+        aliases=("type", "divergence_type"), canonicalize=lambda value: _difference_enum("kind", value)),
+    ("records", "*", "differences", "*", "severity"): FieldPolicy(
+        aliases=("priority",), canonicalize=lambda value: _difference_enum("severity", value)),
+    ("records", "*", "differences", "*", "rationale"): FieldPolicy(aliases=("explanation", "reason")),
+}
+for _field, _aliases in (
+    ("matches", ("matched_ids", "equivalent_ids", "equivalent_candidate_ids")),
+    ("unrelated_ids", ("unrelated", "unmatched_ids", "unrelated_candidate_ids")),
+    ("uncertain_ids", ("unresolved_ids", "unknown_ids", "uncertain_candidate_ids")),
+    ("differences", ("divergences", "mismatches")),
+):
+    _FIELD_POLICIES[("records", "*", _field)] = FieldPolicy(
+        role="collection", aliases=_aliases, empty_if_absent=True, singleton=True,
+    )
+_RECORD_KEYS = set(DECISION_SCHEMA["properties"]) | {
+    alias for path, policy in _FIELD_POLICIES.items() if len(path) == 3 for alias in policy.aliases
+}
 
 
 def candidate_coverage(job: dict[str, Any], row: dict[str, Any]) -> dict[str, list[Any]]:
@@ -150,8 +180,13 @@ def _normalize_candidate_references(row: dict[str, Any], job: dict[str, Any], pa
     if isinstance(differences, list):
         unique, seen = [], set()
         for index, difference in enumerate(differences):
-            if isinstance(difference, dict) and "candidate_id" in difference:
-                difference["candidate_id"] = canonical(difference["candidate_id"], f"{path}.differences[{index}].candidate_id")
+            if isinstance(difference, dict):
+                if "candidate_id" not in difference and (len(expected) == 1 or job["task"].startswith("unmatched_")):
+                    difference["candidate_id"] = next(iter(expected)) if expected else None
+                    notes.append({"path": f"{path}.differences[{index}].candidate_id",
+                                  "value": difference["candidate_id"], "reason": "unique_requested_counterpart"})
+                if "candidate_id" in difference:
+                    difference["candidate_id"] = canonical(difference["candidate_id"], f"{path}.differences[{index}].candidate_id")
             key = json.dumps(difference, sort_keys=True)
             if key in seen:
                 notes.append({"path": f"{path}.differences[{index}]", "reason": "duplicate_identical_difference"})
@@ -225,42 +260,6 @@ def _normalize_assessment(row: dict[str, Any], job: dict[str, Any] | None, path:
              "was_missing": was_missing, "value": value, "reason": reason}]
 
 
-def _normalize_record_rationale(row: dict[str, Any], path: str) -> list[dict[str, Any]]:
-    """Treat record commentary as annotation, never synthesize a finding's reason."""
-    original = row.get("rationale")
-    source = original
-    source_fields = ["rationale"] if "rationale" in row else []
-    if source is None or (isinstance(source, str) and not source.strip()):
-        aliases = {key: value for key in ("explanation", "reason", "summary", "notes")
-                   if (value := row.get(key)) is not None and value != ""}
-        if aliases:
-            source_fields = list(aliases)
-            source = next(iter(aliases.values())) if len(aliases) == 1 else aliases
-    limit = DECISION_SCHEMA["properties"]["rationale"]["maxLength"]
-    if source is None or (isinstance(source, str) and not source.strip()):
-        rendered = "[ProtoLens audit] Model supplied no record-level rationale; no semantic justification was inferred."
-        reason = "missing_record_rationale_annotation"
-    elif isinstance(source, str):
-        if source == original and len(source) <= limit:
-            return []
-        rendered, reason = source, "record_rationale_annotation_alias"
-    else:
-        rendered = "[Model record annotation, JSON] " + json.dumps(source, ensure_ascii=False, sort_keys=True)
-        reason = "structured_record_rationale_annotation"
-    if len(rendered) > limit:
-        rendered = "[ProtoLens audit] Record-level annotation exceeded the length limit; the full model content is preserved in the raw response audit. No replacement justification was inferred."
-        reason = "oversized_record_rationale_annotation"
-    note: dict[str, Any] = {
-        "path": f"{path}.rationale", "was_missing": "rationale" not in row,
-        "source_fields": source_fields, "value": rendered, "reason": reason,
-    }
-    if reason == "oversized_record_rationale_annotation":
-        note.update({"original_sha256": stable_fingerprint(source), "original_in": "response.text"})
-    else:
-        note["original_value"] = original
-    row["rationale"] = rendered
-    return [note]
-
 
 def normalize_decisions(
     data: dict[str, Any], expected: set[str], *, jobs: dict[str, dict[str, Any]] | None = None,
@@ -278,61 +277,51 @@ def normalize_decisions(
                               "reason": "decision_envelope_alias"})
                 break
         else:
-            if "record_id" in data or set(data).intersection(expected):
+            single = "record_id" in data or "decision_id" in data or (
+                len(expected) == 1 and bool(set(data).intersection(_RECORD_KEYS))
+            )
+            if single or set(data).intersection(expected):
                 data["records"] = {key: deepcopy(value) for key, value in data.items()
-                                   if "record_id" in data or key in expected}
+                                   if single or key in expected}
                 notes.append({"path": "$.records", "reason": "decision_root_envelope"})
     rows = data.get("records")
     if isinstance(rows, dict):
         if "records" in rows and len(rows) == 1:
             rows = rows["records"]
-        if isinstance(rows, dict) and "record_id" in rows:
+        if isinstance(rows, dict) and ("record_id" in rows or "decision_id" in rows or (
+                len(expected) == 1 and set(rows).intersection(_RECORD_KEYS))):
             rows = [rows]
         elif isinstance(rows, dict):
             converted = []
             for identifier, row in rows.items():
                 if identifier not in expected or not isinstance(row, dict):
-                    raise ValueError(f"unknown or malformed semantic decision {identifier!r}")
-                if "record_id" in row and row["record_id"] != identifier:
-                    raise ValueError(f"conflicting semantic decision identities: {identifier!r}")
+                    notes.append({"path": "$.records", "record_id": identifier, "original_value": row,
+                                  "reason": "unassigned_mapping_entry_not_accepted"})
+                    continue
+                if any(key in row and row[key] != identifier for key in ("record_id", "decision_id")):
+                    notes.append({"path": "$.records", "record_id": identifier, "original_value": row,
+                                  "reason": "conflicting_mapping_identity_requires_repair"})
+                    continue
                 converted.append({**row, "record_id": identifier})
             rows = converted
         data["records"] = rows
         notes.append({"path": "$.records", "reason": "decision_mapping_to_array"})
+    notes.extend(normalize_schema_fields(data, _NORMALIZATION_SCHEMA, _FIELD_POLICIES))
+    rows = data.get("records")
     if isinstance(rows, list):
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
                 continue
-            if "record_id" not in row and len(rows) == 1 and len(expected) == 1:
+            identity = row.get("record_id")
+            if (identity is None or isinstance(identity, str) and not identity.strip()) and len(rows) == 1 and len(expected) == 1:
                 row["record_id"] = next(iter(expected))
                 notes.append({"path": f"$.records[{index}].record_id", "value": row["record_id"],
                               "reason": "single_requested_record_identity"})
-            for difference in row.get("differences", []) if isinstance(row.get("differences"), list) else []:
-                if not isinstance(difference, dict):
-                    continue
-                for alias, canonical in (("type", "kind"), ("priority", "severity"), ("explanation", "rationale")):
-                    if alias in difference:
-                        if (canonical in difference
-                                and _difference_enum(canonical, difference[canonical]) != _difference_enum(canonical, difference[alias])):
-                            raise ValueError(f"conflicting semantic difference fields: {alias}, {canonical}")
-                        original_alias = difference.pop(alias)
-                        if canonical not in difference:
-                            difference[canonical] = original_alias
-                        notes.append({"path": f"$.records[{index}].differences", "reason": "difference_field_alias",
-                                      "original_field": alias, "field": canonical, "original_value": original_alias})
-                for field in ("kind", "severity"):
-                    old = difference.get(field)
-                    value = _difference_enum(field, old)
-                    if value != old and value in DIFFERENCE_SCHEMA["properties"][field]["enum"]:
-                        difference[field] = value
-                        notes.append({"path": f"$.records[{index}].differences", "reason": "difference_enum_spelling",
-                                      "field": field, "original_value": old, "value": value})
             identifier = row.get("record_id")
             job = jobs.get(identifier) if jobs is not None and isinstance(identifier, str) else None
             if job is not None:
                 notes.extend(_normalize_candidate_references(row, job, f"$.records[{index}]"))
             notes.extend(_normalize_assessment(row, job, f"$.records[{index}]"))
-            notes.extend(_normalize_record_rationale(row, f"$.records[{index}]"))
     return notes
 
 
@@ -349,6 +338,8 @@ class SemanticDecisionRunner:
         self.version, self.batch_records, self.request_bytes = version, batch_records, request_bytes
         self.store, self.force, self.on_progress = store, force, on_progress
         self.completed: list[dict[str, Any]] = []
+        self._completed_by_id: dict[str, dict[str, Any]] = {}
+        self._repair_children: dict[str, set[str]] = {}
 
     def _payload(self, jobs: list[dict[str, Any]], repair: dict[str, Any] | None = None) -> dict[str, Any]:
         refs: set[str] = set()
@@ -382,20 +373,125 @@ class SemanticDecisionRunner:
                                             "minItems": count, "maxItems": count}}}
 
     @staticmethod
-    def _index(data: dict[str, Any], expected: set[str]) -> dict[str, dict[str, Any]]:
-        indexed = {}
+    def _index(
+        data: dict[str, Any], expected: set[str], *, recovery_notes: list[dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        indexed: dict[str, dict[str, Any]] = {}
+        ambiguous: set[str] = set()
         rows = data.get("records", [])
         if not isinstance(rows, list):
-            raise ValueError("semantic decisions must be an array of identified records")
-        for row in rows:
+            if recovery_notes is None:
+                raise ValueError("semantic decisions must be an array of identified records")
+            recovery_notes.append({"path": "$.records", "reason": "unidentified_records_require_repair", "original_value": rows})
+            return indexed
+        for index, row in enumerate(rows):
             if (not isinstance(row, dict) or not isinstance(row.get("record_id"), str)
                     or row["record_id"] not in expected):
-                raise ValueError("each semantic decision must reference a requested record_id")
+                if recovery_notes is None:
+                    raise ValueError("each semantic decision must reference a requested record_id")
+                recovery_notes.append({"path": f"$.records[{index}]", "reason": "unassigned_record_not_accepted", "original_value": row})
+                continue
             identifier = row["record_id"]
-            if identifier in indexed:
-                raise ValueError(f"duplicate semantic decision {identifier}")
-            indexed[identifier] = row
+            if identifier in indexed or identifier in ambiguous:
+                if recovery_notes is None:
+                    raise ValueError(f"duplicate semantic decision {identifier}")
+                if identifier in indexed and indexed[identifier] == row:
+                    recovery_notes.append({"path": f"$.records[{index}]", "reason": "identical_record_duplicate", "record_id": identifier})
+                else:
+                    indexed.pop(identifier, None)
+                    ambiguous.add(identifier)
+                    recovery_notes.append({"path": f"$.records[{index}]", "reason": "conflicting_record_requires_repair", "record_id": identifier})
+                continue
+            if identifier not in ambiguous:
+                indexed[identifier] = row
         return indexed
+
+    def _checkpoint(self, jobs: list[dict[str, Any]]) -> str:
+        fingerprint = stable_fingerprint([self._payload(jobs), DECISION_SCHEMA, self.recorder.llm_client.cache_identity()])
+        return f"checkpoints/merge_decisions/{fingerprint}.json"
+
+    def _save(self, jobs: list[dict[str, Any]], data: dict[str, Any]) -> None:
+        """Call only after schema and semantic acceptance of every saved row."""
+        if self.store is not None:
+            parents = {job["record_id"] for job in jobs}
+            child_ids = set().union(*(self._repair_children.get(identifier, set()) for identifier in parents))
+            audit = [deepcopy(self._completed_by_id[identifier]) for identifier in sorted(child_ids)]
+            for entry in audit:
+                entry["repair_for"] = sorted(parents.intersection(entry["repair_for"]))
+            self.store.write_json(self._checkpoint(jobs), {
+                "content": data, "sha256": stable_fingerprint(data),
+                "audit_records": audit, "audit_sha256": stable_fingerprint(audit),
+            })
+
+    def _load(
+        self, jobs: list[dict[str, Any]], validate: Callable[[dict[str, Any], dict[str, Any]], None],
+    ) -> dict[str, Any] | None:
+        if self.store is None or self.force:
+            return None
+        checkpoint = self._checkpoint(jobs)
+        if not self.store.path(checkpoint).is_file():
+            return None
+        try:
+            cached = self.store.read_json(checkpoint)
+            if not isinstance(cached, dict) or cached.get("sha256") != stable_fingerprint(cached.get("content")):
+                raise ValueError("semantic decision checkpoint checksum mismatch")
+            content = cached["content"]
+            validate_json_schema(content, self._schema(len(jobs)))
+            expected = {job["record_id"]: job for job in jobs}
+            indexed = self._index(content, set(expected))
+            if set(indexed) != set(expected):
+                raise ValueError("semantic decision checkpoint has incomplete record coverage")
+            for identifier, row in indexed.items():
+                validate(expected[identifier], row)
+            # Restore the actual child judgments and their explanations when
+            # resuming a composed parent; do not retain only its audit marker.
+            audit = cached.get("audit_records", [])
+            if not isinstance(audit, list) or ("audit_records" in cached and cached.get("audit_sha256") != stable_fingerprint(audit)):
+                raise ValueError("semantic decision audit checkpoint checksum mismatch")
+            restored = []
+            for entry in audit:
+                if not isinstance(entry, dict) or not isinstance(entry.get("repair_for"), list):
+                    raise ValueError("malformed cached candidate repair provenance")
+                for parent in entry["repair_for"]:
+                    if not isinstance(parent, str) or parent not in expected:
+                        raise ValueError("cached candidate repair references a foreign parent")
+                    job = expected[parent]
+                    candidate_ids = entry.get("candidate_ids")
+                    if not isinstance(candidate_ids, list) or len(candidate_ids) != 1 or not isinstance(candidate_ids[0], str):
+                        raise ValueError("cached repair must identify one candidate")
+                    candidates = [item for item in job["candidates"] if item["id"] == candidate_ids[0]]
+                    child_id = decision_id(job["task"], job["query"]["id"], candidate_ids)
+                    if (len(candidates) != 1 or entry.get("task") != job["task"] or entry.get("query_id") != job["query"]["id"]
+                            or entry.get("record_id") != child_id):
+                        raise ValueError("cached candidate repair changed its request identity")
+                    child = {**job, "record_id": child_id, "candidates": candidates}
+                    validate_json_schema(entry.get("decision"), DECISION_SCHEMA)
+                    validate(child, entry["decision"])
+                    restored.append((child, entry["decision"], parent))
+            for child, decision, parent in restored:
+                self._remember(child, decision, repair_for=parent)
+            return content
+        except (ValueError, TypeError, KeyError, OSError):
+            if self.on_progress:
+                self.on_progress("rebuilding invalid semantic decision checkpoint")
+            return None
+
+    def _remember(self, job: dict[str, Any], decision: dict[str, Any], *, repair_for: str | None = None) -> None:
+        # A single-candidate job can be both a comparison and a repair. Keep
+        # one audit entry per identity even when a partial cache is resumed.
+        entry = self._completed_by_id.get(job["record_id"])
+        if entry is None:
+            entry = {"record_id": job["record_id"], "task": job["task"], "query_id": job["query"]["id"],
+                     "candidate_ids": [item["id"] for item in job["candidates"]], "decision": deepcopy(decision)}
+            self.completed.append(entry)
+            self._completed_by_id[job["record_id"]] = entry
+        else:
+            entry["decision"] = deepcopy(decision)
+        if repair_for is not None and repair_for != job["record_id"]:
+            parents = entry.setdefault("repair_for", [])
+            if repair_for not in parents:
+                parents.append(repair_for)
+            self._repair_children.setdefault(repair_for, set()).add(job["record_id"])
 
     def evaluate(
         self, jobs: Iterable[dict[str, Any]], validate: Callable[[dict[str, Any], dict[str, Any]], None],
@@ -415,75 +511,122 @@ class SemanticDecisionRunner:
         self, data: dict[str, Any], jobs: dict[str, dict[str, Any]],
         validate: Callable[[dict[str, Any], dict[str, Any]], None],
     ) -> list[dict[str, Any]]:
+        """Repair missing semantics at their candidate, including malformed rows."""
         notes: list[dict[str, Any]] = []
-        for identifier, row in self._index(data, set(jobs)).items():
+        indexed = self._index(data, set(jobs), recovery_notes=notes)
+        for identifier, row in indexed.items():
             job = jobs[identifier]
-            if job["task"] not in {"state", "transition"}:
+            if job["task"] not in {"state", "transition"} or not job["candidates"]:
                 continue
-            try:
-                validate_json_schema(row, DECISION_SCHEMA)
-            except ValueError:
-                continue  # Complete malformed analysis fields in record repair first.
-            coverage = candidate_coverage(job, row)
-            if not any(coverage.values()):
-                continue
+            schema_issues = collect_schema_issues(row, DECISION_SCHEMA)
+            if not schema_issues:
+                try:
+                    validate(job, row)
+                    continue
+                except ValueError:
+                    pass
             candidates = {item["id"]: item for item in job["candidates"]}
+            # This view is diagnostic only. No placeholder enters a decision,
+            # a checkpoint, or the assembled graph.
+            view: dict[str, Any] = {"differences": []}
+            malformed_scope = False
+            for field in ("matches", "unrelated_ids", "uncertain_ids"):
+                values = row.get(field)
+                if not isinstance(values, list):
+                    malformed_scope = True
+                    values = []
+                if any(not isinstance(value, str) for value in values):
+                    malformed_scope = True
+                view[field] = [value for value in values if isinstance(value, str)]
+            differences = row.get("differences")
+            if not isinstance(differences, list):
+                malformed_scope = True
+                differences = []
+            for difference in differences:
+                if not isinstance(difference, dict) or not isinstance(difference.get("candidate_id"), str):
+                    malformed_scope = True
+                    continue
+                kind = difference.get("kind")
+                view["differences"].append({"candidate_id": difference["candidate_id"],
+                                            "kind": kind if isinstance(kind, str) else "<invalid-kind>"})
+            coverage = candidate_coverage(job, view)
             bad = set(coverage["missing_ids"] + coverage["conflicting_ids"] + coverage["duplicate_ids"]) & candidates.keys()
-            if coverage["foreign_ids"] or record_wide_uncertainty(row):
-                # An unknown counterpart cannot be silently discarded while
-                # accepting a possibly false "unrelated" classification. A
-                # record-wide deferral likewise requires reassessing its scope.
+            for issue in schema_issues:
+                path = issue.path
+                if path == ("assessment",):
+                    # Completion is recomputed after actual classifications
+                    # have been validated; do not expand a localized omission
+                    # merely because its summary could not yet be derived.
+                    continue
+                if len(path) >= 2 and path[0] == "differences" and isinstance(path[1], int):
+                    difference = differences[path[1]]
+                    candidate = difference.get("candidate_id") if isinstance(difference, dict) else None
+                    if isinstance(candidate, str) and candidate in candidates:
+                        bad.add(candidate)
+                    else:
+                        malformed_scope = True
+                else:
+                    malformed_scope = True
+            if malformed_scope or coverage["foreign_ids"] or record_wide_uncertainty(row):
+                # Unknown identities and unlocatable semantic omissions require
+                # reassessing the block, never silently dropping a proposal.
                 bad = set(candidates)
+            preserved: dict[str, dict[str, Any]] = {}
             for candidate in sorted(candidates.keys() - bad):
-                probe = deepcopy(row)
-                for field in ("matches", "unrelated_ids", "uncertain_ids"):
-                    probe[field] = [value for value in row[field] if value == candidate]
-                probe["differences"] = [value for value in row["differences"] if value["candidate_id"] == candidate]
+                child = {**job, "record_id": decision_id(job["task"], job["query"]["id"], [candidate]),
+                         "candidates": [candidates[candidate]]}
+                probe = {"record_id": child["record_id"], "rationale": row["rationale"],
+                         **{field: [value for value in view[field] if value == candidate]
+                            for field in ("matches", "unrelated_ids", "uncertain_ids")},
+                         "differences": [deepcopy(value) for value in differences
+                                         if isinstance(value, dict) and value.get("candidate_id") == candidate]}
                 probe["assessment"] = "uncertain" if probe["uncertain_ids"] else "complete"
                 try:
-                    validate({**job, "candidates": [candidates[candidate]]}, probe)
+                    validate_json_schema(probe, DECISION_SCHEMA)
+                    validate(child, probe)
                 except ValueError:
                     bad.add(candidate)
-            candidate_results: dict[str, dict[str, Any]] = {}
+                else:
+                    preserved[candidate] = probe
+                    self._save([child], {"records": [probe]})
+                    self._remember(child, probe, repair_for=identifier)
+            if not bad:
+                continue  # A nonlocal error must still pass strict record repair.
+            candidate_results = dict(preserved)
             child_ids = []
             for candidate in sorted(bad):
                 child = {**job, "record_id": decision_id(job["task"], job["query"]["id"], [candidate]),
                          "candidates": [candidates[candidate]]}
-                # Same record contract, now with one explicit candidate. The
-                # child keeps a stable ID and its own resumable checkpoint.
-                # Disabling subdivision bounds recursion even if it fails.
+                # Same schema and identity contract; disable further subdivision
+                # so an exhausted child strictly aborts instead of recurring.
                 try:
                     (_, decision), = self._evaluate_batch([child], validate, allow_candidate_repair=False)
                 except LLMValidationError as exc:
                     raise RuntimeError(f"candidate decision repair failed for {identifier}/{candidate}: {exc}") from exc
-                self.completed[-1]["repair_for"] = identifier
+                self._remember(child, decision, repair_for=identifier)
                 candidate_results[candidate] = decision
                 child_ids.append(child["record_id"])
-            repaired = deepcopy(row)
-            for field in ("matches", "unrelated_ids", "uncertain_ids"):
-                repaired[field] = [value for value in row[field] if value in candidates and value not in bad]
-            repaired["differences"] = [value for value in row["differences"]
-                                       if value["candidate_id"] in candidates and value["candidate_id"] not in bad]
-            for candidate, decision in candidate_results.items():
+            repaired: dict[str, Any] = {"record_id": identifier,
+                "rationale": "[ProtoLens audit] Composed from validated candidate decisions; no semantic justification was inferred.",
+                **{field: [] for field in ("matches", "unrelated_ids", "uncertain_ids", "differences")}}
+            for candidate in sorted(candidate_results):
+                decision = candidate_results[candidate]
                 if record_wide_uncertainty(decision):
-                    # With exactly one candidate, a deferred child judgment has
-                    # an explicit scope; do not promote its tentative findings.
+                    # Explicit model uncertainty in a child has one known scope.
+                    # Validation failure is never converted into uncertainty.
                     repaired["uncertain_ids"].append(candidate)
                 else:
                     for field in ("matches", "unrelated_ids", "uncertain_ids", "differences"):
                         repaired[field].extend(deepcopy(decision[field]))
             repaired["assessment"] = "uncertain" if repaired["uncertain_ids"] else "complete"
-            repaired["rationale"] = (
-                "[ProtoLens] Candidate coverage completed using validated single-candidate decisions. "
-                "Existing valid classifications were retained; revised judgments and rationales are recorded in merge_decisions.json."
-            )
             validate_json_schema(repaired, DECISION_SCHEMA)
             validate(job, repaired)
             row.clear()
             row.update(repaired)
-            notes.append({"path": "$.records", "record_id": identifier, "reason": "candidate_scoped_coverage_repair",
-                          "coverage_before": coverage, "repaired_candidate_ids": sorted(bad),
-                          "child_record_ids": child_ids})
+            self._save([job], {"records": [row]})
+            notes.append({"path": "$.records", "record_id": identifier, "reason": "candidate_scoped_semantic_repair",
+                          "coverage_before": coverage, "schema_issues": [issue.to_dict() for issue in schema_issues],
+                          "repaired_candidate_ids": sorted(bad), "child_record_ids": child_ids})
         return notes
 
     def _evaluate_batch(
@@ -491,6 +634,22 @@ class SemanticDecisionRunner:
         *, allow_candidate_repair: bool = True,
     ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         expected = {job["record_id"]: job for job in jobs}
+
+        def problems(job: dict[str, Any], row: Any) -> dict[str, Any] | None:
+            issues = collect_schema_issues(row, DECISION_SCHEMA)
+            if issues:
+                return {"message": issues[0].message, "schema_issues": [issue.to_dict() for issue in issues]}
+            try:
+                validate(job, row)
+            except ValueError as exc:
+                return {"message": str(exc), "schema_issues": []}
+            return None
+
+        def accept(job: dict[str, Any], row: dict[str, Any]) -> None:
+            # Persist immediately, before the next record can fail. These are
+            # verified decisions, never incomplete proposals or error fallbacks.
+            self._save([job], {"records": [row]})
+            self._remember(job, row)
 
         def validate_all(data: dict[str, Any]) -> None:
             indexed = self._index(data, set(expected))
@@ -500,64 +659,78 @@ class SemanticDecisionRunner:
                 validate_json_schema(row, DECISION_SCHEMA)
                 validate(expected[identifier], row)
 
-        payload = self._payload(jobs)
-        client_identity = self.recorder.llm_client.cache_identity()
-        fingerprint = stable_fingerprint([payload, DECISION_SCHEMA, client_identity])
-        checkpoint = f"checkpoints/merge_decisions/{fingerprint}.json"
-        result = None
-        if self.store is not None and not self.force and self.store.path(checkpoint).is_file():
-            try:
-                cached = self.store.read_json(checkpoint)
-                if not isinstance(cached, dict):
-                    raise ValueError("semantic decision checkpoint must be an object")
-                if cached.get("sha256") != stable_fingerprint(cached.get("content")):
-                    raise ValueError("semantic decision checkpoint checksum mismatch")
-                validate_json_schema(cached["content"], self._schema(len(jobs)))
-                validate_all(cached["content"])
-                result = cached["content"]
-            except (ValueError, TypeError, KeyError, OSError):
-                if self.on_progress:
-                    self.on_progress("rebuilding invalid semantic decision checkpoint")
+        result = self._load(jobs, validate)
+        if result is None and len(jobs) > 1:
+            cached_rows: dict[str, dict[str, Any]] = {}
+            for job in jobs:
+                cached = self._load([job], validate)
+                if cached is not None:
+                    cached_rows[job["record_id"]] = cached["records"][0]
+                    self._remember(job, cached["records"][0])
+            if cached_rows:
+                remaining = [job for job in jobs if job["record_id"] not in cached_rows]
+                if remaining:
+                    for job, row in self._evaluate_batch(remaining, validate, allow_candidate_repair=allow_candidate_repair):
+                        cached_rows[job["record_id"]] = row
+                result = {"records": [cached_rows[job["record_id"]] for job in jobs]}
+                validate_all(result)
+                self._save(jobs, result)
 
         def complete_partial(data: dict[str, Any]) -> list[dict[str, Any]]:
-            notes = self._complete_candidate_coverage(data, expected, validate) if allow_candidate_repair else []
-            indexed = self._index(data, set(expected))
+            notes: list[dict[str, Any]] = []
+            indexed = self._index(data, set(expected), recovery_notes=notes)
+            data["records"] = [indexed[job["record_id"]] for job in jobs if job["record_id"] in indexed]
             issues = {}
+            # Validate all siblings before attempting any repair, so failure
+            # of an early record cannot lose a valid later one.
             for identifier, job in expected.items():
-                row = indexed.get(identifier)
-                try:
-                    validate_json_schema(row, DECISION_SCHEMA)
-                except ValueError as exc:
-                    issues[identifier] = str(exc)
-                    continue
-                try:
-                    validate(job, row)
-                except ValueError as exc:
-                    issues[identifier] = str(exc)
-                    # Acceptance is atomic per record: structural fragments
-                    # are not validated judgments that a repair must preserve.
-            if not issues:
-                return notes
-            repaired = {}
-            # Repair one identified record at a time, with the same schema.
-            # This keeps context bounded and never regenerates accepted rows.
-            for identifier, error in issues.items():
+                issue = problems(job, indexed.get(identifier))
+                if issue is None:
+                    accept(job, indexed[identifier])
+                else:
+                    issues[identifier] = issue
+            for identifier in issues:
                 job = expected[identifier]
-                repair = {"errors": {identifier: error}, "supplied_records": [indexed[identifier]] if identifier in indexed else [],
-                          "supplied_records_are_unvalidated": True,
-                          "repair_scope": "invalid_record", "fixed_fields": {"record_id": identifier},
-                          "allowed_candidate_ids": [item["id"] for item in job["candidates"]],
-                          "accepted_record_ids": sorted(set(expected) - set(issues)),
-                          "requirements": [
-                              "Revise only this invalid record, preserving its record_id. Other accepted records are fixed.",
-                              "Candidate classifications are related fields; correct them together when necessary.",
-                              "Arrays may change length and order. Use only requested candidate IDs and classify every candidate exactly once.",
-                              "Ground each revised judgment in the supplied inputs and evidence; do not invent defaults.",
-                              ("This unmatched task has no candidates: matches, unrelated_ids and uncertain_ids must be []; findings use candidate_id=null."
-                               if job["task"].startswith("unmatched_") else "Use only allowed_candidate_ids, not the query ID or a candidate from another block."),
-                          ]}
+                row = indexed.get(identifier)
+                if row is not None and allow_candidate_repair:
+                    notes.extend(self._complete_candidate_coverage({"records": [row]}, {identifier: job}, validate))
+                    current = problems(job, row)
+                    if current is None:
+                        accept(job, row)
+                        continue
+                    issues[identifier] = current
+                issue = issues[identifier]
+                repair = {
+                    "errors": {identifier: issue["message"]}, "schema_issues": issue["schema_issues"],
+                    "schema_issue_count": len(issue["schema_issues"]),
+                    "supplied_records": [row] if row is not None else [],
+                    "supplied_records_are_unvalidated": True,
+                    "repair_scope": "invalid_record", "fixed_fields": {"record_id": identifier},
+                    "allowed_candidate_ids": [item["id"] for item in job["candidates"]],
+                    "requirements": [
+                        "Return only this complete record with its original record_id and the same schema.",
+                        "Correct related classification fields together; arrays may change length and order.",
+                        "Classify every requested candidate exactly once; ground all judgments in the supplied evidence, with no invented defaults.",
+                        ("Unmatched task: all classification arrays are empty; findings use candidate_id=null."
+                         if job["task"].startswith("unmatched_") else "Use only allowed_candidate_ids, never query IDs or candidates from other blocks."),
+                    ],
+                }
+                # Keep immutable task inputs and evidence intact. An oversized
+                # rejected proposal is optional context; the raw response and
+                # complete diagnostics remain in the conversation log.
                 if not self.fits([job], repair):
-                    raise RuntimeError(f"repair context for {identifier} exceeds merge_request_bytes; no graph was regenerated")
+                    repair["supplied_records"] = []
+                    repair["schema_issues"] = issue["schema_issues"][:8]
+                    repair["errors"] = {identifier: issue["message"].encode("utf-8")[:512].decode("utf-8", errors="ignore")}
+                    notes.append({"path": "$.records", "record_id": identifier,
+                                  "reason": "oversized_invalid_proposal_omitted_from_repair", "schema_issues": issue["schema_issues"]})
+                if not self.fits([job], repair):
+                    # The request itself already contains all expected fields;
+                    # paths alone suffice when verbose diagnostics do not fit.
+                    repair["schema_issues"] = [{"path": value["path"], "keyword": value["keyword"]}
+                                               for value in issue["schema_issues"][:8]]
+                if not self.fits([job], repair):
+                    raise RuntimeError(f"repair context for {identifier} exceeds merge_request_bytes; validated checkpoints retained, no complete merge generated")
 
                 def validate_repair(value: dict[str, Any], *, identifier: str = identifier, job: dict[str, Any] = job) -> None:
                     rows = self._index(value, {identifier})
@@ -567,7 +740,7 @@ class SemanticDecisionRunner:
 
                 try:
                     response = self.recorder.call_chat(
-                        system=SYSTEM + " Revise only the requested invalid record as a whole. Supplied record fields are unvalidated, not fixed facts. Return the full record using the original record_id; satisfy candidate identity, exclusive classification and complete coverage constraints.",
+                        system=SYSTEM + " Revise only the requested invalid record as a whole. Supplied record fields are unvalidated, not fixed facts.",
                         payload=self._payload([job], repair), schema=self._schema(1),
                         schema_name="protolens_merge_decisions_repair", validator=validate_repair,
                         response_normalizer=lambda value, identifier=identifier, job=job: normalize_decisions(
@@ -578,27 +751,29 @@ class SemanticDecisionRunner:
                         )) if allow_candidate_repair else None,
                     )
                 except LLMValidationError as exc:
-                    raise RuntimeError(f"semantic decision repair failed for {identifier}: {exc}") from exc
-                repaired[identifier] = response["records"][0]
-            data["records"] = [repaired.get(job["record_id"], indexed.get(job["record_id"])) for job in jobs]
-            return [*notes, {"path": "$.records", "record_ids": sorted(repaired), "reason": "targeted_semantic_record_repair"}]
+                    raise RuntimeError(
+                        f"semantic decision repair failed for {identifier}; validated checkpoints retained, no complete merge generated: {exc}"
+                    ) from exc
+                row = response["records"][0]
+                indexed[identifier] = row
+                accept(job, row)
+                notes.append({"path": "$.records", "record_id": identifier, "reason": "targeted_semantic_record_repair",
+                              "schema_issues_before_repair": issue["schema_issues"]})
+            data["records"] = [indexed[job["record_id"]] for job in jobs]
+            return notes
 
         if result is None:
             result = self.recorder.call_chat(
-                system=SYSTEM, payload=payload, schema=self._schema(len(jobs)),
+                system=SYSTEM, payload=self._payload(jobs), schema=self._schema(len(jobs)),
                 schema_name="protolens_merge_decisions", validator=validate_all,
                 response_normalizer=lambda data: normalize_decisions(data, set(expected), jobs=expected),
                 result_normalizer=complete_partial,
             )
-            if self.store is not None:
-                self.store.write_json(checkpoint, {"content": result, "sha256": stable_fingerprint(result)})
+            self._save(jobs, result)
         indexed = self._index(result, set(expected))
         pairs = [(job, indexed[job["record_id"]]) for job in jobs]
         for job, decision in pairs:
-            self.completed.append({"record_id": job["record_id"], "task": job["task"],
-                                   "query_id": job["query"]["id"],
-                                   "candidate_ids": [item["id"] for item in job["candidates"]],
-                                   "decision": decision})
+            self._remember(job, decision)
         if self.on_progress:
             self.on_progress(f"semantic merge: {len(self.completed)} decisions validated")
         return pairs

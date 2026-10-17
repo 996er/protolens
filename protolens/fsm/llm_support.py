@@ -11,6 +11,7 @@ import re
 from protolens.fsm.fsm_model import Divergence, ProtocolFSM
 from protolens.utils.llm_client import IncompleteLLMResponse, LLMClient, LLMResponse
 from protolens.utils.json_output import load_json_object
+from protolens.utils.json_schema import collect_schema_issues, validate_json_schema
 
 
 EVIDENCE_SCHEMA: dict[str, Any] = {
@@ -228,9 +229,14 @@ class LLMConversationRecorder:
         for attempt in range(retries + 1):
             user = base_user
             if last_error is not None:
+                feedback = f"{type(last_error).__name__}: {last_error}"
+                # Full diagnostics stay in the log. Feedback must fit the
+                # bounded-request reserve, including multi-byte model text.
+                if len(feedback.encode("utf-8")) > 1536:
+                    feedback = feedback.encode("utf-8")[:1536].decode("utf-8", errors="ignore") + " [feedback shortened; see log]"
                 user += (
                     "\n\nThe previous response was rejected by ProtoLens: "
-                    f"{type(last_error).__name__}: {last_error}. Regenerate the complete JSON object."
+                    f"{feedback}. Regenerate the complete JSON object."
                 )
             record: dict[str, Any] = {
                 "started_at": datetime.now(timezone.utc).isoformat(),
@@ -263,6 +269,9 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 normalizations: list[dict[str, Any]] = []
+                # Keep format diagnostics even when a later semantic repair
+                # aborts this request. Raw model output is retained separately.
+                record["normalizations"] = normalizations
                 data = load_json_object(response.text, schema=schema, normalizations=normalizations)
                 # Decode task-specific response envelopes before the generic
                 # extension filter removes non-schema keys carrying results.
@@ -272,10 +281,11 @@ class LLMConversationRecorder:
                     data, schema, protocol=payload.get("protocol"),
                     repair_response=schema_name.endswith("_repair"),
                 ))
+                schema_issues = collect_schema_issues(data, schema)
+                if schema_issues:
+                    record["schema_issues_before_repair"] = [issue.to_dict() for issue in schema_issues]
                 if result_normalizer is not None:
                     normalizations.extend(result_normalizer(data))
-                if normalizations:
-                    record["normalizations"] = normalizations
                 try:
                     validate_json_schema(data, schema)
                 except ValueError as schema_error:
@@ -302,6 +312,8 @@ class LLMConversationRecorder:
                         "raw": raw,
                     }
                 record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                if getattr(exc, "issues", None):
+                    record["error"]["schema_issues"] = [issue.to_dict() for issue in exc.issues]
                 # Transport/output-budget retries belong to LLMClient. Retrying them
                 # here multiplies request counts and worsens upstream rate limits.
                 retryable = received_response and isinstance(exc, ValueError)
@@ -822,73 +834,6 @@ def validate_divergences(items: Any) -> list[Divergence]:
         result.append(Divergence.from_dict(item))
     return result
 
-
-def validate_json_schema(
-    value: Any, schema: dict[str, Any], path: str = "$", *, allow_missing: bool = False,
-) -> None:
-    expected_type = schema.get("type")
-    if expected_type is not None and not _matches_json_type(value, expected_type):
-        raise ValueError(f"{path} must have JSON type {expected_type!r}, got {type(value).__name__}")
-
-    if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"{path} must be one of {schema['enum']!r}, got {value!r}")
-
-    if isinstance(value, dict):
-        required = schema.get("required", [])
-        missing = [key for key in required if key not in value]
-        if missing and not allow_missing:
-            raise ValueError(f"{path} is missing required keys: {missing}")
-        properties = schema.get("properties", {})
-        if schema.get("additionalProperties") is False:
-            extras = sorted(set(value) - set(properties))
-            if extras:
-                raise ValueError(f"{path} contains unexpected keys: {extras}")
-        for key, item in value.items():
-            child_schema = properties.get(key)
-            if isinstance(child_schema, dict):
-                validate_json_schema(item, child_schema, f"{path}.{key}", allow_missing=allow_missing)
-
-    if isinstance(value, list):
-        if "minItems" in schema and len(value) < int(schema["minItems"]):
-            raise ValueError(f"{path} must contain at least {schema['minItems']} items")
-        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
-            raise ValueError(f"{path} must contain at most {schema['maxItems']} items")
-        item_schema = schema.get("items")
-        if isinstance(item_schema, dict):
-            for index, item in enumerate(value):
-                validate_json_schema(item, item_schema, f"{path}[{index}]", allow_missing=allow_missing)
-
-    if isinstance(value, str) and "minLength" in schema and len(value.strip()) < int(schema["minLength"]):
-        raise ValueError(f"{path} must contain at least {schema['minLength']} characters")
-    if isinstance(value, str) and "maxLength" in schema and len(value) > int(schema["maxLength"]):
-        raise ValueError(f"{path} must contain at most {schema['maxLength']} characters")
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise ValueError(f"{path} must be a finite number")
-        if "minimum" in schema and value < schema["minimum"]:
-            raise ValueError(f"{path} must be >= {schema['minimum']}")
-        if "maximum" in schema and value > schema["maximum"]:
-            raise ValueError(f"{path} must be <= {schema['maximum']}")
-
-
-def _matches_json_type(value: Any, expected: Any) -> bool:
-    choices = expected if isinstance(expected, list) else [expected]
-    for choice in choices:
-        if choice == "null" and value is None:
-            return True
-        if choice == "object" and isinstance(value, dict):
-            return True
-        if choice == "array" and isinstance(value, list):
-            return True
-        if choice == "string" and isinstance(value, str):
-            return True
-        if choice == "boolean" and isinstance(value, bool):
-            return True
-        if choice == "number" and isinstance(value, (int, float)) and not isinstance(value, bool):
-            return True
-        if choice == "integer" and isinstance(value, int) and not isinstance(value, bool):
-            return True
-    return False
 
 
 def response_used_web_search(raw: dict[str, Any] | None) -> bool:
