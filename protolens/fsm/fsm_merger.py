@@ -10,7 +10,7 @@ from protolens.fsm.fsm_model import Divergence, Evidence, ProtocolFSM, State, St
 from protolens.fsm.llm_support import (
     FSM_SCHEMA, LLMConversationRecorder, normalize_fsm_protocol, validate_fsm, validate_json_schema,
 )
-from protolens.fsm.merge_records import SemanticDecisionRunner, decision_id
+from protolens.fsm.merge_records import SemanticDecisionRunner, decision_id, record_wide_uncertainty
 from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.llm_client import LLMClient
 from protolens.utils.stage_checkpoints import stable_fingerprint
@@ -115,7 +115,10 @@ class FSMMerger:
         divergences = self._assemble_divergences(elements, all_results, evidence_table)
         uncertainties = [
             {"record_id": job["record_id"], "query_id": job["query"]["id"],
-             "candidate_ids": row["uncertain_ids"], "rationale": row["rationale"]}
+             "scope": "record" if record_wide_uncertainty(row) else "candidates",
+             "candidate_ids": ([item["id"] for item in job["candidates"]]
+                               if record_wide_uncertainty(row) else row["uncertain_ids"]),
+             "rationale": row["rationale"]}
             for job, row in all_results if row["assessment"] == "uncertain"
         ]
         spec_initial = _id("spec_state", spec_fsm.initial_state)
@@ -220,6 +223,7 @@ class FSMMerger:
             raise ValueError("semantic decision changed record_id")
         candidates = {item["id"]: item for item in job["candidates"]}
         query, task = job["query"], job["task"]
+        deferred = record_wide_uncertainty(row)
         groups = [set(row[key]) for key in ("matches", "unrelated_ids", "uncertain_ids")]
         for key, group in zip(("matches", "unrelated_ids", "uncertain_ids"), groups):
             if len(group) != len(row[key]):
@@ -242,7 +246,7 @@ class FSMMerger:
                     raise ValueError("difference references an unknown candidate or inappropriate kind")
                 differing.add(identifier)
             citations = [*query["evidence"], *(candidates[identifier]["evidence"] if identifier in candidates else [])]
-            if not citations:
+            if not citations and not deferred:
                 raise ValueError("difference has no supporting input evidence; mark the comparison uncertain")
         groups.append(differing)
         if any(left & right for index, left in enumerate(groups) for right in groups[index + 1:]):
@@ -250,10 +254,12 @@ class FSMMerger:
         if set().union(*groups) != set(candidates):
             raise ValueError("every candidate must be classified exactly once; incomplete or foreign candidate coverage")
         if task.startswith("unmatched_"):
-            if (row["assessment"] == "complete") != bool(row["differences"]):
+            if row["assessment"] == "complete" and not row["differences"]:
                 raise ValueError("unmatched assessment needs an evidenced finding or an explicit uncertain judgment")
-        elif (row["assessment"] == "uncertain") != bool(row["uncertain_ids"]):
-            raise ValueError("assessment must reflect explicit uncertain_ids")
+        elif row["uncertain_ids"] and row["assessment"] != "uncertain":
+            raise ValueError("explicit uncertain candidates require an uncertain assessment")
+        if deferred:
+            return  # Tentative matches/findings are audited, never assembled.
         for identifier in row["matches"]:
             candidate = candidates[identifier]
             if task == "state" and query["roles"] != candidate["roles"]:
@@ -267,9 +273,13 @@ class FSMMerger:
     ) -> list[list[str]]:
         groups = _Groups(elements)
         for job, row in results:
+            if record_wide_uncertainty(row):
+                continue
             for candidate in row["matches"]:
                 groups.join(job["query"]["id"], candidate)
         for job, row in results:
+            if record_wide_uncertainty(row):
+                continue
             query = job["query"]["id"]
             for difference in row["differences"]:
                 if groups.root(query) == groups.root(difference["candidate_id"]):
@@ -326,6 +336,9 @@ class FSMMerger:
         related, uncertain = set(), set()
         for job, row in results:
             query = job["query"]["id"]
+            if record_wide_uncertainty(row):
+                uncertain.update({query, *(item["id"] for item in job["candidates"])})
+                continue
             counterparts = set(row["matches"]) | {item["candidate_id"] for item in row["differences"]}
             if counterparts:
                 related.update({query, *counterparts})
@@ -348,6 +361,8 @@ class FSMMerger:
     ) -> list[Divergence]:
         divergences = {}
         for job, row in results:
+            if record_wide_uncertainty(row):
+                continue
             query = inputs[job["query"]["id"]]
             for difference in row["differences"]:
                 counterpart = inputs.get(difference["candidate_id"])

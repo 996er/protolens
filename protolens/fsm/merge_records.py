@@ -42,13 +42,16 @@ SYSTEM = (
     "Copy record_id and candidate IDs exactly. For each comparison, classify EVERY candidate "
     "exactly once as equivalent (matches), behaviorally related but different (differences), "
     "unrelated (unrelated_ids), or unresolved (uncertain_ids). A candidate can have several "
-    "different mismatch kinds. Equivalent means identical behavior including state roles, "
+    "different mismatch kinds. Set assessment=uncertain whenever uncertain_ids is nonempty. "
+    "An uncertain assessment with empty uncertain_ids expresses record-wide uncertainty: "
+    "the program will preserve all original paths and defer this record's matches and findings. "
+    "Equivalent means identical behavior including state roles, "
     "triggers, endpoints, guards, actions and error handling, not merely similar spelling. "
     "Use state_mismatch for state comparisons. For transition comparisons use guard_mismatch, "
     "state_mismatch, action_mismatch or error_handling_mismatch. Do not infer missing/extra "
     "behavior from one candidate block. For unmatched_spec/unmatched_impl, all opposite-side "
     "transitions have already been compared: assess missing_transition/extra_transition "
-    "respectively with candidate_id=null, or assessment=uncertain with no finding. "
+    "respectively with candidate_id=null, or assessment=uncertain to defer judgment. "
     "Assign P0/P1/P2 from evidence and explain the security impact. Never invent citations. "
     "Return {records:[...]} with the SAME complete record structure for initial and repair requests."
 )
@@ -58,8 +61,13 @@ def decision_id(task: str, query_id: str, candidate_ids: list[str]) -> str:
     return "decision_" + stable_fingerprint([task, query_id, sorted(candidate_ids)])[:24]
 
 
+def record_wide_uncertainty(row: dict[str, Any]) -> bool:
+    """A summary may defer the entire record without naming specific candidates."""
+    return row["assessment"] == "uncertain" and not row["uncertain_ids"]
+
+
 def normalize_decisions(data: dict[str, Any], expected: set[str]) -> list[dict[str, Any]]:
-    """Format compatibility only; missing judgments are never synthesized."""
+    """Normalize formats and redundant summaries without inventing judgments."""
     notes: list[dict[str, Any]] = []
     envelopes = [key for key in ("records", "decisions", "results", "repairs", "result") if key in data]
     if len(envelopes) > 1 and any(data[key] != data[envelopes[0]] for key in envelopes[1:]):
@@ -101,6 +109,16 @@ def normalize_decisions(data: dict[str, Any], expected: set[str]) -> list[dict[s
                 row["record_id"] = next(iter(expected))
                 notes.append({"path": f"$.records[{index}].record_id", "value": row["record_id"],
                               "reason": "single_requested_record_identity"})
+            uncertain = row.get("uncertain_ids")
+            if (isinstance(uncertain, list) and uncertain and all(isinstance(item, str) for item in uncertain)
+                    and row.get("assessment") != "uncertain"):
+                # Explicit unresolved candidates determine the summary. Never
+                # perform the reverse conversion: an empty list does not erase
+                # a model's record-wide uncertainty or certify completeness.
+                notes.append({"path": f"$.records[{index}].assessment",
+                              "original_value": row.get("assessment"), "was_missing": "assessment" not in row,
+                              "value": "uncertain", "reason": "assessment_from_explicit_uncertain_candidates"})
+                row["assessment"] = "uncertain"
             for difference in row.get("differences", []) if isinstance(row.get("differences"), list) else []:
                 if not isinstance(difference, dict):
                     continue
