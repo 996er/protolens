@@ -143,6 +143,139 @@ def _expand_merge_evidence(
     return candidate
 
 
+def _normalize_merge_field_patch(
+    patch: dict[str, Any], original: dict[str, Any],
+    slots: dict[str, tuple[tuple[str | int, ...], dict[str, Any]]],
+    divergence_schema: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Decode repair envelopes before undeclared fields are filtered out.
+
+    A returned list may be reordered or contain only repaired rows. Never use
+    its position to identify a divergence; require an explicit index or ID.
+    """
+    changes: list[dict[str, Any]] = []
+    resolved: dict[str, Any] = {}
+    divergences = original.get("divergences", [])
+    by_id: dict[str, list[int]] = {}
+    if isinstance(divergences, list):
+        for index, row in enumerate(divergences):
+            if isinstance(row, dict) and isinstance(row.get("id"), str):
+                by_id.setdefault(row["id"], []).append(index)
+
+    def assign(slot: str, value: Any, origin: str) -> None:
+        path, _ = slots[slot]
+        value = deepcopy(value)
+        if len(path) == 3 and path[0] == "divergences":
+            field = str(path[-1])
+            wrapper = {field: value}
+            changes.extend(_normalize_fsm_metadata(wrapper, divergence_schema, origin))
+            value = wrapper[field]
+        if slot in resolved and json.dumps(resolved[slot], sort_keys=True) != json.dumps(value, sort_keys=True):
+            raise ValueError(f"merge field repair contains conflicting values for {slot!r}")
+        resolved[slot] = value
+        if origin != f"$.{slot}":
+            changes.append({"path": f"$.{slot}", "original_path": origin, "value": value,
+                            "reason": "merge_repair_field_extracted"})
+
+    def read_row(row: Any, origin: str, key: str | None = None) -> None:
+        if not isinstance(row, dict):
+            raise ValueError(f"{origin} must be a divergence repair object")
+        identities: list[int] = []
+        for field in ("divergence_index", "index"):
+            if field in row:
+                index = row[field]
+                if type(index) is not int or not 0 <= index < len(divergences):
+                    raise ValueError(f"{origin}.{field} must be a valid zero-based divergence index")
+                identities.append(index)
+        if key is not None:
+            matches = set(by_id.get(key, []))
+            number = key.removeprefix("divergence_")
+            if number.isascii() and number.isdecimal() and int(number) < len(divergences):
+                matches.add(int(number))
+            if len(matches) != 1:
+                raise ValueError(f"{origin} has an unknown or ambiguous divergence key {key!r}")
+            identities.append(next(iter(matches)))
+        for field in ("divergence_id", "id"):
+            if field not in row:
+                continue
+            identifier = row[field]
+            matches = by_id.get(identifier, []) if isinstance(identifier, str) else []
+            if len(matches) == 1:
+                identities.append(matches[0])
+            elif field == "divergence_id" or not identities:
+                raise ValueError(f"{origin}.{field} must identify one existing divergence")
+            # An id being repaired may not exist yet; an explicit index still
+            # identifies the row, and fixed-field checks below protect old IDs.
+        if not identities or len(set(identities)) != 1:
+            raise ValueError(f"{origin} needs an unambiguous divergence ID or explicit index; list order is not an identity")
+        index = identities[0]
+        values = {field: value for field, value in row.items()
+                  if field not in {"divergence_id", "divergence_index", "index"}}
+        nested_fields = []
+        for envelope in ("fields", "patch", "updates"):
+            if envelope in values:
+                nested = values.pop(envelope)
+                if not isinstance(nested, dict):
+                    raise ValueError(f"{origin}.{envelope} must contain divergence fields")
+                nested = deepcopy(nested)
+                changes.extend(_normalize_fsm_metadata(nested, divergence_schema, f"{origin}.{envelope}"))
+                nested_fields.append(nested)
+        changes.extend(_normalize_fsm_metadata(values, divergence_schema, origin))
+        for nested in nested_fields:
+            for field, value in nested.items():
+                if field in values and values[field] != value:
+                    raise ValueError(f"{origin} contains conflicting divergence field {field!r}")
+                values[field] = value
+        for field, value in values.items():
+            slot = f"divergence_{index}_{field}"
+            if slot in slots:
+                assign(slot, value, f"{origin}.{field}")
+            elif field not in divergences[index] or divergences[index][field] != value:
+                raise ValueError(f"{origin} changes unrequested divergence field {index}.{field}")
+
+    def collect(value: Any, origin: str, *, rows: bool = False) -> None:
+        if isinstance(value, list):
+            for index, row in enumerate(value):
+                collect(row, f"{origin}[{index}]", rows=True)
+            return
+        if not isinstance(value, dict):
+            raise ValueError(f"{origin} must contain repair fields or identified divergence rows")
+        # Also accept explicit slot/value records or path/value records.
+        if "value" in value:
+            slot = value.get("slot", value.get("field"))
+            if isinstance(slot, str) and slot in slots:
+                assign(slot, value["value"], f"{origin}.value")
+                return
+            path = value.get("path")
+            if isinstance(path, list):
+                matches = [name for name, (target, _) in slots.items() if list(target) == path]
+                if len(matches) == 1:
+                    assign(matches[0], value["value"], f"{origin}.value")
+                    return
+            raise ValueError(f"{origin} must name a requested repair slot or exact field path")
+        if any(field in value for field in ("id", "divergence_id", "divergence_index", "index")):
+            read_row(value, origin)
+            return
+        for key, item in value.items():
+            child = f"{origin}.{key}"
+            if key in slots:
+                assign(key, item, child)
+            elif key in {"repairs", "patch", "patches", "result", "fields", "updates"}:
+                collect(item, child)
+            elif key == "divergences":
+                collect(item, child, rows=True)
+            elif (rows or (key.isascii() and key.isdecimal())
+                  or (key.startswith("divergence_") and key[11:].isascii() and key[11:].isdecimal())):
+                read_row(item, child, key)
+            elif key in by_id:
+                read_row(item, child, key)
+            # Other annotations remain available to the generic audit filter.
+
+    collect(patch, "$")
+    patch.update(resolved)
+    return changes
+
+
 class FSMMerger:
     """Compare and merge specification/implementation FSMs through the LLM."""
 
@@ -476,17 +609,7 @@ class FSMMerger:
             return candidate
 
         def normalize_patch(patch: dict[str, Any]) -> list[dict[str, Any]]:
-            changes: list[dict[str, Any]] = []
-            for slot, (path, _) in slots.items():
-                if slot not in patch or len(path) != 3 or path[0] != "divergences":
-                    continue
-                field = str(path[-1])
-                wrapper = {field: patch[slot]}
-                changes.extend(_normalize_fsm_metadata(
-                    wrapper, divergence_schema, f"$.divergences[{path[1]}]",
-                ))
-                patch[slot] = wrapper[field]
-            return changes
+            return _normalize_merge_field_patch(patch, data, slots, divergence_schema)
 
         def validate_repair(patch: dict[str, Any]) -> None:
             candidate = _expand_merge_evidence(patched(patch), evidence_table)
@@ -509,11 +632,17 @@ class FSMMerger:
                     "missing_fields": [slot for slot in slots if slot not in invalid_slots],
                     "invalid_fields": invalid_slots,
                     "field_paths": {slot: list(path) for slot, (path, _) in slots.items()},
+                    "divergence_identities": [
+                        {"divergence_index": index, "id": divergence.get("id")}
+                        for index, divergence in enumerate(divergences or [])
+                        if isinstance(divergence, dict)
+                    ],
                     "partial_result": data,
                     "specification_fsm": merge_payload["specification_fsm"],
                     "implementation_fsm": merge_payload["implementation_fsm"],
                     "evidence_table": evidence_table,
                     "requirements": [
+                        "Return one flat JSON object keyed by requested_fields exactly (for example divergence_0_severity), with each value matching its field schema. Do not omit prefixes or return an anonymous list of values.",
                         "Return all requested fields; replace only fields flagged invalid or absent. The graph and every other supplied value are fixed.",
                         "For divergence_N_FIELD slots, complete only that field on the existing divergence. Do not delete, replace or renumber entries.",
                         "Ground kind, severity and rationale in the supplied comparison and evidence; do not assign arbitrary defaults. Use null for an element only when that side has no counterpart.",
@@ -528,7 +657,7 @@ class FSMMerger:
                 },
                 schema=schema, schema_name="protolens_merge_missing_fields_repair",
                 validator=validate_repair,
-                result_normalizer=normalize_patch,
+                response_normalizer=normalize_patch,
             )
         except LLMValidationError as exc:
             # A failed targeted analysis must not multiply full-merge retries.
