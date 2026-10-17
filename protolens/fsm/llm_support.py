@@ -439,7 +439,9 @@ def _normalize_fsm_metadata(
         # Keep strict output schemas for providers, but do not retry a valid
         # repair solely because this commentary was omitted or structured.
         # This policy does not apply to merge/latestness rationales or evidence.
-        if repair_response and properties.get("rationale", {}).get("type") == "string":
+        is_repair_note = path == "$" or re.search(r"\.repairs\[[0-9]+\]$", path) is not None
+        if (repair_response and is_repair_note
+                and properties.get("rationale", {}).get("type") == "string"):
             rationale = value.get("rationale")
             rendered = None
             if rationale is None or (isinstance(rationale, str) and not rationale.strip()):
