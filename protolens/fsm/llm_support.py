@@ -639,8 +639,11 @@ def _normalize_fsm_metadata(
     return changes
 
 
-def fsm_from_llm(data: Any, *, builder: str, metadata: dict[str, Any] | None = None) -> ProtocolFSM:
-    validate_json_schema(data, FSM_SCHEMA)
+def fsm_from_llm(
+    data: Any, *, builder: str, metadata: dict[str, Any] | None = None,
+    schema: dict[str, Any] | None = None,
+) -> ProtocolFSM:
+    validate_json_schema(data, FSM_SCHEMA if schema is None else schema)
     if not isinstance(data, dict):
         raise ValueError("LLM FSM must be an object")
     states = data.get("states")

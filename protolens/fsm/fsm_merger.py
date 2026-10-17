@@ -51,13 +51,23 @@ TRANSITION_SOURCE_SCHEMA: dict[str, Any] = {
     },
 }
 
+# Merging accumulates citations from multiple input elements. Extraction-time
+# limits (12 per state/transition, 20 per divergence) must not discard evidence
+# or reject a valid union. Keep the original schemas unchanged for builders.
+MERGED_FSM_SCHEMA = deepcopy(FSM_SCHEMA)
+for _collection in ("states", "transitions"):
+    MERGED_FSM_SCHEMA["properties"][_collection]["items"]["properties"]["evidence"].pop("maxItems", None)
+MERGED_DIVERGENCE_SCHEMA = deepcopy(DIVERGENCE_SCHEMA)
+MERGED_DIVERGENCE_SCHEMA["properties"]["evidence"].pop("maxItems", None)
+
+
 MERGE_RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["unified_fsm", "divergences", "transition_sources", "merge_rationale", "uncertainties"],
     "properties": {
-        "unified_fsm": FSM_SCHEMA,
-        "divergences": {"type": "array", "items": DIVERGENCE_SCHEMA, "maxItems": 1000},
+        "unified_fsm": MERGED_FSM_SCHEMA,
+        "divergences": {"type": "array", "items": MERGED_DIVERGENCE_SCHEMA, "maxItems": 1000},
         "transition_sources": {
             "type": "array",
             "items": TRANSITION_SOURCE_SCHEMA,
@@ -92,7 +102,7 @@ def _compact_merge_inputs(
                     evidence_ids[key] = evidence_id
                     evidence_table[evidence_id] = evidence
                 refs.append(evidence_ids[key])
-            element["evidence"] = refs
+            element["evidence"] = list(dict.fromkeys(refs))
         payloads.append(payload)
     return payloads[0], payloads[1], evidence_table
 
@@ -122,10 +132,13 @@ def _expand_merge_evidence(
             if not isinstance(element, dict) or not isinstance(element.get("evidence"), list):
                 continue
             evidence = []
+            seen: set[str] = set()
             for ref in element["evidence"]:
                 if not isinstance(ref, str) or ref not in evidence_table:
                     raise ValueError(f"merged evidence must reference an input evidence ID, got {ref!r}")
-                evidence.append(deepcopy(evidence_table[ref]))
+                if ref not in seen:
+                    evidence.append(deepcopy(evidence_table[ref]))
+                    seen.add(ref)
             element["evidence"] = evidence
     return candidate
 
@@ -156,6 +169,7 @@ class FSMMerger:
                 "Every transition_sources entry must include spec_transition_ids and impl_transition_ids arrays; use [] only for a side with no supporting input transition.",
                 "Return transition_sources as an array of mapping objects, each with unified_transition_id; do not return a dictionary keyed by transition ID.",
                 "Never cite evidence absent from the two input FSMs.",
+                "Preserve all distinct supporting citations when merging input elements; use each evidence ID at most once within an element.",
                 'Every evidence array in states, transitions and divergences must contain only IDs from evidence_table (e.g. ["E1"]). Never repeat excerpts, locations or the evidence table in your output; ProtoLens restores citations locally.',
                 "Keep descriptions and rationales concise; omit repeated explanations without dropping states, transitions or source mappings.",
                 "Return unified_fsm.states as an array of state objects, each with name, description, evidence and confidence.",
@@ -362,7 +376,7 @@ class FSMMerger:
         def validate_repair(result: dict[str, Any]) -> None:
             candidate, _ = patched(result)
             expanded = _expand_merge_evidence({"unified_fsm": candidate}, evidence_table)
-            fsm = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger")
+            fsm = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger", schema=MERGED_FSM_SCHEMA)
             normalize_fsm_protocol(fsm, merge_payload["protocol"], component="UnifiedFSM")
 
         try:
@@ -446,7 +460,7 @@ class FSMMerger:
         # validate all other supplied values before requesting a repair.
         validate_json_schema(supplied, wire_schema, allow_missing=True)
         expanded = _expand_merge_evidence(data, evidence_table)
-        graph = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger")
+        graph = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger", schema=MERGED_FSM_SCHEMA)
         normalize_fsm_protocol(graph, spec_fsm.protocol, component="UnifiedFSM")
         schema = {
             "type": "object", "additionalProperties": False, "required": list(slots),
@@ -619,6 +633,7 @@ class FSMMerger:
         unified = fsm_from_llm(
             data.get("unified_fsm"),
             builder="LLMFSMMerger",
+            schema=MERGED_FSM_SCHEMA,
             metadata={
                 "merge_rationale": data.get("merge_rationale", ""),
                 "uncertainties": data.get("uncertainties", []),
