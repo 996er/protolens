@@ -361,6 +361,21 @@ def _normalize_fsm_metadata(
                 value[canonical] = value.pop(alias)
                 changes.append({"path": f"{path}.{canonical}", "original_path": f"{path}.{alias}",
                                 "value": value[canonical], "reason": "divergence_field_alias"})
+            for field in ("kind", "severity"):
+                original = value.get(field)
+                if not isinstance(original, str):
+                    continue
+                if field == "kind":
+                    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", original.strip())
+                    normalized = re.sub(r"[\s-]+", "_", normalized).lower()
+                else:
+                    normalized = original.strip().upper()
+                # Only spelling variants of an allowed label are equivalent.
+                # Unknown categories need evidence-backed reclassification.
+                if normalized != original and normalized in properties[field].get("enum", []):
+                    value[field] = normalized
+                    changes.append({"path": f"{path}.{field}", "original_value": original,
+                                    "value": normalized, "reason": "divergence_enum_spelling"})
         if ({"spec_transition_ids", "impl_transition_ids"} <= properties.keys()
                 and ("unified_transition_id" in properties or "mapping_index" in properties)):
             for canonical, aliases in (
@@ -754,7 +769,7 @@ def validate_json_schema(
         raise ValueError(f"{path} must have JSON type {expected_type!r}, got {type(value).__name__}")
 
     if "enum" in schema and value not in schema["enum"]:
-        raise ValueError(f"{path} must be one of {schema['enum']!r}")
+        raise ValueError(f"{path} must be one of {schema['enum']!r}, got {value!r}")
 
     if isinstance(value, dict):
         required = schema.get("required", [])
