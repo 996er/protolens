@@ -153,6 +153,7 @@ class FSMMerger:
                 "Do not silently drop any input transition.",
                 "Map every input transition id in transition_sources to its unified transition.",
                 "Every transition_sources entry must include spec_transition_ids and impl_transition_ids arrays; use [] only for a side with no supporting input transition.",
+                "Return transition_sources as an array of mapping objects, each with unified_transition_id; do not return a dictionary keyed by transition ID.",
                 "Never cite evidence absent from the two input FSMs.",
                 'Every evidence array in states, transitions and divergences must contain only IDs from evidence_table (e.g. ["E1"]). Never repeat excerpts, locations or the evidence table in your output; ProtoLens restores citations locally.',
                 "Keep descriptions and rationales concise; omit repeated explanations without dropping states, transitions or source mappings.",

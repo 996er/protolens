@@ -321,6 +321,32 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        mappings_schema = properties.get("transition_sources", {})
+        mapping_schema = mappings_schema.get("items", {})
+        if (mappings_schema.get("type") == "array" and mapping_schema.get("type") == "object"
+                and {"unified_transition_id", "spec_transition_ids", "impl_transition_ids"}
+                <= mapping_schema.get("properties", {}).keys()
+                and isinstance(value.get("transition_sources"), dict)):
+            original = value["transition_sources"]
+            if isinstance(original.get("unified_transition_id"), str):
+                # A single mapping object is the singleton form of the array.
+                mappings = [dict(original)]
+            else:
+                # Also accept mappings indexed by their unified transition ID.
+                # Do not guess which input side a bare list of IDs belongs to.
+                mappings = []
+                for unified_id, mapping in original.items():
+                    if not isinstance(mapping, dict):
+                        raise ValueError(f"{path}.transition_sources[{unified_id!r}] must be a source mapping object")
+                    if "unified_transition_id" in mapping and mapping["unified_transition_id"] != unified_id:
+                        raise ValueError(
+                            f"{path}.transition_sources contains conflicting unified transition IDs: "
+                            f"dictionary key={unified_id!r}, unified_transition_id={mapping['unified_transition_id']!r}"
+                        )
+                    mappings.append({**mapping, "unified_transition_id": unified_id})
+            value["transition_sources"] = mappings
+            changes.append({"path": f"{path}.transition_sources", "original_keys": list(original),
+                            "reason": "transition_sources_object_to_array"})
         if {"kind", "spec_element", "impl_element", "severity", "rationale"} <= properties.keys():
             for alias, canonical in (
                 ("type", "kind"), ("divergence_type", "kind"),
@@ -338,8 +364,8 @@ def _normalize_fsm_metadata(
         if ({"spec_transition_ids", "impl_transition_ids"} <= properties.keys()
                 and ("unified_transition_id" in properties or "mapping_index" in properties)):
             for canonical, aliases in (
-                ("spec_transition_ids", ("spec_transition_id", "spec_ids", "specification_transition_ids")),
-                ("impl_transition_ids", ("impl_transition_id", "impl_ids", "implementation_transition_ids")),
+                ("spec_transition_ids", ("spec_transition_id", "spec_ids", "specification_transition_ids", "spec")),
+                ("impl_transition_ids", ("impl_transition_id", "impl_ids", "implementation_transition_ids", "impl")),
             ):
                 for field in (canonical, *aliases):
                     if isinstance(value.get(field), str):
