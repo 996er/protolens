@@ -373,17 +373,30 @@ def _normalize_fsm_metadata(
                 original = value.get(field)
                 if not isinstance(original, str):
                     continue
+                reason = "divergence_enum_spelling"
                 if field == "kind":
                     normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", original.strip())
                     normalized = re.sub(r"[\s-]+", "_", normalized).lower()
+                    # Providers sometimes name the state-representation
+                    # category instead of using the public state_mismatch enum.
+                    # Normalize the category only; retain its rationale,
+                    # severity, element references and evidence unchanged.
+                    aliases = {
+                        "state_representation": "state_mismatch",
+                        "state_representation_mismatch": "state_mismatch",
+                        "state_representation_difference": "state_mismatch",
+                    }
+                    if normalized in aliases:
+                        normalized = aliases[normalized]
+                        reason = "divergence_kind_alias"
                 else:
                     normalized = original.strip().upper()
-                # Only spelling variants of an allowed label are equivalent.
-                # Unknown categories need evidence-backed reclassification.
+                # Only explicit aliases and spelling variants are accepted.
+                # Other categories still need evidence-backed reclassification.
                 if normalized != original and normalized in properties[field].get("enum", []):
                     value[field] = normalized
                     changes.append({"path": f"{path}.{field}", "original_value": original,
-                                    "value": normalized, "reason": "divergence_enum_spelling"})
+                                    "value": normalized, "reason": reason})
         if ({"spec_transition_ids", "impl_transition_ids"} <= properties.keys()
                 and ("unified_transition_id" in properties or "mapping_index" in properties)):
             for canonical, aliases in (
