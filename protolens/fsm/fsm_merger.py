@@ -195,9 +195,10 @@ class FSMMerger:
             return changes
 
         def normalize_result(data: dict[str, Any]) -> list[dict[str, Any]]:
-            changes = self._repair_missing_merge_fields(
+            changes = self._repair_state_references(data, payload, evidence_table)
+            changes.extend(self._repair_missing_merge_fields(
                 data, payload, evidence_table, spec_fsm, impl_fsm,
-            )
+            ))
             changes.extend(normalize_sources(data))
             return changes
 
@@ -215,6 +216,115 @@ class FSMMerger:
         )
         assert result is not None
         return result
+
+    def _repair_state_references(
+        self, data: dict[str, Any], merge_payload: dict[str, Any],
+        evidence_table: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        graph = data.get("unified_fsm")
+        if not isinstance(graph, dict):
+            return []
+        validate_json_schema(graph, _merge_reference_schema()["properties"]["unified_fsm"])
+        names = [state["name"] for state in graph["states"]]
+        if len(names) != len(set(names)):
+            raise ValueError("unified FSM contains duplicate state names; resolve identities before repairing references")
+        declared = set(names)
+        missing: dict[str, list[tuple[str | int, ...]]] = {}
+
+        def collect(name: str, path: tuple[str | int, ...]) -> None:
+            if name not in declared:
+                missing.setdefault(name, []).append(path)
+
+        for index, transition in enumerate(graph["transitions"]):
+            for endpoint in ("source", "target"):
+                collect(transition[endpoint], ("transitions", index, endpoint))
+        collect(graph["initial_state"], ("initial_state",))
+        for role in ("terminal_states", "error_states"):
+            for index, name in enumerate(graph[role]):
+                collect(name, (role, index))
+        if not missing:
+            return []
+
+        # Restoring a declaration is permitted only by copying an existing
+        # input state verbatim. The model cannot invent a state to pass checks.
+        options: dict[str, tuple[str, dict[str, Any]]] = {}
+        for origin, source in (
+            ("unified", graph),
+            ("specification", merge_payload["specification_fsm"]),
+            ("implementation", merge_payload["implementation_fsm"]),
+        ):
+            for state in source["states"]:
+                if origin == "unified" or (state["name"] in missing and state["name"] not in declared):
+                    options[f"S{len(options)}"] = (origin, state)
+        slots = {f"reference_{index}": name for index, name in enumerate(missing)}
+        schema = {
+            "type": "object", "additionalProperties": False, "required": list(slots),
+            "properties": {
+                slot: {"type": "string", "enum": [
+                    "UNRESOLVED", *[key for key, (origin, state) in options.items()
+                                    if origin == "unified" or state["name"] == name],
+                ]}
+                for slot, name in slots.items()
+            },
+        }
+
+        def patched(result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+            candidate = deepcopy(graph)
+            changes: list[dict[str, Any]] = []
+            for slot, name in slots.items():
+                if result[slot] == "UNRESOLVED":
+                    raise ValueError(f"merged state reference {name!r} has no evidence-backed repair")
+                origin, state = options[result[slot]]
+                if origin != "unified":
+                    candidate["states"].append(deepcopy(state))
+                    changes.append({"path": "$.unified_fsm.states", "value": deepcopy(state),
+                                    "origin": origin, "reason": "restored_input_state_declaration"})
+                for path in missing[name]:
+                    target = candidate
+                    for part in path[:-1]:
+                        target = target[part]
+                    target[path[-1]] = state["name"]
+                    changes.append({"path": "$.unified_fsm" + "".join(
+                        f"[{part}]" if isinstance(part, int) else f".{part}" for part in path),
+                        "original_value": name, "value": state["name"],
+                        "reason": "merged_state_reference_repaired"})
+            return candidate, changes
+
+        def validate_repair(result: dict[str, Any]) -> None:
+            candidate, _ = patched(result)
+            expanded = _expand_merge_evidence({"unified_fsm": candidate}, evidence_table)
+            fsm = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger")
+            normalize_fsm_protocol(fsm, merge_payload["protocol"], component="UnifiedFSM")
+
+        try:
+            result = self.recorder.call_chat(
+                system="Repair undeclared state references in a fixed merged FSM using the supplied input evidence.",
+                payload={
+                    "protocol": merge_payload["protocol"],
+                    "references": {slot: {"unknown_name": name, "paths": missing[name]}
+                                   for slot, name in slots.items()},
+                    "state_options": {key: {"origin": origin, "state": state}
+                                      for key, (origin, state) in options.items()},
+                    "unified_fsm": graph,
+                    "transition_sources": data.get("transition_sources"),
+                    "specification_fsm": merge_payload["specification_fsm"],
+                    "implementation_fsm": merge_payload["implementation_fsm"],
+                    "evidence_table": evidence_table,
+                    "requirements": [
+                        "For each reference slot choose one allowed state option ID using transition behavior, input mappings and evidence.",
+                        "Choose a unified state only if it is semantically equivalent to the missing reference; spelling similarity alone is insufficient.",
+                        "Choose an input state with the same missing name only if its declaration was omitted and the input evidence supports retaining it.",
+                        "Return UNRESOLVED when no option is supported; do not guess to satisfy validation.",
+                        "Do not invent states, change valid endpoints, delete transitions or alter guards, actions, evidence or source mappings.",
+                    ],
+                },
+                schema=schema, schema_name="protolens_merge_state_reference_repair",
+                validator=validate_repair,
+            )
+        except LLMValidationError as exc:
+            raise RuntimeError(f"FSM merge state reference repair failed: {exc}") from exc
+        data["unified_fsm"], changes = patched(result)
+        return changes
 
     def _repair_missing_merge_fields(
         self, data: dict[str, Any], merge_payload: dict[str, Any],
