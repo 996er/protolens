@@ -190,13 +190,6 @@ class FSMMerger:
             result = self._parse_merge_result(expanded, spec_fsm, impl_fsm)
 
         def normalize_sources(data: dict[str, Any]) -> list[dict[str, Any]]:
-            mappings = data.get("transition_sources")
-            if not isinstance(mappings, list) or not any(
-                isinstance(mapping, dict)
-                and ("spec_transition_ids" not in mapping or "impl_transition_ids" not in mapping)
-                for mapping in mappings
-            ):
-                return []
             expanded = _expand_merge_evidence(data, evidence_table)
             changes = self._repair_transition_source_fields(
                 expanded, spec_fsm, impl_fsm,
@@ -425,7 +418,10 @@ class FSMMerger:
         if "unified_fsm" not in data:
             return []
         wire_schema = _merge_reference_schema()
-        fields = ("divergences", "merge_rationale", "uncertainties", "transition_sources")
+        # Source mappings have their own repair phase. Asking this analysis
+        # repair to regenerate an entire mapping table makes nested omissions
+        # fail before the source repair can handle them.
+        fields = ("divergences", "merge_rationale", "uncertainties")
         slots: dict[str, tuple[tuple[str | int, ...], dict[str, Any]]] = {
             field: ((field,), wire_schema["properties"][field]) for field in fields if field not in data
         }
@@ -454,11 +450,13 @@ class FSMMerger:
         if not slots:
             return []
         supplied = deepcopy(data)
+        supplied.pop("transition_sources", None)
         for slot in invalid_slots:
             path, _ = slots[slot]
             del supplied["divergences"][path[1]][path[2]]
         # Only explicitly selected invalid classifications may be replaced;
-        # validate all other supplied values before requesting a repair.
+        # validate other analysis/graph values before requesting a repair.
+        # Source mappings belong to the subsequent independent repair phase.
         validate_json_schema(supplied, wire_schema, allow_missing=True)
         expanded = _expand_merge_evidence(data, evidence_table)
         graph = fsm_from_llm(expanded["unified_fsm"], builder="LLMFSMMerger", schema=MERGED_FSM_SCHEMA)
@@ -492,19 +490,14 @@ class FSMMerger:
 
         def validate_repair(patch: dict[str, Any]) -> None:
             candidate = _expand_merge_evidence(patched(patch), evidence_table)
+            candidate.pop("transition_sources", None)
             validate_json_schema(candidate, MERGE_RESULT_SCHEMA, allow_missing=True)
             # All divergence fields must now be complete, even when unrelated
             # source-mapping fields still need their own targeted repair.
             validate_json_schema(candidate["divergences"], MERGE_RESULT_SCHEMA["properties"]["divergences"])
             validate_divergences(candidate["divergences"])
-            mappings = candidate.get("transition_sources")
-            if isinstance(mappings, list) and all(
-                {"unified_transition_id", "spec_transition_ids", "impl_transition_ids"} <= mapping.keys()
-                for mapping in mappings
-            ):
-                self._validate_transition_coverage(spec_fsm, impl_fsm, graph, mappings)
-            # Existing incomplete mapping entries are repaired by the next
-            # targeted step. Full schema/graph validation still runs afterward.
+            # Source identity, missing rows and source coverage are handled by
+            # the next phase. They must not force unrelated analysis retries.
 
         try:
             patch = self.recorder.call_chat(
@@ -530,7 +523,7 @@ class FSMMerger:
                         "Return divergences=[] only if the comparison supports no material differences, not because analysis was omitted.",
                         "Cite only evidence IDs from evidence_table. Never repeat or invent evidence text.",
                         "Use merge_rationale to explain the merge, and uncertainties to record unresolved comparisons.",
-                        "If transition_sources is requested, map every input and unified transition; each row requires both source ID arrays.",
+                        "Source mappings are repaired separately; return only the requested analysis fields.",
                     ],
                 },
                 schema=schema, schema_name="protolens_merge_missing_fields_repair",
@@ -553,80 +546,167 @@ class FSMMerger:
         self, data: dict[str, Any], spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM,
         *, compact_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        mappings = data.get("transition_sources")
-        if not isinstance(mappings, list):
-            return []
+        original = data.get("transition_sources", [])
+        if not isinstance(original, list):
+            raise ValueError("transition_sources must be an array of source mappings")
+        supplied = {key: value for key, value in data.items() if key != "transition_sources"}
+        validate_json_schema(supplied, MERGE_RESULT_SCHEMA, allow_missing=True)
+        changes: list[dict[str, Any]] = []
+        mappings = []
+        for index, mapping in enumerate(original):
+            validate_json_schema(mapping, TRANSITION_SOURCE_SCHEMA, f"$.transition_sources[{index}]", allow_missing=True)
+            if not mapping:
+                # An empty row has no identity or provenance to preserve. Build
+                # missing rows from declared transitions below, never by index.
+                changes.append({"path": f"$.transition_sources[{index}]", "value": {},
+                                "reason": "empty_source_mapping_replaced_by_declared_transition_rows"})
+            else:
+                mappings.append(deepcopy(mapping))
+        unified_ids = [transition["id"] for transition in data["unified_fsm"]["transitions"]]
         fields = ("spec_transition_ids", "impl_transition_ids")
-        missing = {index: [field for field in fields if field not in mapping]
-                   for index, mapping in enumerate(mappings) if isinstance(mapping, dict)
-                   and any(field not in mapping for field in fields)}
-        if not missing:
-            return []
-        validate_json_schema(data, MERGE_RESULT_SCHEMA, allow_missing=True)
-        if any("unified_transition_id" not in mappings[index] for index in missing):
-            return []  # No unambiguous target; let the ordinary schema retry handle it.
-        source_schema = {
-            "type": "object", "additionalProperties": False,
-            "required": ["mapping_index", *fields],
-            "properties": {
-                "mapping_index": {"type": "integer", "enum": list(missing)},
-                "spec_transition_ids": {"type": "array", "items": {
-                    "type": "string", "enum": [transition.id for transition in spec_fsm.transitions]}},
-                "impl_transition_ids": {"type": "array", "items": {
-                    "type": "string", "enum": [transition.id for transition in impl_fsm.transitions]}},
-            },
-        }
-        schema = {
-            "type": "object", "additionalProperties": False, "required": ["repairs"],
-            "properties": {"repairs": {"type": "array", "items": source_schema,
-                                       "minItems": len(missing), "maxItems": len(missing)}},
+        field_schemas = {
+            "unified_transition_id": {"type": "string", "enum": unified_ids},
+            "spec_transition_ids": {"type": "array", "items": {
+                "type": "string", "enum": [transition.id for transition in spec_fsm.transitions]}},
+            "impl_transition_ids": {"type": "array", "items": {
+                "type": "string", "enum": [transition.id for transition in impl_fsm.transitions]}},
         }
 
-        def patched(result: dict[str, Any]) -> list[dict[str, Any]]:
-            indices = [repair["mapping_index"] for repair in result["repairs"]]
-            if len(set(indices)) != len(indices) or set(indices) != set(missing):
-                raise ValueError("source mapping repair must cover each incomplete entry exactly once")
-            candidate = [dict(mapping) for mapping in mappings]
-            for repair in result["repairs"]:
-                index = repair["mapping_index"]
-                for field in fields:
-                    if field not in missing[index] and candidate[index][field] != repair[field]:
-                        raise ValueError(f"source mapping repair changed existing transition_sources[{index}].{field}")
-                    candidate[index][field] = repair[field]
-            return candidate
+        def repair_fields(requested: tuple[str, ...], *, identity_only: bool) -> None:
+            slots = {f"mapping_{index}_{field}": (index, field)
+                     for index, mapping in enumerate(mappings) for field in requested if field not in mapping}
+            if not slots:
+                return
+            # Flat slots request only absent values. The model no longer has
+            # to reproduce row identities or already-known source arrays.
+            schema = {
+                "type": "object", "additionalProperties": False, "required": list(slots),
+                "properties": {slot: field_schemas[field] for slot, (_, field) in slots.items()},
+            }
 
-        def validate_repair(result: dict[str, Any]) -> None:
-            self._parse_merge_result({**data, "transition_sources": patched(result)}, spec_fsm, impl_fsm)
+            def normalize_patch(patch: dict[str, Any]) -> list[dict[str, Any]]:
+                notes: list[dict[str, Any]] = []
 
-        try:
-            result = self.recorder.call_chat(
-                system="Complete missing source mappings for a fixed merged FSM using only the supplied input transitions.",
-                payload={
-                    "protocol": spec_fsm.protocol,
-                    "missing_fields": [{"mapping_index": index, "fields": fields} for index, fields in missing.items()],
-                    "transition_sources": mappings,
-                    **(compact_context if compact_context is not None else {
-                        "unified_fsm": data.get("unified_fsm"),
-                        "spec_transitions": spec_fsm.to_dict()["transitions"],
-                        "impl_transitions": impl_fsm.to_dict()["transitions"],
-                    }),
-                    "requirements": [
-                        "Match source transitions using behavior and evidence, never ID spelling alone.",
-                        "Fill only missing lists; copy existing lists unchanged. Do not modify the FSM.",
-                        "Use [] only when that side has no supporting transition; every merged transition needs a source.",
-                        "Across all mappings, preserve coverage of every specification and implementation input transition.",
-                    ],
-                },
-                schema=schema, schema_name="protolens_merge_source_mapping_repair",
-                validator=validate_repair,
-            )
-        except LLMValidationError as exc:
-            raise RuntimeError(f"FSM merge source mapping repair failed: {exc}") from exc
-        repaired = patched(result)
-        changes = [{"path": f"$.transition_sources[{index}].{field}", "value": repaired[index][field],
-                    "reason": "missing_transition_sources_repaired"}
-                   for index, fields in missing.items() for field in fields]
-        data["transition_sources"] = repaired
+                def assign(slot: str, value: Any) -> None:
+                    if slots[slot][1] in fields and isinstance(value, str):
+                        value = [value]
+                    existing = patch.get(slot)
+                    if slots[slot][1] in fields and isinstance(existing, str):
+                        existing = [existing]
+                    if slot in patch and existing != value:
+                        raise ValueError(f"source mapping repair contains conflicting values for {slot}")
+                    patch[slot] = value
+
+                # Compatible gateways may wrap slots in repairs or return
+                # indexed rows. Decode them before generic extension filtering.
+                for envelope in ("repairs", "transition_sources", "mappings"):
+                    wrapped = patch.get(envelope)
+                    if isinstance(wrapped, dict) and set(wrapped) <= slots.keys():
+                        for slot, value in wrapped.items():
+                            assign(slot, value)
+                    elif isinstance(wrapped, (dict, list)):
+                        row_schema = deepcopy(TRANSITION_SOURCE_SCHEMA)
+                        row_schema["properties"]["mapping_index"] = {"type": "integer"}
+                        container = {"transition_sources": deepcopy(wrapped)}
+                        notes.extend(_normalize_fsm_metadata(container, {
+                            "type": "object", "properties": {"transition_sources": {
+                                "type": "array", "items": row_schema,
+                            }},
+                        }))
+                        for row in container["transition_sources"]:
+                            if not isinstance(row, dict):
+                                raise ValueError("source mapping repair rows must be objects")
+                            index = row.get("mapping_index")
+                            if index is None and "unified_transition_id" in row:
+                                matches = [i for i, mapping in enumerate(mappings)
+                                           if mapping.get("unified_transition_id") == row["unified_transition_id"]]
+                                if len(matches) == 1:
+                                    index = matches[0]
+                            if type(index) is not int or not 0 <= index < len(mappings):
+                                raise ValueError("source mapping repair row needs an explicit, unambiguous mapping_index")
+                            for field in ("unified_transition_id", *fields):
+                                if field not in row:
+                                    continue
+                                slot = f"mapping_{index}_{field}"
+                                if slot in slots:
+                                    assign(slot, row[field])
+                                elif mappings[index].get(field) != row[field]:
+                                    raise ValueError(f"source mapping repair changed existing mapping {index}.{field}")
+                    if wrapped is not None:
+                        notes.append({"path": f"$.{envelope}", "original_value": wrapped,
+                                      "reason": "source_mapping_repair_envelope_normalized"})
+                for slot, (_, field) in slots.items():
+                    if field in fields and isinstance(patch.get(slot), str):
+                        old = patch[slot]
+                        patch[slot] = [old]
+                        notes.append({"path": f"$.{slot}", "original_value": old,
+                                      "reason": "single_transition_source_id"})
+                return notes
+
+            def patched(patch: dict[str, Any]) -> list[dict[str, Any]]:
+                candidate = deepcopy(mappings)
+                for slot, (index, field) in slots.items():
+                    candidate[index][field] = deepcopy(patch[slot])
+                return candidate
+
+            def validate_repair(patch: dict[str, Any]) -> None:
+                candidate = {**data, "transition_sources": patched(patch)}
+                validate_json_schema(candidate, MERGE_RESULT_SCHEMA, allow_missing=identity_only)
+                if not identity_only:
+                    self._parse_merge_result(candidate, spec_fsm, impl_fsm)
+
+            try:
+                patch = self.recorder.call_chat(
+                    system="Complete requested source-mapping fields for a fixed merged FSM using the supplied graphs and evidence.",
+                    payload={
+                        "protocol": spec_fsm.protocol,
+                        "requested_fields": list(slots),
+                        "field_paths": {slot: ["transition_sources", index, field]
+                                        for slot, (index, field) in slots.items()},
+                        "transition_sources": mappings,
+                        **(compact_context if compact_context is not None else {
+                            "unified_fsm": data.get("unified_fsm"),
+                            "spec_transitions": spec_fsm.to_dict()["transitions"],
+                            "impl_transitions": impl_fsm.to_dict()["transitions"],
+                        }),
+                        "requirements": [
+                            "Return one flat JSON object with exactly the requested slot keys; each value is the requested string or array, not a mapping object.",
+                            "Match transitions by behavior and evidence, never by ID spelling or array position alone.",
+                            "Fill only requested fields. All existing fields and the FSM are fixed.",
+                            "Use [] only when that side has no supporting input transition; every merged transition needs a source.",
+                            ("Resolve the missing row identities. Unmapped unified transitions and missing source arrays are handled next."
+                             if identity_only else "Across all mappings, cover every unified, specification and implementation transition."),
+                        ],
+                    },
+                    schema=schema,
+                    schema_name=("protolens_merge_source_identity_repair" if identity_only
+                                 else "protolens_merge_source_mapping_repair"),
+                    response_normalizer=normalize_patch,
+                    validator=validate_repair,
+                )
+            except LLMValidationError as exc:
+                raise RuntimeError(f"FSM merge source mapping repair failed: {exc}") from exc
+            mappings[:] = patched(patch)
+            changes.extend({"path": f"$.transition_sources[{index}].{field}", "value": patch[slot],
+                            "reason": "missing_transition_sources_repaired"}
+                           for slot, (index, field) in slots.items())
+
+        repair_fields(("unified_transition_id",), identity_only=True)
+        seen = {mapping["unified_transition_id"] for mapping in mappings}
+        unknown = seen - set(unified_ids)
+        if unknown:
+            raise ValueError(f"transition_sources references unknown unified ids: {sorted(unknown)!r}")
+        for unified_id in unified_ids:
+            if unified_id not in seen:
+                mappings.append({"unified_transition_id": unified_id})
+                changes.append({"path": f"$.transition_sources[{len(mappings) - 1}].unified_transition_id",
+                                "value": unified_id, "reason": "missing_row_from_declared_unified_transition"})
+        repair_fields(fields, identity_only=False)
+        candidate = {**data, "transition_sources": mappings}
+        validate_json_schema(candidate, MERGE_RESULT_SCHEMA)
+        self._parse_merge_result(candidate, spec_fsm, impl_fsm)
+        if changes or "transition_sources" not in data:
+            data["transition_sources"] = mappings
         return changes
 
     def _parse_merge_result(
