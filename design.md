@@ -288,6 +288,8 @@ spec_fsm + impl_fsm
 
 枚举归一化在主请求和修复请求中使用相同的候选上下文。`assessment` 的大小写和明确的完成／未决同义词统一规范化；误填 `unrelated`、`equivalent`、`different` 等关系类别或遗漏摘要时，仅在四类候选分类具有合法结构、互斥且完整覆盖本次请求候选集合时，由程序生成完成度摘要。unmatched 任务还必须已有明确的 missing/extra 差异记录，不能从空结果推导完成。差异 kind 统一处理大小写、空格、连字符及驼峰拼写，severity 只规范化明确的 P0/P1/P2 编号表达。未分类候选、未知 ID、歧义类别和无法解释的优先级继续定向修复，不从 high/low 等标签擅自分配 P 编号；所有归一化保留原值与原因。
 
+候选覆盖校验分别列出 missing、foreign、conflicting 和 duplicate ID，并回传本次允许的 ID 清单。返回原始名称／转换 ID 时，仅在当前候选块内具有唯一且精确的对应关系时归一到稳定 ID；同类完全重复的 ID 和相同差异条目去重，不按位置或模糊相似度猜测。比较记录结构正确但覆盖无效时，保留能够独立通过语义校验的分类，只把遗漏、冲突或无效候选拆成单候选判断；这些子判断使用同一记录契约、由 query/task/单候选生成的稳定 ID，并独立缓存。存在无法定位的 foreign ID 或整条未决判断时，重新逐个审查该块的全部候选，不能丢弃未知引用后便默认其余分类可信。单候选任务不再递归拆分，仍使用有界校验预算。子判断整体未决时，仅将该候选保留为未决，绝不把漏项自动归为 unrelated。程序合并子判断后重新校验完整父记录，审计中保存父子关系和覆盖修复前的清单。unmatched 任务的候选清单为空，其分类数组必须为空，missing/extra 差异使用 candidate_id=null。
+
 所有统一状态和转换 ID、差异 ID 都由程序生成。统一状态名称使用稳定 ID，原名称保存在 `metadata.state_sources` 和状态描述；两侧初始状态保存在 `metadata.input_initial_states`，图的单一初始状态采用规范侧映射。语义等价的转换采用规范侧字段作为展示值，所有原始字段写入 `metadata.transition_variants`，全部原始证据取并集。不同语义的转换分别保留。
 
 每个已验证批次原子保存到 `checkpoints/merge_decisions/<fingerprint>.json`，fingerprint 包含完整请求、记录契约和模型身份；重跑时重新验证摘要、结构和语义。`--force` 跳过这些缓存。最终 `merge_decisions.json` 保存稳定输入索引及所有语义判断，纳入阶段工件摘要；原始响应和格式处理记录继续写入 `findings/fsm_merge.llm.jsonl`。新合并契约会使旧合并 checkpoint 失效，已完成的规范和实现阶段可继续复用。

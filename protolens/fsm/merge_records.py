@@ -88,6 +88,79 @@ def _difference_enum(field: str, value: Any) -> Any:
     return token if token in KINDS else value
 
 
+def candidate_coverage(job: dict[str, Any], row: dict[str, Any]) -> dict[str, list[Any]]:
+    """Explain coverage failures after structural validation, by stable ID."""
+    expected = {item["id"] for item in job["candidates"]}
+    fields = ("matches", "unrelated_ids", "uncertain_ids")
+    groups = [set(row[field]) for field in fields]
+    duplicate = {identifier for field in fields for identifier in row[field]
+                 if row[field].count(identifier) > 1}
+    different, pairs = set(), set()
+    for difference in row["differences"]:
+        identifier = difference["candidate_id"]
+        key = (identifier, difference["kind"])
+        if key in pairs:
+            duplicate.add(identifier)
+        pairs.add(key)
+        if identifier is not None or not job["task"].startswith("unmatched_"):
+            different.add(identifier)
+    groups.append(different)
+    seen = set().union(*groups)
+    conflicts = set().union(*(left & right for index, left in enumerate(groups) for right in groups[index + 1:]))
+    return {"missing_ids": sorted(expected - seen), "foreign_ids": sorted(seen - expected, key=str),
+            "conflicting_ids": sorted(conflicts, key=str), "duplicate_ids": sorted(duplicate, key=str)}
+
+
+def _normalize_candidate_references(row: dict[str, Any], job: dict[str, Any], path: str) -> list[dict[str, Any]]:
+    """Accept only exact, unambiguous identities within this candidate block."""
+    aliases: dict[str, set[str]] = {}
+    expected = {item["id"] for item in job["candidates"]}
+    for candidate in job["candidates"]:
+        for field in ("id", "original_id", "name"):
+            value = candidate.get(field)
+            if isinstance(value, str) and value.strip():
+                aliases.setdefault(value.strip(), set()).add(candidate["id"])
+    notes: list[dict[str, Any]] = []
+
+    def canonical(value: Any, location: str) -> Any:
+        if not isinstance(value, str) or value in expected:
+            return value
+        matches = aliases.get(value.strip(), set())
+        if len(matches) != 1:
+            return value  # Never guess by substring, position or fuzzy similarity.
+        identifier = next(iter(matches))
+        notes.append({"path": location, "original_value": value, "value": identifier,
+                      "reason": "exact_candidate_identity_alias"})
+        return identifier
+
+    for field in ("matches", "unrelated_ids", "uncertain_ids"):
+        values = row.get(field)
+        if not isinstance(values, list):
+            continue
+        values = [canonical(value, f"{path}.{field}[{index}]") for index, value in enumerate(values)]
+        if all(isinstance(value, str) for value in values):
+            unique = list(dict.fromkeys(values))
+            if unique != values:
+                notes.append({"path": f"{path}.{field}", "original_value": values,
+                              "reason": "duplicate_identical_candidate_classification"})
+            values = unique
+        row[field] = values
+    differences = row.get("differences")
+    if isinstance(differences, list):
+        unique, seen = [], set()
+        for index, difference in enumerate(differences):
+            if isinstance(difference, dict) and "candidate_id" in difference:
+                difference["candidate_id"] = canonical(difference["candidate_id"], f"{path}.differences[{index}].candidate_id")
+            key = json.dumps(difference, sort_keys=True)
+            if key in seen:
+                notes.append({"path": f"{path}.differences[{index}]", "reason": "duplicate_identical_difference"})
+            else:
+                unique.append(difference)
+                seen.add(key)
+        row["differences"] = unique
+    return notes
+
+
 def _classified_assessment(row: dict[str, Any], job: dict[str, Any]) -> str | None:
     """Summarize explicit classifications; never fill in unassessed candidates."""
     try:
@@ -104,6 +177,8 @@ def _classified_assessment(row: dict[str, Any], job: dict[str, Any]) -> str | No
                                   if key in DIFFERENCE_SCHEMA["properties"]}, DIFFERENCE_SCHEMA)
     except ValueError:
         return None
+    if any(candidate_coverage(job, row).values()):
+        return None
     if job["task"].startswith("unmatched_"):
         expected_kind = "missing_transition" if job["task"] == "unmatched_spec" else "extra_transition"
         if (not any(row[field] for field in ("matches", "unrelated_ids", "uncertain_ids"))
@@ -111,14 +186,6 @@ def _classified_assessment(row: dict[str, Any], job: dict[str, Any]) -> str | No
                                         for item in differences)):
             return "complete"
         return None  # No finding does not prove that the analysis was completed.
-    groups = [set(row[field]) for field in ("matches", "unrelated_ids", "uncertain_ids")]
-    if any(len(group) != len(row[field]) for group, field in zip(groups, ("matches", "unrelated_ids", "uncertain_ids"))):
-        return None
-    groups.append({item["candidate_id"] for item in differences})
-    if any(left & right for index, left in enumerate(groups) for right in groups[index + 1:]):
-        return None
-    if set().union(*groups) != {item["id"] for item in job["candidates"]}:
-        return None
     return "uncertain" if row["uncertain_ids"] else "complete"
 
 
@@ -224,6 +291,8 @@ def normalize_decisions(
                                       "field": field, "original_value": old, "value": value})
             identifier = row.get("record_id")
             job = jobs.get(identifier) if jobs is not None and isinstance(identifier, str) else None
+            if job is not None:
+                notes.extend(_normalize_candidate_references(row, job, f"$.records[{index}]"))
             notes.extend(_normalize_assessment(row, job, f"$.records[{index}]"))
     return notes
 
@@ -303,8 +372,84 @@ class SemanticDecisionRunner:
         if batch:
             yield from self._evaluate_batch(batch, validate)
 
+    def _complete_candidate_coverage(
+        self, data: dict[str, Any], jobs: dict[str, dict[str, Any]],
+        validate: Callable[[dict[str, Any], dict[str, Any]], None],
+    ) -> list[dict[str, Any]]:
+        notes: list[dict[str, Any]] = []
+        for identifier, row in self._index(data, set(jobs)).items():
+            job = jobs[identifier]
+            if job["task"] not in {"state", "transition"}:
+                continue
+            try:
+                validate_json_schema(row, DECISION_SCHEMA)
+            except ValueError:
+                continue  # Complete malformed analysis fields in record repair first.
+            coverage = candidate_coverage(job, row)
+            if not any(coverage.values()):
+                continue
+            candidates = {item["id"]: item for item in job["candidates"]}
+            bad = set(coverage["missing_ids"] + coverage["conflicting_ids"] + coverage["duplicate_ids"]) & candidates.keys()
+            if coverage["foreign_ids"] or record_wide_uncertainty(row):
+                # An unknown counterpart cannot be silently discarded while
+                # accepting a possibly false "unrelated" classification. A
+                # record-wide deferral likewise requires reassessing its scope.
+                bad = set(candidates)
+            for candidate in sorted(candidates.keys() - bad):
+                probe = deepcopy(row)
+                for field in ("matches", "unrelated_ids", "uncertain_ids"):
+                    probe[field] = [value for value in row[field] if value == candidate]
+                probe["differences"] = [value for value in row["differences"] if value["candidate_id"] == candidate]
+                probe["assessment"] = "uncertain" if probe["uncertain_ids"] else "complete"
+                try:
+                    validate({**job, "candidates": [candidates[candidate]]}, probe)
+                except ValueError:
+                    bad.add(candidate)
+            candidate_results: dict[str, dict[str, Any]] = {}
+            child_ids = []
+            for candidate in sorted(bad):
+                child = {**job, "record_id": decision_id(job["task"], job["query"]["id"], [candidate]),
+                         "candidates": [candidates[candidate]]}
+                # Same record contract, now with one explicit candidate. The
+                # child keeps a stable ID and its own resumable checkpoint.
+                # Disabling subdivision bounds recursion even if it fails.
+                try:
+                    (_, decision), = self._evaluate_batch([child], validate, allow_candidate_repair=False)
+                except LLMValidationError as exc:
+                    raise RuntimeError(f"candidate decision repair failed for {identifier}/{candidate}: {exc}") from exc
+                self.completed[-1]["repair_for"] = identifier
+                candidate_results[candidate] = decision
+                child_ids.append(child["record_id"])
+            repaired = deepcopy(row)
+            for field in ("matches", "unrelated_ids", "uncertain_ids"):
+                repaired[field] = [value for value in row[field] if value in candidates and value not in bad]
+            repaired["differences"] = [value for value in row["differences"]
+                                       if value["candidate_id"] in candidates and value["candidate_id"] not in bad]
+            for candidate, decision in candidate_results.items():
+                if record_wide_uncertainty(decision):
+                    # With exactly one candidate, a deferred child judgment has
+                    # an explicit scope; do not promote its tentative findings.
+                    repaired["uncertain_ids"].append(candidate)
+                else:
+                    for field in ("matches", "unrelated_ids", "uncertain_ids", "differences"):
+                        repaired[field].extend(deepcopy(decision[field]))
+            repaired["assessment"] = "uncertain" if repaired["uncertain_ids"] else "complete"
+            repaired["rationale"] = (
+                "[ProtoLens] Candidate coverage completed using validated single-candidate decisions. "
+                "Existing valid classifications were retained; revised judgments and rationales are recorded in merge_decisions.json."
+            )
+            validate_json_schema(repaired, DECISION_SCHEMA)
+            validate(job, repaired)
+            row.clear()
+            row.update(repaired)
+            notes.append({"path": "$.records", "record_id": identifier, "reason": "candidate_scoped_coverage_repair",
+                          "coverage_before": coverage, "repaired_candidate_ids": sorted(bad),
+                          "child_record_ids": child_ids})
+        return notes
+
     def _evaluate_batch(
         self, jobs: list[dict[str, Any]], validate: Callable[[dict[str, Any], dict[str, Any]], None],
+        *, allow_candidate_repair: bool = True,
     ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         expected = {job["record_id"]: job for job in jobs}
 
@@ -336,6 +481,7 @@ class SemanticDecisionRunner:
                     self.on_progress("rebuilding invalid semantic decision checkpoint")
 
         def complete_partial(data: dict[str, Any]) -> list[dict[str, Any]]:
+            notes = self._complete_candidate_coverage(data, expected, validate) if allow_candidate_repair else []
             indexed = self._index(data, set(expected))
             issues = {}
             for identifier, job in expected.items():
@@ -352,7 +498,7 @@ class SemanticDecisionRunner:
                     # Acceptance is atomic per record: structural fragments
                     # are not validated judgments that a repair must preserve.
             if not issues:
-                return []
+                return notes
             repaired = {}
             # Repair one identified record at a time, with the same schema.
             # This keeps context bounded and never regenerates accepted rows.
@@ -361,12 +507,15 @@ class SemanticDecisionRunner:
                 repair = {"errors": {identifier: error}, "supplied_records": [indexed[identifier]] if identifier in indexed else [],
                           "supplied_records_are_unvalidated": True,
                           "repair_scope": "invalid_record", "fixed_fields": {"record_id": identifier},
+                          "allowed_candidate_ids": [item["id"] for item in job["candidates"]],
                           "accepted_record_ids": sorted(set(expected) - set(issues)),
                           "requirements": [
                               "Revise only this invalid record, preserving its record_id. Other accepted records are fixed.",
                               "Candidate classifications are related fields; correct them together when necessary.",
                               "Arrays may change length and order. Use only requested candidate IDs and classify every candidate exactly once.",
                               "Ground each revised judgment in the supplied inputs and evidence; do not invent defaults.",
+                              ("This unmatched task has no candidates: matches, unrelated_ids and uncertain_ids must be []; findings use candidate_id=null."
+                               if job["task"].startswith("unmatched_") else "Use only allowed_candidate_ids, not the query ID or a candidate from another block."),
                           ]}
                 if not self.fits([job], repair):
                     raise RuntimeError(f"repair context for {identifier} exceeds merge_request_bytes; no graph was regenerated")
@@ -385,12 +534,15 @@ class SemanticDecisionRunner:
                         response_normalizer=lambda value, identifier=identifier, job=job: normalize_decisions(
                             value, {identifier}, jobs={identifier: job},
                         ),
+                        result_normalizer=(lambda value, identifier=identifier, job=job: self._complete_candidate_coverage(
+                            value, {identifier: job}, validate,
+                        )) if allow_candidate_repair else None,
                     )
                 except LLMValidationError as exc:
                     raise RuntimeError(f"semantic decision repair failed for {identifier}: {exc}") from exc
                 repaired[identifier] = response["records"][0]
             data["records"] = [repaired.get(job["record_id"], indexed.get(job["record_id"])) for job in jobs]
-            return [{"path": "$.records", "record_ids": sorted(repaired), "reason": "targeted_semantic_record_repair"}]
+            return [*notes, {"path": "$.records", "record_ids": sorted(repaired), "reason": "targeted_semantic_record_repair"}]
 
         if result is None:
             result = self.recorder.call_chat(

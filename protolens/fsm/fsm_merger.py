@@ -10,7 +10,7 @@ from protolens.fsm.fsm_model import Divergence, Evidence, ProtocolFSM, State, St
 from protolens.fsm.llm_support import (
     FSM_SCHEMA, LLMConversationRecorder, normalize_fsm_protocol, validate_fsm, validate_json_schema,
 )
-from protolens.fsm.merge_records import SemanticDecisionRunner, decision_id, record_wide_uncertainty
+from protolens.fsm.merge_records import SemanticDecisionRunner, candidate_coverage, decision_id, record_wide_uncertainty
 from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.llm_client import LLMClient
 from protolens.utils.stage_checkpoints import stable_fingerprint
@@ -135,7 +135,8 @@ class FSMMerger:
                 "transition_variants": variants, "uncertainties": uncertainties,
                 "input_initial_states": {"spec": state_map[spec_initial], "impl": state_map[impl_initial]},
                 "input_versions": {"spec": spec_fsm.version, "impl": impl_fsm.version},
-                "semantic_decision_count": len(all_results), "merge_limits": limits,
+                "semantic_decision_count": len(runner.completed), "comparison_record_count": len(all_results),
+                "merge_limits": limits,
             },
         )
         validate_json_schema(_wire_graph(unified), MERGED_FSM_SCHEMA)
@@ -224,17 +225,16 @@ class FSMMerger:
         candidates = {item["id"]: item for item in job["candidates"]}
         query, task = job["query"], job["task"]
         deferred = record_wide_uncertainty(row)
-        groups = [set(row[key]) for key in ("matches", "unrelated_ids", "uncertain_ids")]
-        for key, group in zip(("matches", "unrelated_ids", "uncertain_ids"), groups):
-            if len(group) != len(row[key]):
-                raise ValueError(f"duplicate candidate IDs in {key}")
-        differing, pairs = set(), set()
+        coverage = candidate_coverage(job, row)
+        if any(coverage.values()):
+            raise ValueError(
+                f"candidate coverage invalid for {job['record_id']}: "
+                f"missing={coverage['missing_ids']!r}, foreign={coverage['foreign_ids']!r}, "
+                f"conflicting={coverage['conflicting_ids']!r}, duplicate={coverage['duplicate_ids']!r}; "
+                f"allowed_candidate_ids={sorted(candidates)!r}"
+            )
         for difference in row["differences"]:
             identifier, kind = difference["candidate_id"], difference["kind"]
-            key = (identifier, kind)
-            if key in pairs:
-                raise ValueError("duplicate difference kind for a candidate")
-            pairs.add(key)
             if task.startswith("unmatched_"):
                 expected = "missing_transition" if task == "unmatched_spec" else "extra_transition"
                 if identifier is not None or kind != expected:
@@ -244,15 +244,9 @@ class FSMMerger:
                     "state_mismatch", "guard_mismatch", "action_mismatch", "error_handling_mismatch"}
                 if identifier not in candidates or kind not in allowed:
                     raise ValueError("difference references an unknown candidate or inappropriate kind")
-                differing.add(identifier)
             citations = [*query["evidence"], *(candidates[identifier]["evidence"] if identifier in candidates else [])]
             if not citations and not deferred:
                 raise ValueError("difference has no supporting input evidence; mark the comparison uncertain")
-        groups.append(differing)
-        if any(left & right for index, left in enumerate(groups) for right in groups[index + 1:]):
-            raise ValueError("candidate has contradictory semantic classifications")
-        if set().union(*groups) != set(candidates):
-            raise ValueError("every candidate must be classified exactly once; incomplete or foreign candidate coverage")
         if task.startswith("unmatched_"):
             if row["assessment"] == "complete" and not row["differences"]:
                 raise ValueError("unmatched assessment needs an evidenced finding or an explicit uncertain judgment")
