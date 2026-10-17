@@ -217,7 +217,7 @@ class LLMConversationRecorder:
         validation_retries: int | None = None,
         result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
-        base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         last_error: Exception | None = None
         retries = self.llm_client.retries if validation_retries is None else validation_retries
         for attempt in range(retries + 1):
@@ -299,7 +299,7 @@ class LLMConversationRecorder:
                 self._conversations.append(record)
                 if not retryable:
                     if isinstance(exc, IncompleteLLMResponse):
-                        raise
+                        raise IncompleteLLMResponse(exc.raw, context=f"{self.name}/{schema_name}") from exc
                     raise RuntimeError(f"{self.name}/{schema_name} request failed: {exc}") from exc
         assert last_error is not None
         raise LLMValidationError(

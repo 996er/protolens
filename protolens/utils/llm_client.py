@@ -27,11 +27,12 @@ class LLMResponse:
 
 
 class IncompleteLLMResponse(RuntimeError):
-    def __init__(self, raw: dict[str, Any]) -> None:
+    def __init__(self, raw: dict[str, Any], *, context: str | None = None) -> None:
         self.raw = raw
         usage = raw.get("usage")
         details = raw.get("incomplete_details")
-        super().__init__(f"LLM response incomplete: details={details!r}, usage={usage!r}")
+        prefix = f"{context}: " if context else ""
+        super().__init__(f"{prefix}LLM response incomplete: details={details!r}, usage={usage!r}")
 
 
 class InvalidStructuredOutput(RuntimeError):

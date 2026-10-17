@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
+import json
 
 from protolens.fsm.fsm_model import Divergence, ProtocolFSM
 from protolens.fsm.llm_support import (
@@ -67,10 +69,70 @@ MERGE_RESULT_SCHEMA: dict[str, Any] = {
 }
 
 
+def _compact_merge_inputs(
+    spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, dict[str, Any]]]:
+    """Send each original citation once; never truncate or regenerate its text."""
+    evidence_table: dict[str, dict[str, Any]] = {}
+    evidence_ids: dict[str, str] = {}
+    payloads = []
+    for fsm in (spec_fsm, impl_fsm):
+        payload = fsm.to_dict()
+        # Checkpoints, analysis traces and prior repair records are not graph
+        # semantics and can dwarf the actual FSM in the request context.
+        payload.pop("metadata", None)
+        payload["states"] = list(payload["states"].values())
+        for element in [*payload["states"], *payload["transitions"]]:
+            refs = []
+            for evidence in element["evidence"]:
+                key = json.dumps(evidence, ensure_ascii=False, sort_keys=True)
+                if key not in evidence_ids:
+                    evidence_id = f"E{len(evidence_table) + 1}"
+                    evidence_ids[key] = evidence_id
+                    evidence_table[evidence_id] = evidence
+                refs.append(evidence_ids[key])
+            element["evidence"] = refs
+        payloads.append(payload)
+    return payloads[0], payloads[1], evidence_table
+
+
+def _merge_reference_schema() -> dict[str, Any]:
+    schema = deepcopy(MERGE_RESULT_SCHEMA)
+    graph = schema["properties"]["unified_fsm"]["properties"]
+    elements = [graph[key]["items"] for key in ("states", "transitions")]
+    elements.append(schema["properties"]["divergences"]["items"])
+    for element in elements:
+        element["properties"]["evidence"]["items"] = {"type": "string", "minLength": 1}
+    return schema
+
+
+def _expand_merge_evidence(
+    data: dict[str, Any], evidence_table: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    candidate = deepcopy(data)
+    graph = candidate.get("unified_fsm", {})
+    collections = [candidate.get("divergences", [])]
+    if isinstance(graph, dict):
+        collections.extend(graph.get(key, []) for key in ("states", "transitions"))
+    for collection in collections:
+        if not isinstance(collection, list):
+            continue  # Preserve malformed containers for normal schema validation.
+        for element in collection:
+            if not isinstance(element, dict) or not isinstance(element.get("evidence"), list):
+                continue
+            evidence = []
+            for ref in element["evidence"]:
+                if not isinstance(ref, str) or ref not in evidence_table:
+                    raise ValueError(f"merged evidence must reference an input evidence ID, got {ref!r}")
+                evidence.append(deepcopy(evidence_table[ref]))
+            element["evidence"] = evidence
+    return candidate
+
+
 class FSMMerger:
     """Compare and merge specification/implementation FSMs through the LLM."""
 
-    CACHE_VERSION = "fsm-semantic-merge-v1"
+    CACHE_VERSION = "fsm-semantic-merge-v2-evidence-refs"
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_merge", llm_client)
@@ -78,12 +140,7 @@ class FSMMerger:
     def merge(self, spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM) -> tuple[ProtocolFSM, list[Divergence]]:
         if self.recorder.llm_client.is_offline:
             raise RuntimeError("FSM comparison and merge require an online LLM")
-        # Match the model-facing output schema instead of teaching the model
-        # the name-indexed state representation used by persisted artifacts.
-        spec_payload = spec_fsm.to_dict()
-        impl_payload = impl_fsm.to_dict()
-        spec_payload["states"] = list(spec_payload["states"].values())
-        impl_payload["states"] = list(impl_payload["states"].values())
+        spec_payload, impl_payload, evidence_table = _compact_merge_inputs(spec_fsm, impl_fsm)
         payload = {
             "protocol": spec_fsm.protocol,
             "task": "Compare SpecificationFSM and ImplementationFSM, report conflicts, and produce UnifiedFSM.",
@@ -95,18 +152,43 @@ class FSMMerger:
                 "Map every input transition id in transition_sources to its unified transition.",
                 "Every transition_sources entry must include spec_transition_ids and impl_transition_ids arrays; use [] only for a side with no supporting input transition.",
                 "Never cite evidence absent from the two input FSMs.",
+                'Every evidence array in states, transitions and divergences must contain only IDs from evidence_table (e.g. ["E1"]). Never repeat excerpts, locations or the evidence table in your output; ProtoLens restores citations locally.',
+                "Keep descriptions and rationales concise; omit repeated explanations without dropping states, transitions or source mappings.",
                 "Return unified_fsm.states as an array of state objects, each with name, description, evidence and confidence.",
                 "Every transition source and target must exactly match a name in unified_fsm.states.",
                 "When renaming or merging states, update all transition endpoints and initial/terminal/error state references.",
             ],
             "specification_fsm": spec_payload,
             "implementation_fsm": impl_payload,
+            "evidence_table": evidence_table,
         }
         result: tuple[ProtocolFSM, list[Divergence]] | None = None
 
         def validate_result(data: dict[str, Any]) -> None:
             nonlocal result
-            result = self._parse_merge_result(data, spec_fsm, impl_fsm)
+            expanded = _expand_merge_evidence(data, evidence_table)
+            validate_json_schema(expanded, MERGE_RESULT_SCHEMA)
+            result = self._parse_merge_result(expanded, spec_fsm, impl_fsm)
+
+        def normalize_sources(data: dict[str, Any]) -> list[dict[str, Any]]:
+            mappings = data.get("transition_sources")
+            if not isinstance(mappings, list) or not any(
+                isinstance(mapping, dict)
+                and ("spec_transition_ids" not in mapping or "impl_transition_ids" not in mapping)
+                for mapping in mappings
+            ):
+                return []
+            expanded = _expand_merge_evidence(data, evidence_table)
+            changes = self._repair_transition_source_fields(
+                expanded, spec_fsm, impl_fsm,
+                compact_context={"unified_fsm": data.get("unified_fsm"),
+                                 "spec_transitions": spec_payload["transitions"],
+                                 "impl_transitions": impl_payload["transitions"],
+                                 "evidence_table": evidence_table},
+            )
+            if "transition_sources" in expanded:
+                data["transition_sources"] = expanded["transition_sources"]
+            return changes
 
         self.recorder.call_chat(
             system=(
@@ -115,16 +197,17 @@ class FSMMerger:
                 "security reasoning can target divergences. Return a complete, auditable merge."
             ),
             payload=payload,
-            schema=MERGE_RESULT_SCHEMA,
+            schema=_merge_reference_schema(),
             schema_name="protolens_fsm_merge",
             validator=validate_result,
-            result_normalizer=lambda data: self._repair_transition_source_fields(data, spec_fsm, impl_fsm),
+            result_normalizer=normalize_sources,
         )
         assert result is not None
         return result
 
     def _repair_transition_source_fields(
         self, data: dict[str, Any], spec_fsm: ProtocolFSM, impl_fsm: ProtocolFSM,
+        *, compact_context: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         mappings = data.get("transition_sources")
         if not isinstance(mappings, list):
@@ -178,9 +261,11 @@ class FSMMerger:
                     "protocol": spec_fsm.protocol,
                     "missing_fields": [{"mapping_index": index, "fields": fields} for index, fields in missing.items()],
                     "transition_sources": mappings,
-                    "unified_fsm": data.get("unified_fsm"),
-                    "spec_transitions": spec_fsm.to_dict()["transitions"],
-                    "impl_transitions": impl_fsm.to_dict()["transitions"],
+                    **(compact_context if compact_context is not None else {
+                        "unified_fsm": data.get("unified_fsm"),
+                        "spec_transitions": spec_fsm.to_dict()["transitions"],
+                        "impl_transitions": impl_fsm.to_dict()["transitions"],
+                    }),
                     "requirements": [
                         "Match source transitions using behavior and evidence, never ID spelling alone.",
                         "Fill only missing lists; copy existing lists unchanged. Do not modify the FSM.",
