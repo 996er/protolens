@@ -143,33 +143,6 @@ def normalize_decisions(data: dict[str, Any], expected: set[str]) -> list[dict[s
     return notes
 
 
-def _protect_supplied(old: Any, new: Any, schema: dict[str, Any], path: str = "$") -> None:
-    """Preserve valid leaves while completing structurally incomplete records."""
-    if isinstance(old, dict) and isinstance(new, dict) and schema.get("type") == "object":
-        for key, value in old.items():
-            if key in schema.get("properties", {}):
-                if key not in new:
-                    raise ValueError(f"repair removed supplied field {path}.{key}")
-                _protect_supplied(value, new[key], schema["properties"][key], f"{path}.{key}")
-        return
-    if isinstance(old, list) and isinstance(new, list) and schema.get("type") == "array":
-        try:
-            validate_json_schema(old, {key: value for key, value in schema.items() if key != "items"})
-        except ValueError:
-            return
-        if len(old) != len(new):
-            raise ValueError(f"repair changed supplied array length at {path}")
-        for index, (before, after) in enumerate(zip(old, new)):
-            _protect_supplied(before, after, schema["items"], f"{path}[{index}]")
-        return
-    try:
-        validate_json_schema(old, schema, allow_missing=True)
-    except ValueError:
-        return  # Explicitly invalid values may be replaced, never defaulted.
-    if type(old) is not type(new) or old != new:
-        raise ValueError(f"repair changed valid supplied value at {path}")
-
-
 class SemanticDecisionRunner:
     """Only unresolved bounded records are repaired; valid records stay fixed."""
 
@@ -279,22 +252,20 @@ class SemanticDecisionRunner:
 
         def complete_partial(data: dict[str, Any]) -> list[dict[str, Any]]:
             indexed = self._index(data, set(expected))
-            issues, protected = {}, {}
+            issues = {}
             for identifier, job in expected.items():
                 row = indexed.get(identifier)
                 try:
                     validate_json_schema(row, DECISION_SCHEMA)
                 except ValueError as exc:
                     issues[identifier] = str(exc)
-                    if row is not None:
-                        protected[identifier] = row
                     continue
                 try:
                     validate(job, row)
                 except ValueError as exc:
                     issues[identifier] = str(exc)
-                    # A semantic contradiction needs a revised judgment rather
-                    # than preserving the contradictory fields as fixed facts.
+                    # Acceptance is atomic per record: structural fragments
+                    # are not validated judgments that a repair must preserve.
             if not issues:
                 return []
             repaired = {}
@@ -303,7 +274,15 @@ class SemanticDecisionRunner:
             for identifier, error in issues.items():
                 job = expected[identifier]
                 repair = {"errors": {identifier: error}, "supplied_records": [indexed[identifier]] if identifier in indexed else [],
-                          "preserve_valid_fields": identifier in protected}
+                          "supplied_records_are_unvalidated": True,
+                          "repair_scope": "invalid_record", "fixed_fields": {"record_id": identifier},
+                          "accepted_record_ids": sorted(set(expected) - set(issues)),
+                          "requirements": [
+                              "Revise only this invalid record, preserving its record_id. Other accepted records are fixed.",
+                              "Candidate classifications are related fields; correct them together when necessary.",
+                              "Arrays may change length and order. Use only requested candidate IDs and classify every candidate exactly once.",
+                              "Ground each revised judgment in the supplied inputs and evidence; do not invent defaults.",
+                          ]}
                 if not self.fits([job], repair):
                     raise RuntimeError(f"repair context for {identifier} exceeds merge_request_bytes; no graph was regenerated")
 
@@ -311,13 +290,11 @@ class SemanticDecisionRunner:
                     rows = self._index(value, {identifier})
                     if set(rows) != {identifier}:
                         raise ValueError(f"repair is missing semantic decision {identifier}")
-                    if identifier in protected:
-                        _protect_supplied(protected[identifier], rows[identifier], DECISION_SCHEMA)
                     validate(job, rows[identifier])
 
                 try:
                     response = self.recorder.call_chat(
-                        system=SYSTEM + " Repair only the requested record. Preserve valid fields when required; complete missing nested fields. Return the full record, using the original record_id.",
+                        system=SYSTEM + " Revise only the requested invalid record as a whole. Supplied record fields are unvalidated, not fixed facts. Return the full record using the original record_id; satisfy candidate identity, exclusive classification and complete coverage constraints.",
                         payload=self._payload([job], repair), schema=self._schema(1),
                         schema_name="protolens_merge_decisions_repair", validator=validate_repair,
                         response_normalizer=lambda value, identifier=identifier: normalize_decisions(value, {identifier}),
