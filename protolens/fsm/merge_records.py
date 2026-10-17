@@ -56,6 +56,7 @@ SYSTEM = (
     "transitions have already been compared: assess missing_transition/extra_transition "
     "respectively with candidate_id=null, or assessment=uncertain to defer judgment. "
     "Assign P0/P1/P2 from evidence and explain the security impact. Never invent citations. "
+    "Include a concise record-level rationale and an evidence-based rationale for every difference. "
     "Return {records:[...]} with the SAME complete record structure for initial and repair requests."
 )
 
@@ -224,6 +225,43 @@ def _normalize_assessment(row: dict[str, Any], job: dict[str, Any] | None, path:
              "was_missing": was_missing, "value": value, "reason": reason}]
 
 
+def _normalize_record_rationale(row: dict[str, Any], path: str) -> list[dict[str, Any]]:
+    """Treat record commentary as annotation, never synthesize a finding's reason."""
+    original = row.get("rationale")
+    source = original
+    source_fields = ["rationale"] if "rationale" in row else []
+    if source is None or (isinstance(source, str) and not source.strip()):
+        aliases = {key: value for key in ("explanation", "reason", "summary", "notes")
+                   if (value := row.get(key)) is not None and value != ""}
+        if aliases:
+            source_fields = list(aliases)
+            source = next(iter(aliases.values())) if len(aliases) == 1 else aliases
+    limit = DECISION_SCHEMA["properties"]["rationale"]["maxLength"]
+    if source is None or (isinstance(source, str) and not source.strip()):
+        rendered = "[ProtoLens audit] Model supplied no record-level rationale; no semantic justification was inferred."
+        reason = "missing_record_rationale_annotation"
+    elif isinstance(source, str):
+        if source == original and len(source) <= limit:
+            return []
+        rendered, reason = source, "record_rationale_annotation_alias"
+    else:
+        rendered = "[Model record annotation, JSON] " + json.dumps(source, ensure_ascii=False, sort_keys=True)
+        reason = "structured_record_rationale_annotation"
+    if len(rendered) > limit:
+        rendered = "[ProtoLens audit] Record-level annotation exceeded the length limit; the full model content is preserved in the raw response audit. No replacement justification was inferred."
+        reason = "oversized_record_rationale_annotation"
+    note: dict[str, Any] = {
+        "path": f"{path}.rationale", "was_missing": "rationale" not in row,
+        "source_fields": source_fields, "value": rendered, "reason": reason,
+    }
+    if reason == "oversized_record_rationale_annotation":
+        note.update({"original_sha256": stable_fingerprint(source), "original_in": "response.text"})
+    else:
+        note["original_value"] = original
+    row["rationale"] = rendered
+    return [note]
+
+
 def normalize_decisions(
     data: dict[str, Any], expected: set[str], *, jobs: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -294,6 +332,7 @@ def normalize_decisions(
             if job is not None:
                 notes.extend(_normalize_candidate_references(row, job, f"$.records[{index}]"))
             notes.extend(_normalize_assessment(row, job, f"$.records[{index}]"))
+            notes.extend(_normalize_record_rationale(row, f"$.records[{index}]"))
     return notes
 
 
