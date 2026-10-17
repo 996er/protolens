@@ -321,6 +321,20 @@ def _normalize_fsm_metadata(
     changes: list[dict[str, Any]] = []
     if isinstance(value, dict):
         properties = schema.get("properties", {})
+        if {"kind", "spec_element", "impl_element", "severity", "rationale"} <= properties.keys():
+            for alias, canonical in (
+                ("type", "kind"), ("divergence_type", "kind"),
+                ("specification_element", "spec_element"),
+                ("implementation_element", "impl_element"),
+                ("priority", "severity"), ("explanation", "rationale"), ("reason", "rationale"),
+            ):
+                if alias not in value or alias in properties:
+                    continue
+                if canonical in value and value[canonical] != value[alias]:
+                    raise ValueError(f"{path} contains conflicting divergence fields: {canonical}, {alias}")
+                value[canonical] = value.pop(alias)
+                changes.append({"path": f"{path}.{canonical}", "original_path": f"{path}.{alias}",
+                                "value": value[canonical], "reason": "divergence_field_alias"})
         if ({"spec_transition_ids", "impl_transition_ids"} <= properties.keys()
                 and ("unified_transition_id" in properties or "mapping_index" in properties)):
             for canonical, aliases in (
