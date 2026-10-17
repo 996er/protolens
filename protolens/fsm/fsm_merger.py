@@ -268,6 +268,75 @@ class FSMMerger:
             },
         }
 
+        def normalize_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+            selections: dict[str, str] = {}
+            changes: list[dict[str, Any]] = []
+
+            def identify(reference: Any) -> str:
+                if not isinstance(reference, str):
+                    raise ValueError(f"state repair reference must be a slot or original state name: {reference!r}")
+                matches = {slot for slot, name in slots.items() if reference in (slot, name)}
+                if len(matches) != 1:
+                    raise ValueError(f"state repair reference is unknown or ambiguous: {reference!r}")
+                return next(iter(matches))
+
+            def select(slot: str, answer: Any) -> None:
+                original = deepcopy(answer)
+                allowed = schema["properties"][slot]["enum"]
+                if isinstance(answer, dict):
+                    labels = [answer[key] for key in ("option_id", "state_option_id", "selected_option_id",
+                                                     "option", "choice", "state_name", "target_state", "selected_state")
+                              if key in answer]
+                else:
+                    labels = [answer]
+                if not labels or any(not isinstance(label, str) for label in labels):
+                    raise ValueError(f"{slot} must select an option ID or an unambiguous state name")
+                resolved = []
+                for label in labels:
+                    if label in allowed:
+                        resolved.append(label)
+                        continue
+                    matches = [key for key, (_, state) in options.items()
+                               if key in allowed and state["name"] == label]
+                    if len(matches) != 1:
+                        raise ValueError(f"{slot} state choice is unknown or ambiguous: {label!r}; return its option ID")
+                    resolved.append(matches[0])
+                if len(set(resolved)) != 1:
+                    raise ValueError(f"{slot} contains conflicting state choices: {labels!r}")
+                selected = resolved[0]
+                if slot in selections and selections[slot] != selected:
+                    raise ValueError(f"state repair repeats {slot} with conflicting choices")
+                selections[slot] = selected
+                changes.append({"path": f"$.{slot}", "original_value": original, "value": selected,
+                                "reason": "state_reference_response_normalized"})
+
+            # Accept explicit slot answers and answers indexed by the original
+            # state name. Never assign answers by array position.
+            for key, answer in response.items():
+                if key in slots or key in missing:
+                    select(identify(key), answer)
+            for wrapper in ("repairs", "mappings", "references", "assignments"):
+                if wrapper not in response:
+                    continue
+                entries = response[wrapper]
+                if isinstance(entries, dict):
+                    for reference, answer in entries.items():
+                        select(identify(reference), answer)
+                elif isinstance(entries, list):
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            raise ValueError(f"{wrapper} entries must explicitly identify the repaired reference")
+                        identities = [identify(entry[key]) for key in ("reference_id", "reference", "slot",
+                                                                      "unknown_name", "original_state")
+                                      if key in entry]
+                        if not identities or len(set(identities)) != 1:
+                            raise ValueError(f"{wrapper} entry must identify exactly one original reference")
+                        select(identities[0], entry)
+                else:
+                    raise ValueError(f"{wrapper} must be a mapping or array of identified repairs")
+            response.update(selections)
+            return changes
+
         def patched(result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             candidate = deepcopy(graph)
             changes: list[dict[str, Any]] = []
@@ -303,6 +372,8 @@ class FSMMerger:
                     "protocol": merge_payload["protocol"],
                     "references": {slot: {"unknown_name": name, "paths": missing[name]}
                                    for slot, name in slots.items()},
+                    "required_output_keys": list(slots),
+                    "allowed_options_by_reference": {slot: schema["properties"][slot]["enum"] for slot in slots},
                     "state_options": {key: {"origin": origin, "state": state}
                                       for key, (origin, state) in options.items()},
                     "unified_fsm": graph,
@@ -312,6 +383,7 @@ class FSMMerger:
                     "evidence_table": evidence_table,
                     "requirements": [
                         "For each reference slot choose one allowed state option ID using transition behavior, input mappings and evidence.",
+                        "Return one flat JSON object with exactly required_output_keys; each value is an allowed option ID string. Include every slot, even when unresolved.",
                         "Choose a unified state only if it is semantically equivalent to the missing reference; spelling similarity alone is insufficient.",
                         "Choose an input state with the same missing name only if its declaration was omitted and the input evidence supports retaining it.",
                         "Return UNRESOLVED when no option is supported; do not guess to satisfy validation.",
@@ -320,6 +392,7 @@ class FSMMerger:
                 },
                 schema=schema, schema_name="protolens_merge_state_reference_repair",
                 validator=validate_repair,
+                response_normalizer=normalize_response,
             )
         except LLMValidationError as exc:
             raise RuntimeError(f"FSM merge state reference repair failed: {exc}") from exc

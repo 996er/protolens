@@ -109,6 +109,7 @@ class LLMConversationRecorder:
         validator: Callable[[dict[str, Any]], None] | None = None,
         validation_retries: int | None = None,
         result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+        response_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         return self._call(
             system=system,
@@ -120,6 +121,7 @@ class LLMConversationRecorder:
             validator=validator,
             validation_retries=validation_retries,
             result_normalizer=result_normalizer,
+            response_normalizer=response_normalizer,
         )
 
     def call_web(
@@ -186,6 +188,7 @@ class LLMConversationRecorder:
         validator: Callable[[dict[str, Any]], None] | None = None,
         validation_retries: int | None = None,
         result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+        response_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         data, _ = self._call_with_response(
             system=system,
@@ -198,6 +201,7 @@ class LLMConversationRecorder:
             validator=validator,
             validation_retries=validation_retries,
             result_normalizer=result_normalizer,
+            response_normalizer=response_normalizer,
         )
         return data
 
@@ -216,6 +220,7 @@ class LLMConversationRecorder:
         schema_repairer: Callable[[dict[str, Any], LLMResponse, ValueError], dict[str, Any]] | None = None,
         validation_retries: int | None = None,
         result_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+        response_normalizer: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], LLMResponse]:
         base_user = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         last_error: Exception | None = None
@@ -258,10 +263,13 @@ class LLMConversationRecorder:
                     "raw": response.raw,
                 }
                 data = load_json_object(response.text)
-                normalizations = _normalize_fsm_metadata(
+                # Decode task-specific response envelopes before the generic
+                # extension filter removes non-schema keys carrying results.
+                normalizations = response_normalizer(data) if response_normalizer is not None else []
+                normalizations.extend(_normalize_fsm_metadata(
                     data, schema, protocol=payload.get("protocol"),
                     repair_response=schema_name.endswith("_repair"),
-                )
+                ))
                 if result_normalizer is not None:
                     normalizations.extend(result_normalizer(data))
                 if normalizations:
