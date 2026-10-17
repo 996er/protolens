@@ -602,7 +602,7 @@ def _structured_output_error(
     text: str, schema: dict[str, Any], *, defer_leaf_fields: bool = False,
 ) -> str:
     try:
-        data = load_json_object(text)
+        data = load_json_object(text, schema=schema)
     except ValueError as exc:
         return str(exc)
     missing = [key for key in schema.get("required", []) if key not in data]
@@ -618,6 +618,22 @@ def _structured_output_error(
 
 
 def _extract_response_text(raw: dict[str, Any]) -> str:
+    output = raw.get("output")
+    if isinstance(output, list):
+        # A gateway's output_text can aggregate commentary and final messages.
+        # Prefer explicit final-answer messages when the response supplies them;
+        # retain all such messages so conflicting answers cannot be hidden.
+        final_messages = [
+            item for item in output
+            if isinstance(item, dict) and item.get("type") == "message"
+            and item.get("role") in {None, "assistant"}
+            and item.get("phase") == "final_answer"
+        ]
+        if final_messages:
+            final_text = "\n".join(_content_to_text(item.get("content")) for item in final_messages)
+            if final_text.strip():
+                return final_text
+
     output_text = raw.get("output_text")
     if isinstance(output_text, str) and output_text.strip():
         return output_text
@@ -637,11 +653,12 @@ def _extract_response_text(raw: dict[str, Any]) -> str:
             if text.strip():
                 return text
 
-    output = raw.get("output")
     if isinstance(output, list):
         parts: list[str] = []
         for item in output:
             if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            if item.get("role") not in {None, "assistant"}:
                 continue
             content = item.get("content")
             if not isinstance(content, list):

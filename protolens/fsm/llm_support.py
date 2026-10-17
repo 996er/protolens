@@ -262,10 +262,12 @@ class LLMConversationRecorder:
                     "model": response.model,
                     "raw": response.raw,
                 }
-                data = load_json_object(response.text)
+                normalizations: list[dict[str, Any]] = []
+                data = load_json_object(response.text, schema=schema, normalizations=normalizations)
                 # Decode task-specific response envelopes before the generic
                 # extension filter removes non-schema keys carrying results.
-                normalizations = response_normalizer(data) if response_normalizer is not None else []
+                if response_normalizer is not None:
+                    normalizations.extend(response_normalizer(data))
                 normalizations.extend(_normalize_fsm_metadata(
                     data, schema, protocol=payload.get("protocol"),
                     repair_response=schema_name.endswith("_repair"),
