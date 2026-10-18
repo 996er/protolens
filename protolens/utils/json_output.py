@@ -3,6 +3,27 @@ from typing import Any
 import json
 
 
+class InvalidJSONOutput(ValueError):
+    """A syntax failure with non-content diagnostics for logs and retry feedback."""
+
+    def __init__(self, message: str, text: str) -> None:
+        head = text.lstrip().lower()
+        if not head:
+            kind = "empty"
+        elif head.startswith(("<!doctype html", "<html", "<head", "<body")):
+            kind = "html"
+        elif head.startswith(("<think", "<analysis", "<reasoning")):
+            kind = "reasoning_markup"
+        elif head[0] in "{[":
+            kind = "malformed_json"
+        elif head.startswith("```"):
+            kind = "markdown"
+        else:
+            kind = "non_json_text"
+        self.output_diagnostics = {"kind": kind, "characters": len(text)}
+        super().__init__(f"{message}; output_kind={kind}, characters={len(text)}")
+
+
 def load_json_object(
     text: str, *, schema: dict[str, Any] | None = None,
     normalizations: list[dict[str, Any]] | None = None,
@@ -20,7 +41,7 @@ def load_json_object(
             stripped = stripped[:-3]
         stripped = stripped.strip()
     if not stripped:
-        raise ValueError("LLM final output is empty; expected a JSON object")
+        raise InvalidJSONOutput("LLM final output is empty; expected a JSON object", stripped)
 
     def reject_constant(value: str) -> None:
         raise ValueError(f"LLM output contains non-finite JSON number {value}")
@@ -33,10 +54,11 @@ def load_json_object(
                 stripped, schema, json.JSONDecoder(parse_constant=reject_constant),
                 normalizations,
             )
-        raise ValueError(
+        raise InvalidJSONOutput(
             f"LLM final output is not valid JSON: {exc.msg} "
             f"at line {exc.lineno}, column {exc.colno} (char {exc.pos}); "
-            "return only the complete JSON object, without prose or HTML"
+            "return only the complete JSON object, without prose or HTML",
+            stripped,
         ) from exc
     if not isinstance(data, dict):
         raise ValueError("LLM output must be a JSON object")

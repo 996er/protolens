@@ -1153,6 +1153,8 @@ python3 -m pip install -r requirement.txt
 
 所有在线 LLM 调用都通过 `protolens/utils/llm_client.py` 使用官方 OpenAI Python SDK：Agent 使用 Chat Completions，FSM 构建和网页检索使用 Responses。两条路径均使用 SDK 的 `with_raw_response.create()`，保留兼容服务扩展字段和完整原始 JSON，以供证据归档。参考 [OpenAI Docs](https://developers.openai.com/api/docs/libraries)。
 
+`openai-compatible` 的结构化请求同时在系统文本中附带完整输出 Schema 和纯 JSON 要求，避免网关转换时遗漏原生格式选项；原生 Schema 参数与本地严格校验仍然保留。响应提取优先使用显式 final_answer，其次使用未标注阶段的 assistant message，支持字符串及文本块内容；不把 commentary 当成最终答案，也不优先采用可能混入说明文字的 output_text 聚合。最终消息缺少正文时，流式恢复按消息 ID 或输出索引匹配对应文本，避免串入其他消息。多个最终回答仍全部保留并检查一致性。无法解码的内容不通过截取任意花括号片段来强行接受；错误反馈及对话日志记录输出类别和字符数，区分 HTML、推理标签、普通非 JSON 文本和损坏 JSON，原始响应继续用于审计。这些措施不能替代上游返回完整有效的最终答案；重试耗尽仍中止，保留已验证块缓存。
+
 现有 `llm.provider`、`model`、`base_url`、`api_key_env`、`extra_headers`、`timeout_seconds`、`max_tokens` 和 `response_format` 配置继续有效。`base_url` 可使用 API 根路径（例如 `https://example.com/v1`），也兼容以 `/chat/completions` 或 `/responses` 结尾的旧配置。远程接口仍需设置 `api_key_env` 指定的环境变量；本地无密钥接口使用 SDK 所需的占位 token，不包含真实凭证。
 
 SDK 内部 `max_retries` 固定为 0，重试由 ProtoLens 的 `llm.retries` 控制，保留空响应格式降级、输出预算增长与网页检索后续写。每次请求通过上下文管理器关闭 SDK HTTP 客户端。离线模式不创建 SDK 客户端、不发起网络请求。

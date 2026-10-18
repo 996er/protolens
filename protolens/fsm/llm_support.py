@@ -312,6 +312,8 @@ class LLMConversationRecorder:
                         "raw": raw,
                     }
                 record["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                if getattr(exc, "output_diagnostics", None):
+                    record["error"]["output_diagnostics"] = exc.output_diagnostics
                 if getattr(exc, "issues", None):
                     record["error"]["schema_issues"] = [issue.to_dict() for issue in exc.issues]
                 # Transport/output-budget retries belong to LLMClient. Retrying them
