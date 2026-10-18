@@ -264,6 +264,8 @@ ImplementationFSMBuilder.build(config)
 
 源码块响应在通用扩展字段过滤之前执行格式规范化，主请求及同块重试共用该入口：`facts` / `transitions` 映射为 `transition_facts`，已知 `result` / `data` / `output` / `implementation` / `fsm` 对象包装中的字段提升到结果根节点；重复字段冲突时拒绝选择其一。单个事实和以事实 ID 为键的对象可无损转换为数组，键与事实内 ID 冲突时仍拒绝。遗漏或 null 的 uncertainties 只记作未提供说明并保存审计，不推断分析确定性；结构化说明保留为 JSON 文本。transition_facts 和 analyzed_files 缺失或 null 均不能补造为空或复制请求清单来伪称已分析，仍要求模型在原块内补齐，并通过完整文件覆盖和原文证据校验。完整结构错误路径写入对话日志，重试反馈按大小限制返回诊断；校验重试统一由源码块外层循环计数，终止错误显示实际块校验尝试次数，不再只显示内层单次调用的 `after 1 attempt(s)`。传输异常仍由客户端处理，已经验证的其他块缓存可继续复用。
 
+源码证据元数据在首次分析和单事实修复中使用同一规范化入口：单个 evidence 对象转为数组，sourceType/type 和 confidenceScore/confidence_score 先归一为规范字段，冲突仍拒绝。仅当字段遗漏时，source_type 由源码分析上下文补为 code；证据 confidence 记为保守的 0.0，并在审计中标明模型未评分，不表示程序评估过支持强度，也不继承转换置信度。选择源码范围的证据修复使用同一缺省评分规则。显式 null、非法值仍需修复；location、excerpt、转换语义及转换自身的 confidence 不按此规则补造。元数据规范化后仍必须通过完整 Schema、文件覆盖和源码原文校验，真正缺失的信息耗尽定向修复后严格中止。
+
 内部的分块恢复缓存会保存完整且已验证的块结果（含源码摘录），以便在最终 EvidenceTable 尚未生成时恢复；它不是对外 FSM 工件。新的分块缓存仅能恢复该版本写出的检查点，旧运行没有检查点的源码块仍需分析一次。
 
 TransitionFact 条目同样在扩展字段过滤前恢复明确别名，例如 source_state/from_state/state_before → source、target_state/to_state/state_after → target、messageType → message_type、actions/side_effects → action、errorHandling/on_error → error_handling。别名冲突仍拒绝，复杂值继续接受结构校验，不通过字符串化改变其语义。若根结果结构和文件覆盖完整，而某个事实仍缺字段或字段类型非法，则仅针对该事实请求补齐，返回同一结果结构及完整 TransitionFact；请求带原源码、全部字段问题和固定身份，禁止删除或替换事实；该事实尚未通过验收，允许依据源码联动修正内部语义，不锁定未验证字段的值或数组长度，其他事实不参与重写。缺少有效 ID 时程序为该块中的事实位置生成稳定修复 ID。source、target、trigger、行为、置信度和证据均不得由程序猜测；message_type、guard、action、error_handling 虽允许 null，模型仍必须显式给出值或说明无法恢复的语义，不能仅因字段缺失自动填 null。单事实结构修复没有递归补全，耗尽配置预算立即中止并保留已验证块缓存，不再次重生成整块；补齐后仍执行原文证据校验和必要的源码范围修复。

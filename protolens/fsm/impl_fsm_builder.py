@@ -76,6 +76,7 @@ _FACT_RESULT_POLICIES = {
     ("uncertainties",): FieldPolicy(
         role="collection", aliases=("uncertainty",), singleton=True,
     ),
+    ("transition_facts", "*", "evidence"): FieldPolicy(role="collection", singleton=True),
 }
 for _field, _aliases in (
     ("id", ("fact_id", "transition_id")),
@@ -88,6 +89,47 @@ for _field, _aliases in (
     ("error_handling", ("errorHandling", "error_action", "on_error")),
 ):
     _FACT_RESULT_POLICIES[("transition_facts", "*", _field)] = FieldPolicy(aliases=_aliases)
+
+
+def _normalize_evidence_metadata(
+    record: dict[str, Any], *, path: str, code_citation: bool,
+) -> list[dict[str, Any]]:
+    """Normalize source-task metadata, without supplying citation content.
+
+    Zero for an omitted score means unassessed, never verified confidence.
+    Explicit invalid values remain subject to schema validation/repair.
+    This policy applies only to evidence, not transition confidence.
+    """
+    policies = {
+        ("confidence",): FieldPolicy(aliases=("confidence_score", "confidenceScore")),
+    }
+    if code_citation:
+        policies[("source_type",)] = FieldPolicy(aliases=("type", "sourceType"))
+    notes = normalize_schema_fields(record, EVIDENCE_SCHEMA, policies)
+    for note in notes:
+        note["path"] = path + note["path"][1:]
+    defaults = {"confidence": (0.0, "omitted_evidence_confidence_unassessed")}
+    if code_citation:
+        defaults["source_type"] = ("code", "source_type_from_implementation_context")
+    for key, (value, reason) in defaults.items():
+        if key not in record:
+            record[key] = value
+            notes.append({"path": f"{path}.{key}", "reason": reason,
+                          "was_missing": True, "value": value})
+    return notes
+
+
+def normalize_transition_evidence_repair(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Use the same evidence-score policy when selecting exact source spans."""
+    notes: list[dict[str, Any]] = []
+    repairs = data.get("repairs")
+    if isinstance(repairs, list):
+        for index, repair in enumerate(repairs):
+            if isinstance(repair, dict):
+                notes.extend(_normalize_evidence_metadata(
+                    repair, path=f"$.repairs[{index}]", code_citation=False,
+                ))
+    return notes
 
 
 def normalize_transition_fact_result(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -125,6 +167,19 @@ def normalize_transition_fact_result(data: dict[str, Any]) -> list[dict[str, Any
             if "original_path" in note:
                 note["original_path"] = path + note["original_path"][1:]
             notes.append(note)
+        facts = value.get("transition_facts")
+        if isinstance(facts, list):
+            for fact_index, fact in enumerate(facts):
+                evidence = fact.get("evidence") if isinstance(fact, dict) else None
+                if not isinstance(evidence, list):
+                    continue
+                for evidence_index, citation in enumerate(evidence):
+                    if isinstance(citation, dict):
+                        notes.extend(_normalize_evidence_metadata(
+                            citation,
+                            path=f"{path}.transition_facts[{fact_index}].evidence[{evidence_index}]",
+                            code_citation=True,
+                        ))
         for envelope in ("result", "data", "output", "implementation", "fsm"):
             nested = value.get(envelope)
             if not isinstance(nested, dict):
@@ -761,6 +816,7 @@ class ImplementationFSMBuilder:
             payload=payload,
             schema=TRANSITION_EVIDENCE_REPAIR_SCHEMA,
             schema_name="protolens_impl_transition_evidence_repair",
+            response_normalizer=normalize_transition_evidence_repair,
             validator=validate_repairs,
         )
         for repair in repaired["repairs"]:
