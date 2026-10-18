@@ -266,6 +266,8 @@ ImplementationFSMBuilder.build(config)
 
 内部的分块恢复缓存会保存完整且已验证的块结果（含源码摘录），以便在最终 EvidenceTable 尚未生成时恢复；它不是对外 FSM 工件。新的分块缓存仅能恢复该版本写出的检查点，旧运行没有检查点的源码块仍需分析一次。
 
+TransitionFact 条目同样在扩展字段过滤前恢复明确别名，例如 source_state/from_state/state_before → source、target_state/to_state/state_after → target、messageType → message_type、actions/side_effects → action、errorHandling/on_error → error_handling。别名冲突仍拒绝，复杂值继续接受结构校验，不通过字符串化改变其语义。若根结果结构和文件覆盖完整，而某个事实仍缺字段或字段类型非法，则仅针对该事实请求补齐，返回同一结果结构及完整 TransitionFact；请求带原源码、全部字段问题和固定身份，禁止删除或替换事实；该事实尚未通过验收，允许依据源码联动修正内部语义，不锁定未验证字段的值或数组长度，其他事实不参与重写。缺少有效 ID 时程序为该块中的事实位置生成稳定修复 ID。source、target、trigger、行为、置信度和证据均不得由程序猜测；message_type、guard、action、error_handling 虽允许 null，模型仍必须显式给出值或说明无法恢复的语义，不能仅因字段缺失自动填 null。单事实结构修复没有递归补全，耗尽配置预算立即中止并保留已验证块缓存，不再次重生成整块；补齐后仍执行原文证据校验和必要的源码范围修复。
+
 #### 4.3 FSMMerger
 
 模型负责语义判断，程序负责身份、来源和图结构：
