@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from protolens.protocols import seed_message_contract, protocol_profile
+from protolens.tools.wire_protocols import wire_method
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -278,6 +281,7 @@ class MonitorAgent:
                 "Do not include transport actions such as TCP reset, half-close, or TLS renegotiation."
             ),
             "protocol": config.protocol,
+            "seed_message_contract": seed_message_contract(config.protocol),
             "target_name": config.target_name,
             "fuzz_result": {
                 "mode": fuzz_result.mode,
@@ -396,7 +400,7 @@ class MonitorAgent:
             if not messages:
                 skipped.append({"conflict_id": conflict_id, "candidate_id": candidate_id, "reason": "empty client-sendable message sequence"})
                 continue
-            frontier_match = _frontier_match(messages, dynamic)
+            frontier_match = _frontier_match(messages, dynamic, config.protocol)
             if frontier_match is not None and not frontier_match.get("matched"):
                 skipped.append(
                     {
@@ -1330,7 +1334,7 @@ def _client_seed_message(message: str, protocol: str) -> str | None:
     return client_seed_message(message, protocol)
 
 
-def _frontier_match(messages: list[str], dynamic: dict[str, Any] | None) -> dict[str, Any] | None:
+def _frontier_match(messages: list[str], dynamic: dict[str, Any] | None, protocol: str = "") -> dict[str, Any] | None:
     if not isinstance(dynamic, dict):
         return None
     execution_fsm = dynamic.get("execution_fsm", {})
@@ -1342,7 +1346,7 @@ def _frontier_match(messages: list[str], dynamic: dict[str, Any] | None) -> dict
     frontier_sequences = _frontier_command_sequences(frontier)
     if not frontier_sequences:
         return None
-    candidate_commands = [_message_method(message) for message in messages]
+    candidate_commands = [_message_method(message, protocol) for message in messages]
     candidate_commands = [command for command in candidate_commands if command]
     if not candidate_commands:
         return {
@@ -1393,10 +1397,15 @@ def _frontier_command_sequences(frontier: dict[str, Any]) -> list[list[str]]:
     return unique
 
 
-def _message_method(message: str) -> str:
+def _message_method(message: str, protocol: str = "") -> str:
     text = str(message).strip()
     if not text:
         return ""
+    if protocol_profile(protocol).binary:
+        try:
+            return wire_method(CorpusEncoder()._encode_message(message, protocol, 1), protocol)
+        except (ValueError, OverflowError):
+            return "RAW"
     if text.lower().startswith(("raw:", "raw-b64:", "base64:")):
         return "RAW"
     return text.split()[0].upper().rstrip(":") if text.split() else ""

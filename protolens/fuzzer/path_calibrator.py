@@ -14,6 +14,8 @@ from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import PlannedStatePath
 from protolens.fuzzer.aflnet_adapter import _run_build_command
 from protolens.tools.corpus_encoder import CorpusEncoder
+from protolens.protocols import PROTOCOLS, normalize_protocol, protocol_profile
+from protolens.tools.wire_protocols import dns_message_end, wire_method
 
 
 class PathCalibrator:
@@ -26,7 +28,7 @@ class PathCalibrator:
             reason = "path_calibration.enabled is false"
         elif config.aflnet.dry_run:
             reason = "dry-run: no target was executed"
-        elif config.protocol.lower() not in {"rtsp", "ftp", "smtp", "http", "daap-http"}:
+        elif normalize_protocol(config.protocol) not in PROTOCOLS:
             reason = "protocol has no response oracle"
         elif config.host not in {"127.0.0.1", "localhost", "::1"}:
             reason = "managed calibration requires a loopback target"
@@ -78,7 +80,9 @@ class PathCalibrator:
         settings = config.path_calibration
         try:
             # Never probe a listener that was already present before this candidate's target.
-            if _port_is_listening(config.host, config.port):
+            occupied = (_udp_port_occupied(config.host, config.port) if config.network_transport == "udp"
+                        else _port_is_listening(config.host, config.port))
+            if occupied:
                 result["reason"] = "target port already occupied; calibration skipped"
                 return result
             target = subprocess.Popen(command, cwd=config.aflnet.working_directory(config.source_root),
@@ -90,16 +94,29 @@ class PathCalibrator:
                 if target.poll() is not None:
                     raise OSError(f"target exited before accepting a connection: {target.returncode}")
                 try:
-                    connection = socket.create_connection((config.host, config.port), timeout=min(0.2, settings.timeout_seconds))
+                    if config.network_transport == "udp":
+                        # UDP connect does not establish server readiness. Allow
+                        # the configured startup interval, and require a reply.
+                        if time.monotonic() < deadline:
+                            time.sleep(0.02)
+                            continue
+                        family, kind, proto, _, endpoint = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_DGRAM)[0]
+                        connection = socket.socket(family, kind, proto)
+                        if config.client_port:
+                            connection.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", config.client_port))
+                        connection.connect(endpoint)
+                    else:
+                        connection = socket.create_connection((config.host, config.port), timeout=min(0.2, settings.timeout_seconds))
                 except OSError as exc:
                     if not _is_connection_pending(exc):
                         raise
                     if time.monotonic() >= deadline:
                         raise TimeoutError("target startup timed out")
                     time.sleep(0.02)
-            reader = _ResponseReader(connection, settings.timeout_seconds)
+            reader = _ResponseReader(connection, settings.timeout_seconds, datagram=config.network_transport == "udp")
             result["connected"] = True
-            protocol = config.protocol.lower()
+            protocol = normalize_protocol(config.protocol)
+            observation_only = protocol_profile(protocol).binary and protocol != "dns"
             greeting = None
             if protocol in {"ftp", "smtp"}:
                 greeting = reader.read(protocol)
@@ -125,21 +142,39 @@ class PathCalibrator:
                     connection.sendall(payload)
                     event["bytes_sent"] = len(payload)
                     code = reader.read(protocol)
+                    if protocol == "sip":
+                        deadline = time.monotonic() + settings.timeout_seconds
+                        for _ in range(16):
+                            if code >= 200:
+                                break
+                            reader.timeout = max(0.001, deadline - time.monotonic())
+                            code = reader.read(protocol)
+                        reader.timeout = settings.timeout_seconds
+                    if protocol == "dns" and reader.last_response.get("transaction_id") != int.from_bytes(payload[:2], "big"):
+                        raise ValueError("DNS response transaction ID does not match the request")
                 event["response_code"] = code
                 event["response_headers"] = dict(reader.last_response.get("headers", {}))
+                if observation_only:
+                    event["response_kind"] = reader.last_response.get("kind", "")
+                    event["accepted"] = None
+                    continue
                 response_bindings.update(_extract_response_bindings(protocol, reader.last_response))
                 if response_bindings:
                     event["bindings_after_response"] = dict(response_bindings)
-                accepted = 200 <= code < (400 if protocol in {"ftp", "smtp"} else 300)
+                accepted = code == 0 if protocol == "dns" else 200 <= code < (400 if protocol in {"ftp", "smtp"} else 300)
                 event["accepted"] = accepted
                 if not accepted:
-                    result.update(status="rejected" if code >= 400 else "inconclusive",
-                                  reason="response rejected the request" if code >= 400 else "response requires unsupported continuation",
+                    rejected = code >= 400 or (protocol == "dns" and code != 0)
+                    result.update(status="rejected" if rejected else "inconclusive",
+                                  reason="response rejected the request" if rejected else "response requires unsupported continuation",
                                   failure_index=index)
                     break
                 result["accepted_prefix_length"] = index + 1
             else:
-                result.update(status="response_accepted", reason="all encoded requests received positive responses")
+                if observation_only:
+                    result.update(status="response_observed", reason="framed responses observed; handshake and hidden state acceptance are not verified")
+                else:
+                    result.update(status="response_accepted", reason="all encoded requests received positive responses")
             if response_bindings:
                 result["response_bindings"] = dict(response_bindings)
                 path.messages = bound_messages + path.messages[len(bound_messages):]
@@ -169,20 +204,23 @@ class PathCalibrator:
 class _ResponseReader:
     """Bounded framed responses; a partial packet must never count as acceptance."""
 
-    def __init__(self, connection: socket.socket, timeout: float) -> None:
+    def __init__(self, connection: socket.socket, timeout: float, *, datagram: bool = False) -> None:
         self.connection = connection
         self.timeout = timeout
         self.buffer = b""
         self.deadline = 0.0
         self.received = 0
         self.last_response: dict[str, Any] = {}
+        self.datagram = datagram
 
     def _more(self) -> None:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("response deadline exceeded")
         self.connection.settimeout(remaining)
-        block = self.connection.recv(4096)
+        if self.datagram and self.received:
+            raise ValueError("truncated datagram response")
+        block = self.connection.recv(65535 if self.datagram else 4096)
         if not block:
             raise ValueError("connection closed before complete response")
         self.received += len(block)
@@ -199,6 +237,8 @@ class _ResponseReader:
     def read(self, protocol: str) -> int:
         self.deadline = time.monotonic() + self.timeout
         self.received = len(self.buffer)
+        if protocol_profile(protocol).binary:
+            return self._binary_response(protocol)
         line = self._line()
         if protocol in {"ftp", "smtp"}:
             if len(line) < 4 or not line[:3].isdigit() or line[3:4] not in {b" ", b"-"}:
@@ -210,7 +250,7 @@ class _ResponseReader:
             self.last_response = {"status_code": code, "headers": {}}
             return code
         parts = line.split(b" ", 2)
-        prefix = b"RTSP/" if protocol == "rtsp" else b"HTTP/"
+        prefix = {"rtsp": b"RTSP/", "sip": b"SIP/"}.get(protocol, b"HTTP/")
         if len(parts) < 2 or not parts[0].startswith(prefix) or len(parts[1]) != 3 or not parts[1].isdigit():
             raise ValueError("invalid RTSP/HTTP status line")
         headers: dict[bytes, bytes] = {}
@@ -242,6 +282,65 @@ class _ResponseReader:
             },
         }
         return code
+
+    def _take(self, size: int) -> bytes:
+        if size > 1_048_576:
+            raise ValueError("response exceeds calibration byte limit")
+        while len(self.buffer) < size:
+            self._more()
+        block, self.buffer = self.buffer[:size], self.buffer[size:]
+        return block
+
+    def _binary_response(self, protocol: str) -> int:
+        if protocol == "dns":
+            if not self.datagram:
+                raise ValueError("DNS calibration currently requires UDP")
+            self._more()
+            block = self.buffer
+            self.buffer = b""
+            if dns_message_end(block) != len(block) or not block[2] & 0x80:
+                raise ValueError("invalid DNS response")
+            if block[2] & 0x02:
+                raise ValueError("truncated DNS response requires TCP continuation")
+            code = block[3] & 15
+            self.last_response = {"transaction_id": int.from_bytes(block[:2], "big"), "status_code": code, "headers": {}}
+            return code
+        if protocol == "ssh":
+            # RFC 4253 permits pre-identification lines from a server.
+            while True:
+                prefix = self._take(4)
+                if prefix == b"SSH-":
+                    self._line()
+                    self.last_response = {"kind": "IDENTIFICATION", "headers": {}}
+                    return 0
+                if all(32 <= byte < 127 for byte in prefix):
+                    self._line()
+                    continue
+                length = int.from_bytes(prefix, "big")
+                if length < 6:
+                    raise ValueError("invalid SSH packet length")
+                body = self._take(length)
+                if body[0] < 4 or body[0] >= length - 1:
+                    raise ValueError("invalid SSH padding length")
+                self.last_response = {"kind": wire_method(prefix + body, protocol), "headers": {}}
+                return 0
+        header_size, length_start = {"tls": (5, 3), "dtls": (13, 11), "dicom": (6, 2)}[protocol]
+        header = self._take(header_size)
+        body = self._take(int.from_bytes(header[length_start:], "big"))
+        self.last_response = {"kind": wire_method(header + body, protocol), "headers": {}}
+        return 0
+
+
+def _udp_port_occupied(host: str, port: int) -> bool:
+    family, kind, proto, _, endpoint = socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)[0]
+    with socket.socket(family, kind, proto) as probe:
+        try:
+            probe.bind(endpoint)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return True
+            raise
+    return False
 
 
 def _bind_response_values(message: str, protocol: str, bindings: dict[str, str]) -> str:

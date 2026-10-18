@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+import struct
+from protolens.protocols import protocol_profile
+from protolens.tools.wire_protocols import split_wire_messages, wire_method
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import hashlib
@@ -315,7 +320,8 @@ class CrashReplayVerifier:
         crash_path: Path,
     ) -> dict[str, Any]:
         payload = crash_path.read_bytes()
-        chunks = _split_seed_messages(payload, config.protocol)
+        replayable = "replayable-" in crash_path.parent.name
+        chunks = _unpack_replay_messages(payload) if replayable else _split_seed_messages(payload, config.protocol)
         if len(chunks) <= 1 or len(chunks) > 24:
             return {
                 "attempted": False,
@@ -331,13 +337,13 @@ class CrashReplayVerifier:
                 changed = False
                 for index in range(len(kept)):
                     candidate = kept[:index] + kept[index + 1 :]
-                    tmp_path.write_bytes(b"".join(candidate))
-                    replay = _run_replay(config, replay_binary, target_command, tmp_path)
+                    tmp_path.write_bytes(_pack_replay_messages(candidate) if replayable else b"".join(candidate))
+                    replay = _run_replay(config, replay_binary, target_command, tmp_path, replayable=replayable)
                     if replay["confirmed"]:
                         kept = candidate
                         changed = True
                         break
-            minimized_payload = b"".join(kept)
+            minimized_payload = _pack_replay_messages(kept) if replayable else b"".join(kept)
             minimized = len(minimized_payload) < len(payload)
             out_path = crash_path.with_suffix(crash_path.suffix + ".protolens-min")
             if minimized:
@@ -356,9 +362,19 @@ def _run_replay(
     replay_binary: str,
     target_command: list[str],
     seed_path: Path,
+    *,
+    replayable: bool | None = None,
 ) -> dict[str, Any]:
     target = None
+    converted = None
     try:
+        replay_path = seed_path
+        if replayable is None:
+            replayable = "replayable-" in seed_path.parent.name
+        if not replayable:
+            converted = TemporaryDirectory(prefix="protolens-replay-")
+            replay_path = Path(converted.name) / "messages.raw"
+            replay_path.write_bytes(_pack_replay_messages(_split_seed_messages(seed_path.read_bytes(), config.protocol)))
         target = subprocess.Popen(
             target_command,
             cwd=str(config.aflnet.working_directory(config.source_root)),
@@ -370,11 +386,13 @@ def _run_replay(
         time.sleep(min(5.0, max(0.05, config.aflnet.timeout_ms / 1000.0)))
         replay_command = [
             replay_binary,
-            str(seed_path),
-            config.protocol.upper(),
+            str(replay_path),
+            protocol_profile(config.protocol).aflnet_name,
             str(config.port),
-            str(max(1000, config.aflnet.timeout_ms * 1000)),
             str(max(1, config.aflnet.timeout_ms)),
+            # The bundled replay tool assigns this directly to timeval.tv_usec
+            # with tv_sec=0, so values >= 1 second are invalid there.
+            str(min(999999, max(1000, config.aflnet.timeout_ms * 1000))),
         ]
         replay = subprocess.run(
             replay_command,
@@ -402,6 +420,8 @@ def _run_replay(
             "error": str(exc),
         }
     finally:
+        if converted is not None:
+            converted.cleanup()
         if target and target.poll() is None:
             try:
                 os.killpg(target.pid, signal.SIGTERM)
@@ -630,10 +650,10 @@ def _execution_frontier_candidates(queue_artifacts: list[dict[str, Any]], protoc
 
 def _seed_message_summaries(payload: bytes, protocol: str) -> list[dict[str, str]]:
     summaries: list[dict[str, str]] = []
-    for index, chunk in enumerate(_split_seed_messages(payload[:65536], protocol or "")):
+    for index, chunk in enumerate(_split_seed_messages(payload, protocol or "")[:32]):
         line = chunk.splitlines()[0] if chunk.splitlines() else chunk[:80]
         text = line.decode("utf-8", errors="replace").strip()
-        method = _message_method(text, protocol)
+        method = wire_method(chunk, protocol) if protocol_profile(protocol).binary else _message_method(text, protocol)
         if not method:
             continue
         summaries.append(
@@ -641,6 +661,8 @@ def _seed_message_summaries(payload: bytes, protocol: str) -> list[dict[str, str
                 "index": str(index),
                 "method": method,
                 "first_line": text[:160],
+                "wire_message": "raw-b64:" + base64.b64encode(chunk).decode("ascii") if len(chunk) <= 4096 else "",
+                "wire_bytes": str(len(chunk)),
             }
         )
     return summaries
@@ -1004,9 +1026,24 @@ def _target_command(cmd: list[str]) -> list[str]:
 
 
 def _split_seed_messages(payload: bytes, protocol: str) -> list[bytes]:
-    if protocol.lower() in {"rtsp", "http", "daap-http"}:
-        return _split_keep_separator(payload, b"\r\n\r\n")
-    return _split_keep_separator(payload, b"\r\n")
+    return split_wire_messages(payload, protocol)
+
+
+def _unpack_replay_messages(payload: bytes) -> list[bytes]:
+    chunks: list[bytes] = []
+    offset = 0
+    while offset + 4 <= len(payload):
+        length = struct.unpack_from("=I", payload, offset)[0]
+        offset += 4
+        if not length or offset + length > len(payload):
+            return []
+        chunks.append(payload[offset:offset + length])
+        offset += length
+    return chunks if offset == len(payload) else []
+
+
+def _pack_replay_messages(chunks: list[bytes]) -> bytes:
+    return b"".join(struct.pack("=I", len(chunk)) + chunk for chunk in chunks)
 
 
 def _split_keep_separator(payload: bytes, separator: bytes) -> list[bytes]:

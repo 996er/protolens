@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from protolens.protocols import seed_message_contract
+
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -295,7 +297,7 @@ IMPLEMENTATION_ASSEMBLY_SCHEMA: dict[str, Any] = {
 class ImplementationFSMBuilder:
     """Recover implementation state semantics through LLM source analysis only."""
 
-    CACHE_VERSION = "implementation-transition-facts-v1"
+    CACHE_VERSION = "implementation-transition-facts-v2-protocol-contract"
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_implementation", llm_client)
@@ -548,6 +550,7 @@ class ImplementationFSMBuilder:
         payload = {
             "task": "Recover the implementation FSM facts evidenced by this source chunk.",
             "protocol": config.protocol,
+            "seed_message_contract": seed_message_contract(config.protocol),
             "target_name": config.target_name,
             "source_root": str(config.source_root),
             "entrypoints": config.entrypoints,

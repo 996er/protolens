@@ -64,7 +64,7 @@ class TransportAwareHarness:
                 "supported": all(bool(event.get("supported", True)) for event in events),
                 "events": events,
             }
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             return {
                 "conflict_id": action.get("conflict_id", ""),
                 "supported": True,
@@ -77,6 +77,18 @@ class TransportAwareHarness:
             _close(session.sock)
 
     def _connect(self, config: ProtoLensConfig) -> socket.socket | ssl.SSLSocket:
+        if config.network_transport == "udp":
+            family, kind, proto, _, endpoint = socket.getaddrinfo(config.host, config.port, type=socket.SOCK_DGRAM)[0]
+            raw_sock = socket.socket(family, kind, proto)
+            try:
+                raw_sock.settimeout(config.transport_harness.timeout_seconds)
+                if config.client_port:
+                    raw_sock.bind(("::" if family == socket.AF_INET6 else "0.0.0.0", config.client_port))
+                raw_sock.connect(endpoint)
+                return raw_sock
+            except Exception:
+                raw_sock.close()
+                raise
         raw_sock = socket.create_connection(
             (config.host, config.port),
             timeout=config.transport_harness.timeout_seconds,
@@ -92,6 +104,9 @@ class TransportAwareHarness:
 
     def _apply_message(self, config: ProtoLensConfig, session: _Session, message: str) -> dict[str, Any]:
         upper = message.upper()
+        if config.network_transport == "udp" and ("RESET" in upper or "HALF_CLOSE" in upper or "TLS_RENEGOTIATION" in upper):
+            return {"event": "transport_action", "supported": False,
+                    "reason": "UDP has no TCP reset, half-close or TLS renegotiation"}
         if "TLS_RENEGOTIATION" in upper and "RESET" not in upper:
             return {
                 "event": "tls_renegotiation",

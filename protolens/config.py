@@ -8,6 +8,8 @@ import math
 import os
 import shlex
 
+from protolens.protocols import normalize_protocol, protocol_profile
+
 
 @dataclass
 class AFLNetConfig:
@@ -307,7 +309,7 @@ class ProtoLensConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any], base_dir: Path | None = None) -> "ProtoLensConfig":
         base_dir = (base_dir or Path.cwd()).resolve()
-        protocol = str(data["protocol"]).strip()
+        protocol = normalize_protocol(str(data["protocol"]))
         target_name = str(data["target_name"]).strip()
         if not protocol or not target_name:
             raise ValueError("protocol and target_name must be non-empty")
@@ -340,6 +342,24 @@ class ProtoLensConfig:
         config.validate()
         return config
 
+    @property
+    def network_transport(self) -> str:
+        options = self.aflnet.cmd[:self.aflnet.cmd.index("--")] if "--" in self.aflnet.cmd else self.aflnet.cmd
+        for index, value in enumerate(options[:-1]):
+            if value == "-N":
+                scheme = options[index + 1].split("://", 1)[0].lower()
+                if scheme in {"tcp", "udp"}:
+                    return scheme
+        return protocol_profile(self.protocol).transport
+
+    @property
+    def client_port(self) -> int:
+        options = self.aflnet.cmd[:self.aflnet.cmd.index("--")] if "--" in self.aflnet.cmd else self.aflnet.cmd
+        for index, value in enumerate(options[:-1]):
+            if value == "-l":
+                return int(options[index + 1])
+        return 0
+
     def validate(self) -> None:
         """尽早拒绝会在长流程末端才暴露的无效配置。"""
 
@@ -349,6 +369,10 @@ class ProtoLensConfig:
                 raise ValueError(f"path_calibration.{name} must be finite and positive")
         if not 0 <= self.port <= 65535:
             raise ValueError("port must be between 0 and 65535")
+        if not 0 <= self.client_port <= 65535:
+            raise ValueError("AFLNet -l client port must be between 0 and 65535")
+        if self.network_transport == "udp" and self.transport_harness.use_tls:
+            raise ValueError("transport_harness.use_tls requires TCP; DTLS uses raw UDP records")
         if not self.aflnet.dry_run and self.port == 0:
             raise ValueError("port must be between 1 and 65535 when AFLNet execution is enabled")
         if not self.aflnet.dry_run and not self.aflnet.cmd:

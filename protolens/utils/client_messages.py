@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from protolens.protocols import normalize_protocol
+from protolens.tools.wire_protocols import BINARY_METHODS
+
 
 PROTOCOL_METHODS: dict[str, set[str]] = {
     "ftp": {
@@ -20,6 +23,8 @@ PROTOCOL_METHODS: dict[str, set[str]] = {
     "smtp": {"AUTH", "DATA", "EHLO", "EXPN", "HELO", "HELP", "MAIL", "NOOP", "QUIT", "RCPT", "RSET", "STARTTLS", "VRFY"},
     "http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
     "daap-http": {"CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE"},
+    "sip": {"ACK", "BYE", "CANCEL", "INFO", "INVITE", "MESSAGE", "NOTIFY", "OPTIONS", "PRACK", "PUBLISH", "REFER", "REGISTER", "SUBSCRIBE", "UPDATE"},
+    **BINARY_METHODS,
 }
 EXTENSIBLE_METHOD_PROTOCOLS = {"rtsp"}
 
@@ -120,12 +125,16 @@ def client_seed_message(message: str, protocol: str) -> str | None:
         return None
     lowered = text.lower()
     if lowered.startswith(("raw:", "raw-b64:", "base64:")):
-        return text
-    if _looks_internal(text):
-        return None
+        return str(message).lstrip()
 
-    protocol_key = protocol.lower().replace("_", "-")
+    protocol_key = normalize_protocol(protocol)
     commands = PROTOCOL_METHODS.get(protocol_key)
+    # Full text requests are wire material, not whitespace-separated templates.
+    # Preserve headers, bodies and significant whitespace verbatim.
+    if "\r\n" in message or "\n" in message:
+        first = message.splitlines()[0].split()
+        if first and commands and first[0].upper() in commands:
+            return message
     parts = text.split()
     if len(parts) >= 2 and parts[0].lower().replace("_", "-").rstrip(":") == protocol_key:
         parts = parts[1:]
@@ -133,6 +142,8 @@ def client_seed_message(message: str, protocol: str) -> str | None:
         return None
 
     method = parts[0].upper().rstrip(":,;")
+    if _looks_internal(parts[0]):
+        return None
     if commands is not None and method not in commands and protocol_key not in EXTENSIBLE_METHOD_PROTOCOLS:
         return None
     if (commands is None or method not in commands) and not re.fullmatch(r"[A-Z][A-Z0-9_.-]{1,24}", method):

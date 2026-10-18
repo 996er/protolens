@@ -10,6 +10,8 @@ import json
 
 from protolens.fsm.fsm_model import PlannedStatePath, SeedIntent
 from protolens.utils.client_messages import PROTOCOL_METHODS, client_seed_message
+from protolens.protocols import normalize_protocol, protocol_profile
+from protolens.tools.wire_protocols import encode_binary
 
 
 class CorpusEncoder:
@@ -194,16 +196,31 @@ class CorpusEncoder:
         dictionary_path: Path,
         *,
         preserve_existing: bool = False,
+        protocol: str = "generic",
     ) -> Path:
         dictionary_path.parent.mkdir(parents=True, exist_ok=True)
         tokens: set[str] = set()
         for path in paths:
             for message in path.messages:
-                normalized = client_seed_message(message, "generic")
+                normalized = client_seed_message(message, protocol)
+                if normalized and normalized.lower().startswith(("raw:", "raw-b64:", "base64:")):
+                    # An encoded packet is not a textual dictionary token.
+                    continue
                 head = normalized.split()[0].upper() if normalized and normalized.split() else ""
                 if head:
                     tokens.add(head)
-        tokens.update({"Session:", "CSeq:", "Content-Length:", "Transport:"})
+        key = normalize_protocol(protocol)
+        if key in {"generic", "rtsp"}:
+            tokens.update({"Session:", "CSeq:", "Content-Length:", "Transport:"})
+        elif key in {"http", "daap-http"}:
+            tokens.update({"Host:", "Content-Length:", "Authorization:", "/server-info", "/databases"} if key == "daap-http"
+                          else {"Host:", "Content-Length:", "Authorization:"})
+        elif key == "sip":
+            tokens.update({"Via:", "From:", "To:", "Call-ID:", "CSeq:", "Contact:", "Content-Length:"})
+        elif protocol_profile(key).binary:
+            tokens.clear()
+            # Small real wire prefixes are useful AFL dictionary tokens.
+            tokens.add(_fallback_request(key)[:8].decode("latin-1"))
         lines: list[str] = []
         if preserve_existing and dictionary_path.is_file():
             lines.extend(
@@ -345,6 +362,11 @@ class CorpusEncoder:
         raw = _raw_message_bytes(normalized)
         if raw is not None:
             return raw
+        protocol = normalize_protocol(protocol)
+        if protocol_profile(protocol).binary:
+            return encode_binary(normalized, protocol, sequence)
+        if "\n" in normalized:
+            return normalized.encode("utf-8")
         request = _message_to_request(normalized, protocol, sequence)
         return request.encode("utf-8", errors="replace")
 
@@ -367,13 +389,15 @@ class CorpusEncoder:
             if not encoded:
                 continue
             chunks.append(encoded)
-            request = encoded.decode("utf-8", errors="replace")
+            # Latin-1 gives a one-to-one byte index, including binary and UTF-8.
+            request = encoded.decode("latin-1")
             byte_ranges.extend(_mutation_byte_ranges(request, offset, index, message, mutation_set))
             offset += len(encoded)
         return b"".join(chunks), byte_ranges
 
 
 def _message_to_request(message: str, protocol: str, sequence: int = 1) -> str:
+    protocol = normalize_protocol(protocol)
     raw = _raw_message_bytes(message)
     if raw is not None:
         return raw.decode("utf-8", errors="replace")
@@ -381,6 +405,19 @@ def _message_to_request(message: str, protocol: str, sequence: int = 1) -> str:
     flags = _directives(message)
     directives = _directive_values(message)
     argument = _argument_text(message)
+    if protocol == "sip":
+        target = directives.get("uri") or directives.get("target") or (argument if argument.startswith("sip:") else "sip:127.0.0.1")
+        contact = directives.get("contact", "sip:protolens@127.0.0.1:5061")
+        body = directives.get("body", "")
+        return (
+            f"{method} {target} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-protolens-{sequence};rport\r\n"
+            "Max-Forwards: 70\r\n"
+            "From: <sip:protolens@127.0.0.1>;tag=protolens\r\n"
+            f"To: <{target}>\r\nCall-ID: protolens@127.0.0.1\r\n"
+            f"CSeq: {sequence} {method}\r\nContact: <{contact}>\r\n"
+            f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n{body}"
+        )
     if protocol.lower() == "rtsp":
         target = directives.get("target") or directives.get("uri") or "rtsp://127.0.0.1:8554/protolens"
         if argument and (argument.startswith("rtsp://") or argument.startswith("/")):
@@ -410,7 +447,7 @@ def _message_to_request(message: str, protocol: str, sequence: int = 1) -> str:
     if protocol.lower() == "ftp":
         return _ftp_command(message)
     if protocol.lower() == "smtp":
-        arguments = {"EHLO": "localhost", "MAIL": "FROM:<fuzz@example.com>", "RCPT": "TO:<root@example.com>"}
+        arguments = {"EHLO": "localhost", "HELO": "localhost", "MAIL": "FROM:<fuzz@example.com>", "RCPT": "TO:<root@example.com>"}
         if argument:
             arguments = {**arguments, method: argument}
         if "malformed" in flags:
@@ -489,15 +526,8 @@ def _raw_message_bytes(message: str) -> bytes | None:
 
 
 def _fallback_request(protocol: str) -> bytes:
-    defaults = {
-        "rtsp": "OPTIONS",
-        "ftp": "USER",
-        "smtp": "EHLO",
-        "http": "GET",
-        "daap-http": "GET",
-    }
-    message = defaults.get(protocol.lower(), "PROTOLENS")
-    return _message_to_request(message, protocol).encode("utf-8")
+    profile = protocol_profile(protocol)
+    return CorpusEncoder()._encode_message(profile.fallback or "PROTOLENS", protocol, 1)
 
 
 def _queue_weight(path: PlannedStatePath, mutation_points: list[int]) -> int:
@@ -607,7 +637,7 @@ def _mutation_byte_ranges(
                 "message_index": message_index,
                 "field": "message",
                 "start": base_offset,
-                "end": base_offset + len(request.encode("utf-8", errors="replace")),
+                "end": base_offset + len(request),
                 "reason": "planned mutation point",
             }
         )
@@ -637,7 +667,7 @@ def _mutation_byte_ranges(
                 "message_index": message_index,
                 "field": "malformed_directive",
                 "start": base_offset,
-                "end": base_offset + len(request.encode("utf-8", errors="replace")),
+                "end": base_offset + len(request),
                 "reason": "seed intent requests malformed guard material",
             }
         )
@@ -657,7 +687,10 @@ def _dedupe_ranges(ranges: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _escape(token: str) -> str:
-    return token.replace("\\", "\\\\").replace('"', '\\"')
+    return "".join(
+        "\\\\" if byte == 92 else '\\"' if byte == 34 else chr(byte) if 32 <= byte < 127 else f"\\x{byte:02x}"
+        for byte in token.encode("latin-1", errors="replace")
+    )
 
 
 def _remove_manifest_entries(corpus_dir: Path, manifest_path: Path) -> None:

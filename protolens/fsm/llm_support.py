@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from protolens.protocols import normalize_protocol
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -815,7 +817,7 @@ def normalize_fsm_protocol(fsm: ProtocolFSM, expected: str, *, component: str) -
 
 
 def _protocol_key(value: str) -> str:
-    return "".join(character for character in value.casefold() if character.isalnum())
+    return "".join(character for character in normalize_protocol(value).casefold() if character.isalnum())
 
 
 def validate_divergences(items: Any) -> list[Divergence]:

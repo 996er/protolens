@@ -76,9 +76,9 @@ class AFLNetAdapter:
             seed_manifest = {}
         dictionary_source = seed_intents if seed_intents is not None else paths
         if command_options.dictionary_path:
-            self.encoder.write_dictionary(dictionary_source, dictionary_path, preserve_existing=True)
+            self.encoder.write_dictionary(dictionary_source, dictionary_path, preserve_existing=True, protocol=config.protocol)
         else:
-            self.encoder.write_dictionary(dictionary_source, dictionary_path)
+            self.encoder.write_dictionary(dictionary_source, dictionary_path, protocol=config.protocol)
             notes.append(
                 "aflnet.cmd does not contain -x; "
                 "ProtoLens wrote an audit dictionary that AFLNet will not consume."
