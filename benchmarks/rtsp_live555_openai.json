@@ -45,7 +45,7 @@
       "-m",
       "none",
       "-t",
-      "5000",
+      "1000+",
       "--",
       "/home/ubuntu/experiments/live555/testProgs/testOnDemandRTSPServer",
       "8554"
@@ -104,6 +104,6 @@
     "timeout_seconds": 180,
     "response_format": "json_object",
     "max_tokens": 24000,
-    "retries": 2
+    "retries": 5
   }
 }
