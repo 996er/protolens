@@ -1,0 +1,112 @@
+{
+  "protocol": "smtp",
+  "target_name": "exim-openai",
+  "spec_paths": [
+    "./specs/smtp_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/exim",
+  "entrypoints": [
+    "src/src/exim.c",
+    "src/src/daemon.c",
+    "src/src/smtp_in.c"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/exim/src/build-Linux-x86_64/exim -bd -d -oX 25 -oP /var/lock/exim.pid",
+  "host": "127.0.0.1",
+  "port": 25,
+  "run_dir": "/home/ubuntu/experiments/runs/smtp-exim-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 5000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": null,
+    "env": {},
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-smtp",
+      "-o",
+      "/home/ubuntu/experiments/runs/smtp-exim-openai/output",
+      "-x",
+      "/home/ubuntu/experiments/smtp.dict",
+      "-N",
+      "tcp://127.0.0.1/25",
+      "-P",
+      "SMTP",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-W",
+      "100",
+      "-m",
+      "none",
+      "-t",
+      "5000",
+      "-c",
+      "/home/ubuntu/experiments/clean",
+      "--",
+      "/home/ubuntu/experiments/exim/src/build-Linux-x86_64/exim",
+      "-bd",
+      "-d",
+      "-oX",
+      "25",
+      "-oP",
+      "/var/lock/exim.pid"
+    ]
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative SMTP RFCs including security extensions, updates, and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "connection greeting and EHLO/HELO negotiation",
+      "MAIL FROM, RCPT TO, DATA transaction sequencing and reset",
+      "authentication and STARTTLS when supported",
+      "reply codes, errors, connection termination and supported extensions"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}
