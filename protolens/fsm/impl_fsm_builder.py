@@ -297,6 +297,9 @@ IMPLEMENTATION_ASSEMBLY_SCHEMA: dict[str, Any] = {
 
 # These bounds limit individual model responses, not a graph assembled locally
 # from multiple validated batches (or the union of their original evidence).
+ASSEMBLED_IMPLEMENTATION_SCHEMA = deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA)
+for _field in ("states", "transitions", "uncertainties"):
+    ASSEMBLED_IMPLEMENTATION_SCHEMA["properties"][_field].pop("maxItems", None)
 IMPLEMENTATION_FSM_SCHEMA = deepcopy(FSM_SCHEMA)
 for _field in ("states", "transitions", "terminal_states", "error_states"):
     IMPLEMENTATION_FSM_SCHEMA["properties"][_field].pop("maxItems", None)
@@ -1065,11 +1068,12 @@ class ImplementationFSMBuilder:
                     raise
                 # Never parse or accept a truncated JSON prefix. Change the
                 # request shape after the client's output retry budget expires.
-        assembled, state_repairs = self._assemble_fsm_batches(
+        assembled, state_repairs, reference_repairs = self._assemble_fsm_batches(
             config, payload, batches, evidence_table, on_progress=on_progress,
         )
         validate_result(assembled)
         self._state_declaration_repairs = state_repairs + self._state_declaration_repairs
+        self._state_reference_repairs = reference_repairs + self._state_reference_repairs
         return assembled
 
     @staticmethod
@@ -1099,7 +1103,7 @@ class ImplementationFSMBuilder:
         self, config: ProtoLensConfig, payload: dict[str, Any],
         batches: list[list[dict[str, Any]]], evidence_table: dict[str, dict[str, Any]],
         *, on_progress: Callable[[str], None] | None = None,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         # Decide aliases and roles once using global context. Independent FSMs
         # per batch would disagree on state names and produce multiple entries.
         state_schema = deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA)
@@ -1140,7 +1144,6 @@ class ImplementationFSMBuilder:
             validator=validate_states,
         )
         catalogue["states"], state_repairs = self._coalesce_assembly_states(catalogue["states"])
-        declared = {state["name"] for state in catalogue["states"]}
         batch_schema = {
             "type": "object", "additionalProperties": False,
             "required": ["transitions", "uncertainties"],
@@ -1151,40 +1154,44 @@ class ImplementationFSMBuilder:
         }
         transitions: list[dict[str, Any]] = []
         uncertainties = list(catalogue["uncertainties"])
+        reference_repairs: list[dict[str, Any]] = []
 
         def assemble_batch(batch: list[dict[str, Any]], label: str) -> None:
             if on_progress:
                 on_progress(f"assembling implementation transition batch {label} ({len(batch)} facts)")
+            accepted_candidate: dict[str, Any] | None = None
+            accepted_repairs: list[dict[str, Any]] = []
 
             def validate_batch(result: dict[str, Any]) -> None:
+                nonlocal accepted_candidate, accepted_repairs
                 self._validate_fact_coverage(result, batch)
-                unknown = {
-                    transition[endpoint]
-                    for transition in result["transitions"]
-                    for endpoint in ("source", "target")
-                    if transition[endpoint] not in declared
-                }
-                if unknown:
-                    raise ValueError(f"use exact global state catalogue names; unknown endpoints: {sorted(unknown)!r}")
+                candidate, repairs = self._repair_assembly_state_references(
+                    config, {**catalogue, **result}, batch, evidence_table,
+                )
                 fsm = fsm_from_llm(
-                    self._materialize_assembled_fsm({**catalogue, **result}, batch, evidence_table),
+                    self._materialize_assembled_fsm(candidate, batch, evidence_table),
                     builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA,
                 )
                 normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
                 self._validate_code_evidence(fsm)
+                # Failed candidates must not alter the shared catalogue or audit.
+                # Keep the response shape intact; the recorder retains raw output.
+                result["transitions"] = candidate["transitions"]
+                accepted_candidate, accepted_repairs = candidate, repairs
 
             try:
                 result = self.recorder.call_chat(
-                    system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and use the fixed global state catalogue.",
+                    system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and existing global state identities.",
                     payload={
                         "task": "Assemble only this batch of transitions; do not reproduce state declarations or source evidence.",
                         "protocol": config.protocol,
                         "target_name": config.target_name,
                         "requirements": [
                             "Every supplied fact id must be covered by fact_ids; never reference facts outside this batch.",
-                            "Use unique transition IDs within this response and exact state names from declared_states for both endpoints.",
+                            "Use unique transition IDs within this response. Use exact state names from declared_states when they represent the fact endpoints.",
                             "Deduplicate only equivalent facts; preserve distinct guards, actions and error paths. Do not invent behavior.",
-                            "The global state identities and roles are fixed. Use their descriptions to resolve aliases.",
+                            "Preserve existing state identities and roles. Use their descriptions to resolve supported aliases.",
+                            "If a fact endpoint has no equivalent declared state, retain its exact fact endpoint name; ProtoLens will request a fact-backed declaration separately. Never force it into an unrelated state.",
                             "Keep text concise and return only transitions and uncertainties.",
                         ],
                         "declared_states": catalogue["states"],
@@ -1201,16 +1208,28 @@ class ImplementationFSMBuilder:
                 assemble_batch(batch[:midpoint], f"{label}_a")
                 assemble_batch(batch[midpoint:], f"{label}_b")
                 return
+            assert accepted_candidate is not None
+            # Publish verified additions only after this batch is accepted, so
+            # later batches see them without changing earlier state identities.
+            catalogue["states"] = accepted_candidate["states"]
+            transition_ids: dict[str, str] = {}
             for index, transition in enumerate(result["transitions"], 1):
                 # Stable namespaces avoid collisions between independent model
                 # responses without changing transition semantics or evidence.
-                transitions.append({**transition, "id": f"assembly_{label}_{index}__{transition['id']}"})
+                transition_id = f"assembly_{label}_{index}__{transition['id']}"
+                transition_ids[transition["id"]] = transition_id
+                transitions.append({**transition, "id": transition_id})
+            reference_repairs.extend(
+                {**repair, "batch": label, "original_transition_id": repair["transition_id"],
+                 "transition_id": transition_ids[repair["transition_id"]]}
+                for repair in accepted_repairs
+            )
             uncertainties.extend(result["uncertainties"])
 
         for index, batch in enumerate(batches, 1):
             assemble_batch(batch, str(index))
         return {**catalogue, "transitions": transitions,
-                "uncertainties": list(dict.fromkeys(uncertainties))}, state_repairs
+                "uncertainties": list(dict.fromkeys(uncertainties))}, state_repairs, reference_repairs
 
     def _repair_assembly_state_references(
         self, config: ProtoLensConfig, assembled: dict[str, Any],
@@ -1300,7 +1319,7 @@ class ImplementationFSMBuilder:
 
         def validate_repair(result: dict[str, Any]) -> None:
             candidate, _ = apply_repairs(result)
-            validate_json_schema(candidate, IMPLEMENTATION_ASSEMBLY_SCHEMA)
+            validate_json_schema(candidate, ASSEMBLED_IMPLEMENTATION_SCHEMA)
             self._validate_fact_coverage(candidate, facts)
             fsm = fsm_from_llm(self._materialize_assembled_fsm(candidate, facts, evidence_table),
                                builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA)
@@ -1317,6 +1336,7 @@ class ImplementationFSMBuilder:
                     "Resolve an alias only when the related facts support equivalence with a declared state; do not guess from spelling similarity.",
                     "If a declaration was omitted, new_states may declare only a declarable_missing_state_names entry supported by that endpoint's facts.",
                     "Choose evidence-backed state roles; do not infer terminal or error roles from the name or absent outgoing edges.",
+                    "Preserve existing state declarations and roles; do not add another initial state.",
                     "Cite supporting_fact_ids from the affected transition and explain each choice. Do not invent states or behavior to satisfy validation.",
                 ],
                 "declared_states": assembled["states"],
