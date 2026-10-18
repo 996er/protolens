@@ -20,6 +20,10 @@
     "timeout_ms": 5000,
     "duration_seconds": 0,
     "dry_run": false,
+    "cwd": "/home/ubuntu/experiments/live555/testProgs",
+    "env": {
+      "PWD": "/home/ubuntu/experiments/live555/testProgs"
+    },
     "cmd": [
       "/home/ubuntu/protolens/afl-fuzz",
       "-d",

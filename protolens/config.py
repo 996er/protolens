@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 import json
 import math
+import os
 import shlex
 
 
@@ -21,6 +22,17 @@ class AFLNetConfig:
     dry_run: bool = True
     cmd: list[str] = field(default_factory=list)
     extra_args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    cwd: str | None = None
+
+    def working_directory(self, source_root: Path) -> Path:
+        return Path(self.cwd) if self.cwd is not None else source_root
+
+    def execution_env(self, source_root: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env["PWD"] = str(self.working_directory(source_root).resolve())
+        env.update(_parse_environment(self.env))
+        return env
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None, base_dir: Path | None = None) -> "AFLNetConfig":
@@ -30,6 +42,11 @@ class AFLNetConfig:
         if base_dir is not None and not binary_path.is_absolute() and binary_path.parent != Path("."):
             binary = str((base_dir / binary_path).resolve())
         cmd = _parse_cmd(data.get("cmd", []))
+        cwd = data.get("cwd")
+        if cwd is not None:
+            if not isinstance(cwd, str) or not cwd.strip() or "\x00" in cwd:
+                raise ValueError("aflnet.cwd must be a non-empty path string or null")
+            cwd = str(_resolve_path(base_dir or Path.cwd(), cwd))
         if cmd and base_dir is not None:
             first = Path(cmd[0]).expanduser()
             if not first.is_absolute() and first.parent != Path("."):
@@ -41,6 +58,8 @@ class AFLNetConfig:
             dry_run=bool(data.get("dry_run", True)),
             cmd=cmd,
             extra_args=[str(item) for item in data.get("extra_args", [])],
+            env=_parse_environment(data.get("env", {})),
+            cwd=cwd,
         )
 
 
@@ -338,6 +357,7 @@ class ProtoLensConfig:
             raise ValueError("aflnet.timeout_ms must be non-negative")
         if self.aflnet.duration_seconds < 0:
             raise ValueError("aflnet.duration_seconds must be non-negative")
+        _parse_environment(self.aflnet.env)
         if self.monitor_agent.interval_seconds <= 0:
             raise ValueError("monitor_agent.interval_seconds must be positive")
         if self.monitor_agent.stagnation_seconds < 0:
@@ -416,6 +436,17 @@ def _resolve_path(base_dir: Path, value: Any) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
+
+
+def _parse_environment(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("aflnet.env must be a JSON object of string names and values")
+    for name, content in value.items():
+        if not isinstance(name, str) or not name or "=" in name or "\x00" in name:
+            raise ValueError("aflnet.env names must be non-empty strings without '=' or NUL")
+        if not isinstance(content, str) or "\x00" in content:
+            raise ValueError(f"aflnet.env[{name!r}] must be a string without NUL")
+    return dict(value)
 
 
 def _parse_cmd(value: Any) -> list[str]:

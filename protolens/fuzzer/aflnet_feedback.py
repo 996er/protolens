@@ -5,7 +5,6 @@ from tempfile import TemporaryDirectory
 import hashlib
 import os
 import re
-import shutil
 import signal
 import subprocess
 import time
@@ -13,6 +12,7 @@ from typing import Any
 
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import Conflict, FuzzResult, PlannedStatePath
+from protolens.fuzzer.aflnet_adapter import _resolve_binary
 
 PLOT_FIELDS = [
     "unix_time",
@@ -361,7 +361,8 @@ def _run_replay(
     try:
         target = subprocess.Popen(
             target_command,
-            cwd=str(config.source_root),
+            cwd=str(config.aflnet.working_directory(config.source_root)),
+            env=config.aflnet.execution_env(config.source_root),
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -377,7 +378,8 @@ def _run_replay(
         ]
         replay = subprocess.run(
             replay_command,
-            cwd=str(config.source_root),
+            cwd=str(config.aflnet.working_directory(config.source_root)),
+            env=config.aflnet.execution_env(config.source_root),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=max(5, config.aflnet.timeout_ms // 1000 + 5),
@@ -987,14 +989,10 @@ def _resolve_replay_binary(config: ProtoLensConfig) -> str | None:
     if aflnet_path.name == "afl-fuzz":
         names.insert(0, str(aflnet_path.with_name("aflnet-replay")))
     for name in names:
-        found = shutil.which(name)
+        found = _resolve_binary(name, config.aflnet.working_directory(config.source_root),
+                                env=config.aflnet.execution_env(config.source_root))
         if found:
-            return str(Path(found).resolve())
-        path = Path(name).expanduser()
-        candidates = [path] if path.is_absolute() else [Path.cwd() / path, config.source_root / path]
-        for candidate in candidates:
-            if candidate.is_file() and candidate.stat().st_mode & 0o111:
-                return str(candidate.resolve())
+            return found
     return None
 
 

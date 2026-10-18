@@ -81,7 +81,8 @@ class PathCalibrator:
             if _port_is_listening(config.host, config.port):
                 result["reason"] = "target port already occupied; calibration skipped"
                 return result
-            target = subprocess.Popen(command, cwd=config.source_root, start_new_session=True,
+            target = subprocess.Popen(command, cwd=config.aflnet.working_directory(config.source_root),
+                                      env=config.aflnet.execution_env(config.source_root), start_new_session=True,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             result["target_started"] = True
             deadline = time.monotonic() + settings.startup_seconds

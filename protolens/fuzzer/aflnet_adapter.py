@@ -32,7 +32,8 @@ class AFLNetAdapter:
         seed_intents: list[SeedIntent] | None = None,
     ) -> FuzzResult:
         command = self._build_command(config)
-        command_options = _AFLNetCommandOptions.from_command(command, config.source_root)
+        working_directory = config.aflnet.working_directory(config.source_root)
+        command_options = _AFLNetCommandOptions.from_command(command, working_directory)
 
         notes: list[str] = []
         if command_options.errors and not config.aflnet.dry_run:
@@ -96,7 +97,7 @@ class AFLNetAdapter:
             import_dir.mkdir(parents=True, exist_ok=True)
             (import_dir / ".processed").mkdir(exist_ok=True)
             notes.append(f"ProtoLens monitor import dir: {import_dir}")
-        binary = _resolve_binary(command[0], config.source_root)
+        binary = _resolve_binary(command[0], working_directory, env=config.aflnet.execution_env(config.source_root))
         if binary:
             command[0] = binary
         notes.insert(0, f"AFLNet queue schedule: {schedule_tsv}")
@@ -152,7 +153,7 @@ class AFLNetAdapter:
         process: subprocess.Popen[bytes] | None = None
         started_at = _utc_now()
         try:
-            env = os.environ.copy()
+            env = config.aflnet.execution_env(config.source_root)
             env["AFLNET_PROTO_SCHEDULE"] = _schedule_path_from_notes(prepared.notes)
             import_dir = _monitor_import_dir(config)
             if config.monitor_agent.enabled:
@@ -161,7 +162,7 @@ class AFLNetAdapter:
                 env["AFLNET_PROTOLENS_IMPORT_DIR"] = str(import_dir)
             process = subprocess.Popen(
                 command,
-                cwd=str(config.source_root),
+                cwd=str(config.aflnet.working_directory(config.source_root)),
                 start_new_session=True,
                 env=env,
             )
@@ -334,12 +335,19 @@ def _resolve_command_path(value: str, cwd: Path) -> Path:
     return path.resolve(strict=False)
 
 
-def _resolve_binary(value: str, source_root: Path) -> str | None:
-    direct = shutil.which(value)
+def _resolve_binary(value: str, source_root: Path, *, env: dict[str, str] | None = None) -> str | None:
+    search_path = None
+    if env is not None:
+        # Relative PATH entries are interpreted by the child in its own cwd.
+        search_path = os.pathsep.join(
+            str(Path(part) if Path(part).is_absolute() else source_root / part)
+            for part in env.get("PATH", os.defpath).split(os.pathsep)
+        )
+    direct = shutil.which(value, path=search_path) if Path(value).parent == Path(".") and "/" not in value else None
     if direct:
         return str(Path(direct).resolve())
     path = Path(value).expanduser()
-    candidates = [path] if path.is_absolute() else [Path.cwd() / path, source_root / path]
+    candidates = [path] if path.is_absolute() else [source_root / path]
     for candidate in candidates:
         if candidate.is_file() and candidate.stat().st_mode & 0o111:
             return str(candidate.resolve())

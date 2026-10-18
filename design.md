@@ -1141,6 +1141,18 @@ ProtoLens Result Analyzer
 
 当前仓库根目录的 `afl-fuzz.c` 已加入基于 `AFLNET_PROTO_SCHEDULE` 的 advisory power score 权重调整，以及基于 `AFLNET_PROTOLENS_IMPORT_DIR` 的运行时 seed 导入；未设置这些环境变量时行为保持 AFLNet 原有调度。
 
+`aflnet.env` 可配置启动前注入的环境变量，键和值必须是字符串。子进程继承 ProtoLens 的环境，再用此对象覆盖同名变量；值按字面传递，不执行 `export`、`source` 或 `$VAR` 展开。`aflnet.cwd` 指定实际工作目录，省略或为 null 时仍使用 source_root；相对路径以 benchmark JSON 所在目录为基准。默认 PWD 与实际工作目录一致，显式 env.PWD 可覆盖它，但单独设置 PWD 不会切换目录。例如 Live555：
+
+```json
+"aflnet": {
+  "cwd": "/home/ubuntu/experiments/live555/testProgs",
+  "env": {"PWD": "/home/ubuntu/experiments/live555/testProgs"},
+  "cmd": ["/home/ubuntu/protolens/afl-fuzz", "其余原有参数"]
+}
+```
+
+cmd 仍以参数数组直接启动。AFLNet、其派生的目标进程，以及路径校准和崩溃回放使用上述环境和工作目录；build_command 仍在 source_root 下构建。相对 corpus、output、dictionary 路径按实际工作目录解释，AFLNet 可执行文件查找使用配置覆盖后的 PATH。程序生成的 AFLNET_PROTO_SCHEDULE 和启用监控时的 AFLNET_PROTOLENS_IMPORT_DIR 在用户环境之后设置，以指向本轮实际工件。
+
 ## CLI 设计
 
 ### Python 安装与 LLM SDK
