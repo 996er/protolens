@@ -262,6 +262,8 @@ ImplementationFSMBuilder.build(config)
 
 空白或无状态语义的 chunk 可以返回空 TransitionFact 数组，全部 chunk 合并后不允许为空。超出 `max_file_bytes` 的源码会明确报错并终止，不会跳过后伪称已分析。`implementation_evidence_table.json` 是结构化 FSM 工件中源码摘录的唯一存储位置；`implementation_transition_facts.json` 和 `impl_fsm.json` 只保存 `evidence_ids`。`merge-fsm` 在内存中解析引用后再调用 FSMMerger。自动恢复、丢弃和重试过的证据只记录位置和摘要，不在 FSM metadata 重复保存源码原文；LLM 原始结果及 rejected 状态保留在 `findings/fsm_implementation.llm.jsonl` 供调用审计。
 
+源码块响应在通用扩展字段过滤之前执行格式规范化，主请求及同块重试共用该入口：`facts` / `transitions` 映射为 `transition_facts`，已知 `result` / `data` / `output` / `implementation` / `fsm` 对象包装中的字段提升到结果根节点；重复字段冲突时拒绝选择其一。单个事实和以事实 ID 为键的对象可无损转换为数组，键与事实内 ID 冲突时仍拒绝。遗漏或 null 的 uncertainties 只记作未提供说明并保存审计，不推断分析确定性；结构化说明保留为 JSON 文本。transition_facts 和 analyzed_files 缺失或 null 均不能补造为空或复制请求清单来伪称已分析，仍要求模型在原块内补齐，并通过完整文件覆盖和原文证据校验。完整结构错误路径写入对话日志，重试反馈按大小限制返回诊断；校验重试统一由源码块外层循环计数，终止错误显示实际块校验尝试次数，不再只显示内层单次调用的 `after 1 attempt(s)`。传输异常仍由客户端处理，已经验证的其他块缓存可继续复用。
+
 内部的分块恢复缓存会保存完整且已验证的块结果（含源码摘录），以便在最终 EvidenceTable 尚未生成时恢复；它不是对外 FSM 工件。新的分块缓存仅能恢复该版本写出的检查点，旧运行没有检查点的源码块仍需分析一次。
 
 #### 4.3 FSMMerger
