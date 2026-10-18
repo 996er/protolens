@@ -250,7 +250,8 @@ ImplementationFSMBuilder.build(config)
   -> 省略号/改写/错误路径证据只对失败的 transition 发起修复：模型选择当前 chunk 的源码片段和局部行号范围，本地直接复制原文并记录真实字符位置，保留已验证事实
   -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
-  -> 所有 compact TransitionFact 交给 LLM assembler，输出状态、边和 fact_ids，不传源码摘录；不合格输出在配置预算内重试
+  -> 小规模 compact TransitionFact 一次组装；大规模先用全部 facts 统一状态定义，再按最多 64 条及序列化字节预算分批生成边和 fact_ids，不传源码摘录
+  -> 单次完整组装耗尽输出预算时切换为分批组装；转移批次因 max_output_tokens 截断时二分重试，单条仍失败则明确终止，不接受截断结果；结构或语义不合格输出仍使用配置重试预算
   -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
   -> 同名且角色属性一致的重复状态声明在计数和图校验前合并，保留所有不同描述并取最低置信度；不改动边或推断名称别名。角色冲突列出名称、声明位置和冲突字段后重试；成功的合并记录在 metadata.state_declaration_repairs，原始响应保留在对话日志
   -> 未声明的边端点集中发起一次定向 LLM 修复：别名只能选择已声明名称；新增声明只能使用相关 fact 同侧端点中已经出现的缺失名称。每项修复须引用该边的支持事实并解释依据；本地仅应用端点修改与受支持的声明，保留其余边属性和事实引用，重新校验完整 FSM，记录 metadata.state_reference_repairs。每个组装候选最多一次定向修复，不合格则使用原有组装重试预算
@@ -970,7 +971,7 @@ class Conflict:
 1. 本地遍历、读取、分块源码，不执行正则、AST 或启发式协议语义抽取。
 2. LLM 对每个源码 chunk 分析网络入口、parser、state variable、dispatch、guard、side effect、error return，只返回 TransitionFact。
 3. Builder 验证证据原文后建立去重 EvidenceTable，facts 和后续 assembler 只传递 evidence ID。
-4. 所有 compact facts 进入一次 LLM FSM assembler，处理跨文件调用、状态别名并返回 fact 覆盖映射。状态角色使用声明内的布尔属性，由本地转换为公共 FSM 的状态引用字段；边端点仍须精确匹配声明名称。该组装格式变更不影响已验证的源码分块缓存。
+4. 小规模 compact facts 一次组装；大规模先让 LLM 基于全部 facts 统一状态名称、别名及角色，再按最多 64 条及序列化字节预算分批组装转移。完整组装因输出预算截断时也切换为此流程，转移批次截断则递归二分；其他错误仍明确报告。每批共享固定的状态定义，校验 fact 覆盖、端点和源码证据，本地为边 ID 添加批次前缀并合并完整图；单次模型响应的数量上限不限制本地合并后的图和证据总数。状态角色由声明内的布尔属性转换为公共 FSM 引用。该变更不影响已验证的源码分块缓存。
 5. Builder 验证每个 fact 都被覆盖，并验证每条最终实现边至少有一段可在项目源码中精确找到的证据原文。
 6. 输出 `impl_fsm.json`、`implementation_transition_facts.json`、`implementation_evidence_table.json`、source manifest 和对话审计文件。
 
@@ -1498,7 +1499,7 @@ FSM 构建注意事项：`spec_paths` 可以为空，旧配置中的值只作为
 | 风险 | 影响 | 缓解 |
 |------|------|------|
 | LLM 构建 FSM 不稳定 | 分歧误报或漏边 | strict Schema、权威域名、源码原文校验、transition 覆盖映射、完整对话审计 |
-| 源码分块导致跨文件语义丢失 | impl FSM 缺边 | entrypoint 优先、TransitionFact 证据化、一次全局 assembler、fact 覆盖校验、AFLNet 动态反馈 |
+| 源码分块导致跨文件语义丢失 | impl FSM 缺边 | entrypoint 优先、TransitionFact 证据化、全局状态定义与分批转移组装、fact 覆盖校验、AFLNet 动态反馈 |
 | agent 输出泛泛而谈 | fuzzing 目标不可执行 | 强制输出 state、transition、precondition、test strategy |
 | 路径不可达 | fuzzer 浪费时间 | PathPlanner 只生成候选，PathCalibrator 用真实 socket 响应校准，失败候选保留证据并降级选择 |
 | AFLNet 状态编号和 FSM 状态难对应 | 结果难解释 | 使用响应签名、状态名、路径消息共同映射 |

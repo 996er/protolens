@@ -14,14 +14,16 @@ from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
+    FSM_SCHEMA,
     LLMConversationRecorder,
     LLMValidationError,
     fsm_from_llm,
     normalize_fsm_protocol,
+    protocol_label_matches,
     validate_json_schema,
 )
 from protolens.fsm.fsm_model import stable_id
-from protolens.utils.llm_client import LLMClient
+from protolens.utils.llm_client import IncompleteLLMResponse, LLMClient
 from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.stage_checkpoints import stable_fingerprint
 from protolens.utils.json_schema import FieldPolicy, collect_schema_issues, normalize_schema_fields
@@ -293,6 +295,14 @@ IMPLEMENTATION_ASSEMBLY_SCHEMA: dict[str, Any] = {
     },
 }
 
+# These bounds limit individual model responses, not a graph assembled locally
+# from multiple validated batches (or the union of their original evidence).
+IMPLEMENTATION_FSM_SCHEMA = deepcopy(FSM_SCHEMA)
+for _field in ("states", "transitions", "terminal_states", "error_states"):
+    IMPLEMENTATION_FSM_SCHEMA["properties"][_field].pop("maxItems", None)
+for _field in ("states", "transitions"):
+    IMPLEMENTATION_FSM_SCHEMA["properties"][_field]["items"]["properties"]["evidence"].pop("maxItems", None)
+
 
 class ImplementationFSMBuilder:
     """Recover implementation state semantics through LLM source analysis only."""
@@ -413,11 +423,12 @@ class ImplementationFSMBuilder:
         }
         if on_progress:
             on_progress(f"assembling implementation FSM from {len(facts)} verified transition facts")
-        assembled = self._assemble_fsm(config, facts, evidence_table)
+        assembled = self._assemble_fsm(config, facts, evidence_table, on_progress=on_progress)
         materialized = self._materialize_assembled_fsm(assembled, facts, evidence_table)
         fsm = fsm_from_llm(
             materialized,
             builder="LLMImplementationFSMBuilder",
+            schema=IMPLEMENTATION_FSM_SCHEMA,
             metadata={
                 "source_root": str(config.source_root),
                 "entrypoints": config.entrypoints,
@@ -992,6 +1003,7 @@ class ImplementationFSMBuilder:
     def _assemble_fsm(
         self, config: ProtoLensConfig, facts: list[dict[str, Any]],
         evidence_table: dict[str, dict[str, Any]],
+        *, on_progress: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "task": "Assemble one coherent implementation FSM from compact transition facts.",
@@ -1025,6 +1037,7 @@ class ImplementationFSMBuilder:
             fsm = fsm_from_llm(
                 self._materialize_assembled_fsm(candidate, facts, evidence_table),
                 builder="LLMImplementationFSMBuilder",
+                schema=IMPLEMENTATION_FSM_SCHEMA,
             )
             normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
             self._validate_code_evidence(fsm)
@@ -1034,16 +1047,170 @@ class ImplementationFSMBuilder:
             self._state_declaration_repairs = repairs
             self._state_reference_repairs = reference_repairs
 
-        return self.recorder.call_chat(
-            system=(
-                "You are ProtoLens ImplementationFSM assembler. Build states and transitions only from the "
-                "supplied compact facts. Evidence text is managed by ProtoLens and must not be reproduced."
-            ),
-            payload=payload,
-            schema=IMPLEMENTATION_ASSEMBLY_SCHEMA,
-            schema_name="protolens_impl_fsm_assemble",
-            validator=validate_result,
+        batches = self._assembly_batches(facts)
+        if len(batches) == 1:
+            try:
+                return self.recorder.call_chat(
+                    system=(
+                        "You are ProtoLens ImplementationFSM assembler. Build states and transitions only from the "
+                        "supplied compact facts. Evidence text is managed by ProtoLens and must not be reproduced."
+                    ),
+                    payload=payload,
+                    schema=IMPLEMENTATION_ASSEMBLY_SCHEMA,
+                    schema_name="protolens_impl_fsm_assemble",
+                    validator=validate_result,
+                )
+            except IncompleteLLMResponse as exc:
+                if not self._assembly_output_exhausted(exc):
+                    raise
+                # Never parse or accept a truncated JSON prefix. Change the
+                # request shape after the client's output retry budget expires.
+        assembled, state_repairs = self._assemble_fsm_batches(
+            config, payload, batches, evidence_table, on_progress=on_progress,
         )
+        validate_result(assembled)
+        self._state_declaration_repairs = state_repairs + self._state_declaration_repairs
+        return assembled
+
+    @staticmethod
+    def _assembly_output_exhausted(error: IncompleteLLMResponse) -> bool:
+        details = error.raw.get("incomplete_details")
+        return isinstance(details, dict) and details.get("reason") == "max_output_tokens"
+
+    def _assembly_batches(self, facts: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        # Bound both record count and serialized size; a few verbose facts can
+        # otherwise require as much output as hundreds of short ones.
+        byte_limit = min(48000, max(4000, getattr(self.recorder.llm_client, "max_tokens", 24000) * 2))
+        batches: list[list[dict[str, Any]]] = []
+        batch: list[dict[str, Any]] = []
+        size = 0
+        for fact in facts:
+            fact_size = len(json.dumps(fact, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if batch and (len(batch) >= 64 or size + fact_size > byte_limit):
+                batches.append(batch)
+                batch, size = [], 0
+            batch.append(fact)
+            size += fact_size
+        if batch:
+            batches.append(batch)
+        return batches
+
+    def _assemble_fsm_batches(
+        self, config: ProtoLensConfig, payload: dict[str, Any],
+        batches: list[list[dict[str, Any]]], evidence_table: dict[str, dict[str, Any]],
+        *, on_progress: Callable[[str], None] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        # Decide aliases and roles once using global context. Independent FSMs
+        # per batch would disagree on state names and produce multiple entries.
+        state_schema = deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA)
+        state_schema["required"].remove("transitions")
+        del state_schema["properties"]["transitions"]
+        state_schema["properties"]["states"]["items"]["properties"]["description"]["maxLength"] = 400
+
+        def validate_states(result: dict[str, Any]) -> None:
+            if not protocol_label_matches(config.protocol, result["protocol"]):
+                raise ValueError(f"state catalogue protocol must match {config.protocol!r}")
+            states, _ = self._coalesce_assembly_states(result["states"])
+            if any(state["name"] != state["name"].strip() for state in states):
+                raise ValueError("state names must not have leading or trailing whitespace")
+            if sum(state["is_initial"] for state in states) != 1:
+                raise ValueError("declare exactly one evidence-backed initial state")
+
+        if on_progress:
+            on_progress(f"assembling global implementation state catalogue for {len(batches)} transition batches")
+        catalogue = self.recorder.call_chat(
+            system="You are ProtoLens ImplementationFSM state assembler. Use the complete facts to resolve state identities and roles.",
+            payload={
+                **payload,
+                "task": "Declare the global state catalogue only. Transitions will be assembled in separate bounded batches.",
+                "requirements": [
+                    "Return protocol, version, states and uncertainties only; do not reproduce transitions or fact ID lists.",
+                    "Resolve aliases only when the full transition semantics support equivalence; declare every state needed by the facts.",
+                    "Declare unique state names and exactly one is_initial=true. All roles must be supported by the facts.",
+                    "Do not infer terminal status from absent outgoing edges or error status from the name.",
+                    "Use concise descriptions (at most 400 characters) that explain identity and any supported aliases.",
+                ],
+                "transition_facts": [
+                    {key: value for key, value in fact.items() if key not in {"model_id", "evidence_ids"}}
+                    for fact in payload["transition_facts"]
+                ],
+            },
+            schema=state_schema,
+            schema_name="protolens_impl_fsm_states",
+            validator=validate_states,
+        )
+        catalogue["states"], state_repairs = self._coalesce_assembly_states(catalogue["states"])
+        declared = {state["name"] for state in catalogue["states"]}
+        batch_schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["transitions", "uncertainties"],
+            "properties": {
+                key: deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA["properties"][key])
+                for key in ("transitions", "uncertainties")
+            },
+        }
+        transitions: list[dict[str, Any]] = []
+        uncertainties = list(catalogue["uncertainties"])
+
+        def assemble_batch(batch: list[dict[str, Any]], label: str) -> None:
+            if on_progress:
+                on_progress(f"assembling implementation transition batch {label} ({len(batch)} facts)")
+
+            def validate_batch(result: dict[str, Any]) -> None:
+                self._validate_fact_coverage(result, batch)
+                unknown = {
+                    transition[endpoint]
+                    for transition in result["transitions"]
+                    for endpoint in ("source", "target")
+                    if transition[endpoint] not in declared
+                }
+                if unknown:
+                    raise ValueError(f"use exact global state catalogue names; unknown endpoints: {sorted(unknown)!r}")
+                fsm = fsm_from_llm(
+                    self._materialize_assembled_fsm({**catalogue, **result}, batch, evidence_table),
+                    builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA,
+                )
+                normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
+                self._validate_code_evidence(fsm)
+
+            try:
+                result = self.recorder.call_chat(
+                    system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and use the fixed global state catalogue.",
+                    payload={
+                        "task": "Assemble only this batch of transitions; do not reproduce state declarations or source evidence.",
+                        "protocol": config.protocol,
+                        "target_name": config.target_name,
+                        "requirements": [
+                            "Every supplied fact id must be covered by fact_ids; never reference facts outside this batch.",
+                            "Use unique transition IDs within this response and exact state names from declared_states for both endpoints.",
+                            "Deduplicate only equivalent facts; preserve distinct guards, actions and error paths. Do not invent behavior.",
+                            "The global state identities and roles are fixed. Use their descriptions to resolve aliases.",
+                            "Keep text concise and return only transitions and uncertainties.",
+                        ],
+                        "declared_states": catalogue["states"],
+                        "transition_facts": batch,
+                    },
+                    schema=batch_schema,
+                    schema_name=f"protolens_impl_fsm_transitions_{label}",
+                    validator=validate_batch,
+                )
+            except IncompleteLLMResponse as exc:
+                if not self._assembly_output_exhausted(exc) or len(batch) <= 1:
+                    raise
+                midpoint = len(batch) // 2
+                assemble_batch(batch[:midpoint], f"{label}_a")
+                assemble_batch(batch[midpoint:], f"{label}_b")
+                return
+            for index, transition in enumerate(result["transitions"], 1):
+                # Stable namespaces avoid collisions between independent model
+                # responses without changing transition semantics or evidence.
+                transitions.append({**transition, "id": f"assembly_{label}_{index}__{transition['id']}"})
+            uncertainties.extend(result["uncertainties"])
+
+        for index, batch in enumerate(batches, 1):
+            assemble_batch(batch, str(index))
+        return {**catalogue, "transitions": transitions,
+                "uncertainties": list(dict.fromkeys(uncertainties))}, state_repairs
 
     def _repair_assembly_state_references(
         self, config: ProtoLensConfig, assembled: dict[str, Any],
@@ -1136,7 +1303,7 @@ class ImplementationFSMBuilder:
             validate_json_schema(candidate, IMPLEMENTATION_ASSEMBLY_SCHEMA)
             self._validate_fact_coverage(candidate, facts)
             fsm = fsm_from_llm(self._materialize_assembled_fsm(candidate, facts, evidence_table),
-                               builder="LLMImplementationFSMBuilder")
+                               builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA)
             normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
             self._validate_code_evidence(fsm)
 
