@@ -1,0 +1,17 @@
+SSH minimal state model for ProtoLens.
+
+
+TRANSITION: START -- IDENTIFICATION -> VERSION_SENT ; action=send client version
+TRANSITION: VERSION_SENT -- SERVER_IDENTIFICATION [compatible version] -> VERSION_EXCHANGED ; action=record peer version
+TRANSITION: VERSION_EXCHANGED -- KEXINIT -> KEX_PENDING ; action=offer algorithms
+TRANSITION: KEX_PENDING -- SERVER_KEXINIT [compatible algorithms] -> KEY_EXCHANGE ; action=select algorithms
+TRANSITION: KEY_EXCHANGE -- KEY_EXCHANGE_COMPLETE [host key and exchange validated] -> KEYS_READY ; action=derive keys
+TRANSITION: KEYS_READY -- NEWKEYS -> WAIT_PEER_KEYS ; action=activate outbound keys
+TRANSITION: WAIT_PEER_KEYS -- SERVER_NEWKEYS -> SECURE ; action=activate inbound keys
+TRANSITION: SECURE -- SERVICE_REQUEST [ssh-userauth] -> SERVICE_PENDING ; action=request authentication service
+TRANSITION: SERVICE_PENDING -- SERVER_SERVICE_ACCEPT -> AUTH_READY ; action=begin authentication
+TRANSITION: AUTH_READY -- USERAUTH_REQUEST -> AUTH_PENDING ; action=submit authentication
+TRANSITION: AUTH_PENDING -- SERVER_USERAUTH_FAILURE -> AUTH_READY ; action=record allowed methods
+TRANSITION: AUTH_PENDING -- SERVER_USERAUTH_SUCCESS -> AUTHENTICATED ; action=permit connection service
+TRANSITION: AUTHENTICATED -- CHANNEL_OPEN [authorized session channel] -> CHANNEL_PENDING ; action=request channel
+TRANSITION: CHANNEL_PENDING -- SERVER_CHANNEL_OPEN_CONFIRMATION -> CHANNEL_OPEN ; action=record channel identifiers

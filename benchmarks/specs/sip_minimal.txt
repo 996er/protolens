@@ -1,0 +1,16 @@
+SIP minimal state model for ProtoLens.
+
+TRANSITION: START -- OPTIONS -> OPTIONS_PENDING ; action=query capabilities
+TRANSITION: OPTIONS_PENDING -- SERVER_FINAL [matching response] -> START ; action=finish OPTIONS transaction
+TRANSITION: START -- REGISTER -> REGISTER_PENDING ; action=request registration
+TRANSITION: REGISTER_PENDING -- SERVER_2XX [matching response] -> START ; action=record registration lifetime
+TRANSITION: REGISTER_PENDING -- SERVER_CHALLENGE [401 or 407] -> AUTH_REQUIRED ; action=record challenge
+TRANSITION: AUTH_REQUIRED -- REGISTER [valid authorization and new transaction] -> REGISTER_PENDING ; action=retry registration
+TRANSITION: START -- INVITE -> INVITE_PENDING ; action=initiate call
+TRANSITION: INVITE_PENDING -- SERVER_1XX [matching response] -> INVITE_PENDING ; action=record progress
+TRANSITION: INVITE_PENDING -- SERVER_2XX [matching response] -> ACK_REQUIRED ; action=record dialog identifiers
+TRANSITION: ACK_REQUIRED -- ACK [matching dialog] -> ESTABLISHED ; action=acknowledge acceptance
+TRANSITION: INVITE_PENDING -- SERVER_FAILURE [300 through 699] -> FAILURE_ACK ; action=record rejection
+TRANSITION: FAILURE_ACK -- ACK [matching transaction] -> START ; action=acknowledge failure
+TRANSITION: ESTABLISHED -- BYE [matching dialog] -> BYE_PENDING ; action=request termination
+TRANSITION: BYE_PENDING -- SERVER_2XX [matching response] -> CLOSED ; action=release dialog

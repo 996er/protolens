@@ -1,0 +1,13 @@
+DTLS minimal state model for ProtoLens.
+
+
+TRANSITION: START -- CLIENT_HELLO -> WAIT_SERVER ; action=send initial handshake
+TRANSITION: WAIT_SERVER -- SERVER_HELLO_VERIFY_REQUEST -> COOKIE_REQUIRED ; action=retain peer cookie
+TRANSITION: COOKIE_REQUIRED -- CLIENT_HELLO [valid returned cookie] -> WAIT_SERVER ; action=repeat hello with cookie
+TRANSITION: WAIT_SERVER -- SERVER_FLIGHT [complete valid server handshake flight] -> CLIENT_FLIGHT ; action=process negotiated parameters
+TRANSITION: CLIENT_FLIGHT -- CLIENT_HANDSHAKE_FLIGHT [valid key exchange and protected Finished] -> WAIT_FINISHED ; action=send client flight
+TRANSITION: WAIT_FINISHED -- HANDSHAKE_COMPLETE [peer Finished verified] -> ESTABLISHED ; action=activate established session
+TRANSITION: WAIT_SERVER -- TIMER [retry budget remains] -> RETRANSMIT ; action=schedule previous flight
+TRANSITION: RETRANSMIT -- CLIENT_HELLO [preserved flight context] -> WAIT_SERVER ; action=retransmit hello
+TRANSITION: ESTABLISHED -- APPLICATION_DATA [valid epoch sequence and protection] -> ESTABLISHED ; action=process application datagram
+TRANSITION: ESTABLISHED -- CLOSE_NOTIFY [valid record protection] -> CLOSED ; action=close association

@@ -1,0 +1,13 @@
+DNS minimal state model for ProtoLens.
+
+
+TRANSITION: START -- QUERY test.com A [valid question] -> WAITING ; action=send query and remember transaction ID
+TRANSITION: START -- QUERY test.com AAAA [valid question] -> WAITING ; action=send IPv6-address query
+TRANSITION: WAITING -- SERVER_ANSWER [matching transaction and RCODE zero and not truncated] -> COMPLETE ; action=consume response
+TRANSITION: WAITING -- SERVER_ERROR [matching transaction and nonzero RCODE] -> FAILED ; action=record DNS error
+TRANSITION: WAITING -- SERVER_TRUNCATED [matching transaction and TC set] -> TCP_REQUIRED ; action=retry over TCP when supported
+TRANSITION: WAITING -- SERVER_UNRELATED [transaction or question mismatch] -> WAITING ; action=ignore unrelated response
+TRANSITION: WAITING -- TIMEOUT [retry budget remains] -> RETRY ; action=schedule retransmission
+TRANSITION: RETRY -- QUERY test.com A [same outstanding question] -> WAITING ; action=retransmit query
+TRANSITION: COMPLETE -- QUERY test.com A -> WAITING ; action=start independent transaction
+TRANSITION: FAILED -- QUERY test.com A -> WAITING ; action=start independent transaction

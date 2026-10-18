@@ -1,0 +1,17 @@
+SMTP minimal state model for ProtoLens.
+
+
+TRANSITION: START -- SERVER_GREETING [220 received] -> CONNECTED ; action=begin SMTP session
+TRANSITION: CONNECTED -- EHLO [250 received] -> READY ; action=record extensions
+TRANSITION: CONNECTED -- HELO [250 received] -> READY ; action=use basic SMTP
+TRANSITION: READY -- MAIL [sender accepted] -> MAIL_STARTED ; action=initialize envelope
+TRANSITION: MAIL_STARTED -- RCPT [recipient accepted] -> RECIPIENTS ; action=add recipient
+TRANSITION: RECIPIENTS -- RCPT [recipient accepted] -> RECIPIENTS ; action=add recipient
+TRANSITION: RECIPIENTS -- DATA [354 received] -> DATA_INPUT ; action=accept message body
+TRANSITION: DATA_INPUT -- DATA_BODY [terminator received and message accepted] -> READY ; action=complete transaction
+TRANSITION: MAIL_STARTED -- RSET -> READY ; action=discard envelope
+TRANSITION: RECIPIENTS -- RSET -> READY ; action=discard envelope
+TRANSITION: READY -- NOOP -> READY ; action=keep session
+TRANSITION: READY -- STARTTLS [advertised and 220 received] -> TLS_NEGOTIATION ; action=begin TLS
+TRANSITION: TLS_NEGOTIATION -- TLS_COMPLETE [handshake succeeds] -> CONNECTED ; action=discard prior SMTP knowledge and repeat EHLO
+TRANSITION: READY -- QUIT -> CLOSED ; action=close connection

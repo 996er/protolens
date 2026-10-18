@@ -1,0 +1,14 @@
+DICOM minimal state model for ProtoLens.
+
+
+TRANSITION: START -- A-ASSOCIATE-RQ [TCP connected] -> ASSOCIATION_PENDING ; action=propose association parameters
+TRANSITION: ASSOCIATION_PENDING -- SERVER_ASSOCIATE_AC [acceptable contexts] -> ASSOCIATED ; action=record accepted contexts
+TRANSITION: ASSOCIATION_PENDING -- SERVER_ASSOCIATE_RJ -> REJECTED ; action=record rejection
+TRANSITION: ASSOCIATED -- P-DATA-TF [accepted context and valid PDVs] -> ASSOCIATED ; action=transfer DIMSE data
+TRANSITION: ASSOCIATED -- A-RELEASE-RQ -> RELEASE_PENDING ; action=request orderly release
+TRANSITION: RELEASE_PENDING -- SERVER_RELEASE_RP -> CLOSING ; action=finish release exchange
+TRANSITION: ASSOCIATED -- SERVER_RELEASE_RQ -> RELEASE_REPLY ; action=prepare release response
+TRANSITION: RELEASE_REPLY -- A-RELEASE-RP -> CLOSING ; action=acknowledge peer release
+TRANSITION: ASSOCIATED -- A-ABORT -> CLOSING ; action=abort association
+TRANSITION: REJECTED -- TRANSPORT_CLOSED -> CLOSED ; action=release transport resources
+TRANSITION: CLOSING -- TRANSPORT_CLOSED -> CLOSED ; action=release transport resources

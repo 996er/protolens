@@ -1,0 +1,13 @@
+TLS minimal state model for ProtoLens.
+
+
+TRANSITION: START -- CLIENT_HELLO -> WAIT_SERVER ; action=offer version and cipher suites
+TRANSITION: WAIT_SERVER -- SERVER_HELLO [compatible parameters] -> SERVER_FLIGHT ; action=record negotiated parameters
+TRANSITION: SERVER_FLIGHT -- SERVER_HELLO_DONE [required server messages validated] -> CLIENT_FLIGHT ; action=prepare key exchange
+TRANSITION: CLIENT_FLIGHT -- CLIENT_KEY_EXCHANGE [valid key material] -> KEYS_DERIVED ; action=derive traffic keys
+TRANSITION: KEYS_DERIVED -- CHANGE_CIPHER_SPEC -> CLIENT_CIPHER_ACTIVE ; action=activate outbound protection
+TRANSITION: CLIENT_CIPHER_ACTIVE -- FINISHED [valid protected transcript proof] -> WAIT_SERVER_FINISHED ; action=send client proof
+TRANSITION: WAIT_SERVER_FINISHED -- SERVER_FINISHED [peer cipher change and proof verified] -> ESTABLISHED ; action=complete handshake
+TRANSITION: ESTABLISHED -- APPLICATION_DATA [correct record protection] -> ESTABLISHED ; action=exchange application bytes
+TRANSITION: ESTABLISHED -- CLOSE_NOTIFY [correct record protection] -> CLOSING ; action=close outbound TLS direction
+TRANSITION: CLOSING -- SERVER_CLOSE_NOTIFY -> CLOSED ; action=complete orderly shutdown

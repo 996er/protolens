@@ -1,0 +1,11 @@
+HTTP minimal state model for ProtoLens.
+
+
+TRANSITION: START -- GET / [complete request with Host] -> RESPONSE_PENDING ; action=send request
+TRANSITION: START -- HEAD / [complete request with Host] -> RESPONSE_PENDING ; action=request metadata
+TRANSITION: START -- POST / [correct body framing] -> RESPONSE_PENDING ; action=send body
+TRANSITION: RESPONSE_PENDING -- SERVER_INFORMATIONAL [non-upgrade interim response] -> RESPONSE_PENDING ; action=await final response
+TRANSITION: RESPONSE_PENDING -- SERVER_FINAL [complete response and persistent connection] -> START ; action=permit next request
+TRANSITION: RESPONSE_PENDING -- SERVER_FINAL [complete response and connection closing] -> CLOSED ; action=release connection
+TRANSITION: RESPONSE_PENDING -- SERVER_UPGRADE [accepted protocol switch] -> UPGRADED ; action=hand over to negotiated protocol
+TRANSITION: RESPONSE_PENDING -- SERVER_INCOMPLETE [connection ends before expected body completion] -> FAILED ; action=record incomplete response

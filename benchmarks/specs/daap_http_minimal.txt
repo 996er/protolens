@@ -1,0 +1,11 @@
+DAAP over HTTP minimal state model for ProtoLens.
+
+
+TRANSITION: START -- GET /server-info -> START ; action=inspect server capabilities
+TRANSITION: START -- GET /content-codes -> START ; action=inspect DMAP field definitions
+TRANSITION: START -- GET /login [configured authorization satisfied] -> SESSION_ACTIVE ; action=retain returned session ID
+TRANSITION: SESSION_ACTIVE -- GET /update [valid session and revision parameters] -> SESSION_ACTIVE ; action=observe library revision
+TRANSITION: SESSION_ACTIVE -- GET /databases [valid session parameters] -> SESSION_ACTIVE ; action=enumerate databases
+TRANSITION: SESSION_ACTIVE -- GET /databases/1/items [valid session and database ID] -> SESSION_ACTIVE ; action=enumerate media items
+TRANSITION: SESSION_ACTIVE -- GET /databases/1/containers [valid session and database ID] -> SESSION_ACTIVE ; action=enumerate playlists
+TRANSITION: SESSION_ACTIVE -- GET /logout [valid session parameters] -> START ; action=release session
