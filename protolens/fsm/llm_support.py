@@ -499,18 +499,18 @@ def _normalize_fsm_metadata(
                 numeric_text = numeric_text[:-1].strip()
             # Normalize explicit numbers only. Labels such as "high" have no
             # defined numeric meaning; bare 95 must not silently become 0.95.
-            if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", numeric_text):
-                raise ValueError(
-                    f"{path}.confidence must be numeric or an explicit percentage, got {original!r}"
-                )
-            confidence = float(numeric_text)
-            if percentage:
-                confidence /= 100
-            if not math.isfinite(confidence):
-                raise ValueError(f"{path}.confidence must be finite, got {original!r}")
-            value["confidence"] = confidence
-            changes.append({"path": f"{path}.confidence", "original_value": original,
-                            "value": confidence, "reason": "numeric_confidence_string"})
+            if re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", numeric_text):
+                confidence = float(numeric_text)
+                if percentage:
+                    confidence /= 100
+                if math.isfinite(confidence):
+                    value["confidence"] = confidence
+                    changes.append({"path": f"{path}.confidence", "original_value": original,
+                                    "value": confidence, "reason": "numeric_confidence_string"})
+            # Leave labels and nonfinite strings intact. The schema collector
+            # must report their paths so targeted repair can run; raising here
+            # bypasses result_normalizer/schema_repairer and rewrites whole
+            # records on every retry. This does not make these values valid.
             # The original schema still checks the permitted range below.
         if {"source_type", "location", "excerpt", "confidence"} <= properties.keys():
             # Normalize citation aliases before the extension filter can move

@@ -270,6 +270,8 @@ ImplementationFSMBuilder.build(config)
 
 TransitionFact 条目同样在扩展字段过滤前恢复明确别名，例如 source_state/from_state/state_before → source、target_state/to_state/state_after → target、messageType → message_type、actions/side_effects → action、errorHandling/on_error → error_handling。别名冲突仍拒绝，复杂值继续接受结构校验，不通过字符串化改变其语义。若根结果结构和文件覆盖完整，而某个事实仍缺字段或字段类型非法，则仅针对该事实请求补齐，返回同一结果结构及完整 TransitionFact；请求带原源码、全部字段问题和固定身份，禁止删除或替换事实；该事实尚未通过验收，允许依据源码联动修正内部语义，不锁定未验证字段的值或数组长度，其他事实不参与重写。缺少有效 ID 时程序为该块中的事实位置生成稳定修复 ID。source、target、trigger、行为、置信度和证据均不得由程序猜测；message_type、guard、action、error_handling 虽允许 null，模型仍必须显式给出值或说明无法恢复的语义，不能仅因字段缺失自动填 null。单事实结构修复没有递归补全，耗尽配置预算立即中止并保留已验证块缓存，不再次重生成整块；补齐后仍执行原文证据校验和必要的源码范围修复。
 
+置信度字符串只有明确的数字或百分数可直接转为数值；high/medium/low 等标签没有预设数值映射。公共格式规范化保留无法转换的原值，由结构校验收集完整错误路径，避免提前抛错绕过定向修复。首次源码分析和单事实修复共用置信度补齐流程：当事实其余结构有效时，每次仅提交一条事实及其源码上下文，模型按稳定 record_id 返回需补齐的转换或证据评分（最多 13 项），程序检查 ID 完整覆盖、唯一性和 0–1 有限数值后，仅更新对应 confidence 字段。原值及修复值保留在审计中；其他结构仍缺失时先执行原有事实修复。评分请求不递归修复，耗尽预算严格中止并保留已验证缓存，不能因标签无效自动降为 0 或重写整块。
+
 #### 4.3 FSMMerger
 
 模型负责语义判断，程序负责身份、来源和图结构：
