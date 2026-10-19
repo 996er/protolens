@@ -1235,12 +1235,73 @@ class ImplementationFSMBuilder:
         self, config: ProtoLensConfig, assembled: dict[str, Any],
         facts: list[dict[str, Any]], evidence_table: dict[str, dict[str, Any]],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Repair bounded endpoint groups without regenerating valid transitions."""
+        declared = {state["name"] for state in assembled["states"]}
+        facts_by_id = {fact["id"]: fact for fact in facts}
+        groups: list[set[tuple[str, str]]] = []
+        group: set[tuple[str, str]] = set()
+        size = 0
+        for transition in assembled["transitions"]:
+            for endpoint in ("source", "target"):
+                if transition[endpoint] in declared:
+                    continue
+                # Bound variable repair context as well as output record count.
+                # The shared state catalogue remains intact to avoid losing
+                # legitimate alias candidates. A single oversized endpoint is
+                # kept intact rather than truncating its supporting facts.
+                context = {"transition": transition, "endpoint": endpoint,
+                           "facts": [facts_by_id[key] for key in transition["fact_ids"]]}
+                context_size = len(json.dumps(context, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                if group and (len(group) >= 8 or size + context_size > 24000):
+                    groups.append(group)
+                    group, size = set(), 0
+                group.add((transition["id"], endpoint))
+                size += context_size
+        if group:
+            groups.append(group)
+        if not groups:
+            return assembled, []
+
+        candidate = assembled
+        audit: list[dict[str, Any]] = []
+        for batch_index, endpoint_keys in enumerate(groups, 1):
+            try:
+                candidate, repairs = self._repair_assembly_state_reference_batch(
+                    config, candidate, facts, endpoint_keys=endpoint_keys,
+                )
+            except (LLMValidationError, IncompleteLLMResponse) as exc:
+                # The repair owns its bounded retry budget. RuntimeError stops
+                # the enclosing assembler from multiplying it by regenerating
+                # otherwise valid transition batches (or splitting them again).
+                raise RuntimeError(
+                    f"implementation state reference repair batch {batch_index}/{len(groups)} exhausted; "
+                    f"verified source chunk checkpoints retained, no implementation FSM generated: {exc}"
+                ) from exc
+            audit.extend({**repair, "repair_batch": batch_index} for repair in repairs)
+
+        # Intermediate groups intentionally leave other endpoints unresolved.
+        # Validate the complete graph only when all groups have been applied to
+        # this local candidate; callers publish it only after acceptance.
+        validate_json_schema(candidate, ASSEMBLED_IMPLEMENTATION_SCHEMA)
+        self._validate_fact_coverage(candidate, facts)
+        fsm = fsm_from_llm(self._materialize_assembled_fsm(candidate, facts, evidence_table),
+                           builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA)
+        normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
+        self._validate_code_evidence(fsm)
+        return candidate, audit
+
+    def _repair_assembly_state_reference_batch(
+        self, config: ProtoLensConfig, assembled: dict[str, Any],
+        facts: list[dict[str, Any]],
+        *, endpoint_keys: set[tuple[str, str]],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         declared = {state["name"] for state in assembled["states"]}
         transitions = {item["id"]: item for item in assembled["transitions"]}
         missing = {
             (item["id"], endpoint): item[endpoint]
             for item in assembled["transitions"]
-            for endpoint in ("source", "target") if item[endpoint] not in declared
+            for endpoint in ("source", "target")
+            if (item["id"], endpoint) in endpoint_keys and item[endpoint] not in declared
         }
         if not missing:
             return assembled, []
@@ -1259,6 +1320,8 @@ class ImplementationFSMBuilder:
         state_schema = {
             **ASSEMBLY_STATE_SCHEMA,
             "properties": {**ASSEMBLY_STATE_SCHEMA["properties"],
+                           "description": {"type": "string", "maxLength": 400},
+                           "is_initial": {"type": "boolean", "enum": [False]},
                            "name": {"type": "string", "enum": sorted(declarable or declared)}},
         }
         schema = {
@@ -1276,8 +1339,9 @@ class ImplementationFSMBuilder:
                             "endpoint": {"type": "string", "enum": ["source", "target"]},
                             "state_name": {"type": "string", "enum": sorted(declared | declarable)},
                             "supporting_fact_ids": {"type": "array", "minItems": 1,
+                                                    "maxItems": min(16, len(related_fact_ids)),
                                                     "items": {"type": "string", "enum": sorted(related_fact_ids)}},
-                            "rationale": {"type": "string", "minLength": 1},
+                            "rationale": {"type": "string", "minLength": 1, "maxLength": 600},
                         },
                     },
                 },
@@ -1321,18 +1385,18 @@ class ImplementationFSMBuilder:
             candidate, _ = apply_repairs(result)
             validate_json_schema(candidate, ASSEMBLED_IMPLEMENTATION_SCHEMA)
             self._validate_fact_coverage(candidate, facts)
-            fsm = fsm_from_llm(self._materialize_assembled_fsm(candidate, facts, evidence_table),
-                               builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA)
-            normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
-            self._validate_code_evidence(fsm)
+            if sum(state["is_initial"] for state in candidate["states"]) != 1:
+                raise ValueError("state reference repair must preserve exactly one initial state")
 
         result = self.recorder.call_chat(
             system="You are ProtoLens implementation FSM state-reference repairer. Ground every decision in the supplied transition facts.",
             payload={
-                "task": "Repair all undeclared transition endpoints without regenerating the FSM.",
+                "task": "Repair only the supplied small batch of undeclared transition endpoints without regenerating the FSM.",
                 "protocol": config.protocol,
                 "requirements": [
                     "Return exactly one repair per missing endpoint. Never change valid endpoints or transition semantics.",
+                    "Return only repairs and new_states for this request. Do not reproduce the global state catalogue, transitions, facts or evidence.",
+                    "Keep each rationale within 600 characters and each new state description within 400 characters. Cite at most 16 directly supporting fact IDs per repair.",
                     "Resolve an alias only when the related facts support equivalence with a declared state; do not guess from spelling similarity.",
                     "If a declaration was omitted, new_states may declare only a declarable_missing_state_names entry supported by that endpoint's facts.",
                     "Choose evidence-backed state roles; do not infer terminal or error roles from the name or absent outgoing edges.",
@@ -1348,9 +1412,8 @@ class ImplementationFSMBuilder:
             },
             schema=schema, schema_name="protolens_impl_state_reference_repair",
             validator=validate_repair,
-            # One targeted attempt per assembly candidate, then the existing
-            # assembly validation budget applies. Do not multiply retry budgets.
-            validation_retries=0,
+            # Only this small endpoint group is retried. Exhaustion is promoted
+            # to RuntimeError by the caller, so the enclosing assembly stops.
         )
         return apply_repairs(result)
 
