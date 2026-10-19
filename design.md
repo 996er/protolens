@@ -251,6 +251,7 @@ ImplementationFSMBuilder.build(config)
   -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
   -> 小规模 compact TransitionFact 一次组装；大规模先用全部 facts 统一状态定义，再按最多 64 条及序列化字节预算分批生成边和 fact_ids，不传源码摘录
+  -> 组装与引用修复请求只传事实的规范 id 和语义字段，不传 model_id/evidence_ids；完整组装与每个转移批次的 fact_ids Schema 均枚举当前请求允许的事实 ID。模型误用证据 ID 时，仅在完整事实集合中该证据唯一属于一个当前批次事实时恢复规范 ID，并记录原值；共享证据不会展开为多个事实，也不凭 ev_ 前缀推断。仍无法确定的引用按单条转换定向修复，只返回固定 transition_id、fact_ids 和 rationale，保留已合法引用及其他语义字段，不重写其他转换。单值引用可转数组，重复引用去重；缺失、歧义或越界引用不能自动绑定到尚未覆盖的事实。定向修复耗尽则严格中止并保留已验证源码块缓存，最后仍检查全部事实覆盖、状态引用和源码证据
   -> 单次完整组装耗尽输出预算时切换为分批组装；转移批次因 max_output_tokens 截断时二分重试，单条仍失败则明确终止，不接受截断结果；结构或语义不合格输出仍使用配置重试预算
   -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
   -> 同名且角色属性一致的重复状态声明在计数和图校验前合并，保留所有不同描述并取最低置信度；不改动边或推断名称别名。角色冲突列出名称、声明位置和冲突字段后重试；成功的合并记录在 metadata.state_declaration_repairs，原始响应保留在对话日志
