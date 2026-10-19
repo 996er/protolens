@@ -1265,18 +1265,10 @@ class ImplementationFSMBuilder:
         candidate = assembled
         audit: list[dict[str, Any]] = []
         for batch_index, endpoint_keys in enumerate(groups, 1):
-            try:
-                candidate, repairs = self._repair_assembly_state_reference_batch(
-                    config, candidate, facts, endpoint_keys=endpoint_keys,
-                )
-            except (LLMValidationError, IncompleteLLMResponse) as exc:
-                # The repair owns its bounded retry budget. RuntimeError stops
-                # the enclosing assembler from multiplying it by regenerating
-                # otherwise valid transition batches (or splitting them again).
-                raise RuntimeError(
-                    f"implementation state reference repair batch {batch_index}/{len(groups)} exhausted; "
-                    f"verified source chunk checkpoints retained, no implementation FSM generated: {exc}"
-                ) from exc
+            candidate, repairs = self._repair_assembly_state_reference_batch(
+                config, candidate, facts, endpoint_keys=endpoint_keys,
+                original_declared=declared,
+            )
             audit.extend({**repair, "repair_batch": batch_index} for repair in repairs)
 
         # Intermediate groups intentionally leave other endpoints unresolved.
@@ -1293,30 +1285,55 @@ class ImplementationFSMBuilder:
     def _repair_assembly_state_reference_batch(
         self, config: ProtoLensConfig, assembled: dict[str, Any],
         facts: list[dict[str, Any]],
-        *, endpoint_keys: set[tuple[str, str]],
+        *, endpoint_keys: set[tuple[str, str]], original_declared: set[str],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        # A shared union of candidate states/facts permits cross-endpoint
+        # selections. Give each endpoint its own schema and retry budget, while
+        # keeping accepted changes local until the whole graph is validated.
+        candidate = assembled
+        audit: list[dict[str, Any]] = []
+        for key in sorted(endpoint_keys):
+            try:
+                candidate, repairs = self._repair_assembly_state_reference_endpoint(
+                    config, candidate, facts, endpoint_key=key,
+                    original_declared=original_declared,
+                )
+            except (LLMValidationError, IncompleteLLMResponse) as exc:
+                # Do not spend the outer assembly budget regenerating other
+                # transitions after this endpoint's repair budget is exhausted.
+                raise RuntimeError(
+                    f"implementation state reference repair exhausted for {key!r}; "
+                    f"verified source chunk checkpoints retained, no implementation FSM generated: {exc}"
+                ) from exc
+            audit.extend(repairs)
+        return candidate, audit
+
+    def _repair_assembly_state_reference_endpoint(
+        self, config: ProtoLensConfig, assembled: dict[str, Any],
+        facts: list[dict[str, Any]],
+        *, endpoint_key: tuple[str, str], original_declared: set[str],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         declared = {state["name"] for state in assembled["states"]}
         transitions = {item["id"]: item for item in assembled["transitions"]}
-        missing = {
-            (item["id"], endpoint): item[endpoint]
-            for item in assembled["transitions"]
-            for endpoint in ("source", "target")
-            if (item["id"], endpoint) in endpoint_keys and item[endpoint] not in declared
-        }
-        if not missing:
-            return assembled, []
         facts_by_id = {fact["id"]: fact for fact in facts}
-        affected_ids = {transition_id for transition_id, _ in missing}
-        related_fact_ids = {
-            fact_id for transition_id in affected_ids for fact_id in transitions[transition_id]["fact_ids"]
-        }
-        # New declarations may only use a missing name already present on the
-        # corresponding endpoint of that transition's verified source facts.
-        declarable = {
-            name for (transition_id, endpoint), name in missing.items()
-            if any(facts_by_id[fact_id][endpoint] == name
-                   for fact_id in transitions[transition_id]["fact_ids"])
-        }
+        transition_id, endpoint = endpoint_key
+        transition = transitions[transition_id]
+        related_fact_ids = set(transition["fact_ids"])
+        endpoint_fact_ids: dict[str, list[str]] = {}
+        for fact_id in sorted(related_fact_ids):
+            name = facts_by_id[fact_id][endpoint]
+            endpoint_fact_ids.setdefault(name, []).append(fact_id)
+        # Never promote a state created for another endpoint into an unrestricted
+        # alias candidate just because it was processed earlier in this repair.
+        allowed_names = original_declared | set(endpoint_fact_ids)
+        original_name = transition[endpoint]
+        if original_name in declared and original_name in allowed_names:
+            return assembled, []
+        missing = {endpoint_key: original_name}
+        affected_ids = {transition_id}
+        # The assembler may have invented the missing name. Offer the actual
+        # same-side fact endpoints, rather than requiring that bad name to match.
+        declarable = set(endpoint_fact_ids) - declared
         state_schema = {
             **ASSEMBLY_STATE_SCHEMA,
             "properties": {**ASSEMBLY_STATE_SCHEMA["properties"],
@@ -1328,7 +1345,7 @@ class ImplementationFSMBuilder:
             "type": "object", "additionalProperties": False,
             "required": ["repairs", "new_states"],
             "properties": {
-                "new_states": {"type": "array", "items": state_schema, "maxItems": len(declarable)},
+                "new_states": {"type": "array", "items": state_schema, "maxItems": min(1, len(declarable))},
                 "repairs": {
                     "type": "array", "minItems": len(missing), "maxItems": len(missing),
                     "items": {
@@ -1336,8 +1353,8 @@ class ImplementationFSMBuilder:
                         "required": ["transition_id", "endpoint", "state_name", "supporting_fact_ids", "rationale"],
                         "properties": {
                             "transition_id": {"type": "string", "enum": sorted(affected_ids)},
-                            "endpoint": {"type": "string", "enum": ["source", "target"]},
-                            "state_name": {"type": "string", "enum": sorted(declared | declarable)},
+                            "endpoint": {"type": "string", "enum": [endpoint]},
+                            "state_name": {"type": "string", "enum": sorted(allowed_names)},
                             "supporting_fact_ids": {"type": "array", "minItems": 1,
                                                     "maxItems": min(16, len(related_fact_ids)),
                                                     "items": {"type": "string", "enum": sorted(related_fact_ids)}},
@@ -1347,6 +1364,36 @@ class ImplementationFSMBuilder:
                 },
             },
         }
+
+        def restore_endpoint_support(result: dict[str, Any]) -> list[dict[str, Any]]:
+            """Reattach exact input links; never infer state alias semantics."""
+            notes: list[dict[str, Any]] = []
+            repairs = result.get("repairs")
+            if not isinstance(repairs, list):
+                return notes
+            for index, repair in enumerate(repairs):
+                if not isinstance(repair, dict):
+                    continue
+                if (repair.get("transition_id"), repair.get("endpoint")) != endpoint_key:
+                    continue
+                name = repair.get("state_name")
+                if not isinstance(name, str) or name in original_declared or name not in endpoint_fact_ids:
+                    continue
+                # These links are program-owned for newly introduced states:
+                # the selected name already occurs verbatim on this exact side
+                # of this transition's verified facts. Preserve all transition
+                # fact_ids; this list is only the bounded justification subset.
+                support = endpoint_fact_ids[name][:16]
+                if repair.get("supporting_fact_ids") != support:
+                    notes.append({
+                        "path": f"$.repairs[{index}].supporting_fact_ids",
+                        "reason": "restored_exact_endpoint_fact_ids",
+                        "was_missing": "supporting_fact_ids" not in repair,
+                        "original_value": deepcopy(repair.get("supporting_fact_ids")),
+                        "value": support, "transition_id": transition_id, "endpoint": endpoint,
+                    })
+                    repair["supporting_fact_ids"] = support
+            return notes
 
         def apply_repairs(result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
             new_names = [state["name"] for state in result["new_states"]]
@@ -1368,9 +1415,10 @@ class ImplementationFSMBuilder:
                 name = repair["state_name"]
                 if name not in declared | set(new_names):
                     raise ValueError(f"state reference repair still references an undeclared state: {name!r}")
-                if name in new_names:
+                if name not in original_declared:
                     if not any(facts_by_id[fact_id][endpoint] == name for fact_id in support):
                         raise ValueError(f"new state {name!r} lacks supporting endpoint facts for {key!r}")
+                if name in new_names:
                     used_new.add(name)
                 patched[transition_id][endpoint] = name
                 audit.append({**repair, "original_state": missing[key],
@@ -1391,7 +1439,7 @@ class ImplementationFSMBuilder:
         result = self.recorder.call_chat(
             system="You are ProtoLens implementation FSM state-reference repairer. Ground every decision in the supplied transition facts.",
             payload={
-                "task": "Repair only the supplied small batch of undeclared transition endpoints without regenerating the FSM.",
+                "task": "Repair only this transition endpoint without regenerating the FSM.",
                 "protocol": config.protocol,
                 "requirements": [
                     "Return exactly one repair per missing endpoint. Never change valid endpoints or transition semantics.",
@@ -1399,11 +1447,16 @@ class ImplementationFSMBuilder:
                     "Keep each rationale within 600 characters and each new state description within 400 characters. Cite at most 16 directly supporting fact IDs per repair.",
                     "Resolve an alias only when the related facts support equivalence with a declared state; do not guess from spelling similarity.",
                     "If a declaration was omitted, new_states may declare only a declarable_missing_state_names entry supported by that endpoint's facts.",
+                    "The original unknown_state may itself be wrong. Choose an existing state alias only with semantic support, or a state from endpoint_fact_ids using the exact same-side fact spelling. Never substitute source for target or borrow a state from another transition.",
+                    "For a state introduced during this repair, ProtoLens restores supporting_fact_ids from endpoint_fact_ids after you choose state_name. Do not rewrite facts. For aliases to original declared states, supply your supporting_fact_ids and a semantic rationale.",
                     "Choose evidence-backed state roles; do not infer terminal or error roles from the name or absent outgoing edges.",
                     "Preserve existing state declarations and roles; do not add another initial state.",
                     "Cite supporting_fact_ids from the affected transition and explain each choice. Do not invent states or behavior to satisfy validation.",
                 ],
-                "declared_states": assembled["states"],
+                "declared_states": [state for state in assembled["states"] if state["name"] in allowed_names],
+                "allowed_state_names": sorted(allowed_names),
+                "original_declared_state_names": sorted(original_declared),
+                "endpoint_fact_ids": endpoint_fact_ids,
                 "missing_endpoints": [{"transition_id": key[0], "endpoint": key[1], "unknown_state": name}
                                       for key, name in missing.items()],
                 "declarable_missing_state_names": sorted(declarable),
@@ -1412,7 +1465,8 @@ class ImplementationFSMBuilder:
             },
             schema=schema, schema_name="protolens_impl_state_reference_repair",
             validator=validate_repair,
-            # Only this small endpoint group is retried. Exhaustion is promoted
+            response_normalizer=restore_endpoint_support,
+            # Only this endpoint is retried. Exhaustion is promoted
             # to RuntimeError by the caller, so the enclosing assembly stops.
         )
         return apply_repairs(result)
