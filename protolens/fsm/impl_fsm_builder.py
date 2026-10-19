@@ -245,13 +245,25 @@ TRANSITION_EVIDENCE_REPAIR_SCHEMA: dict[str, Any] = {
 }
 
 
+# Explanation length is a generation preference, not evidence validity. Keep
+# complete supplied text in results/audit instead of truncating its reasoning
+# or retrying an otherwise valid decision solely because it is verbose.
+ASSEMBLY_RATIONALE_SCHEMA: dict[str, Any] = {
+    "type": "string", "minLength": 1,
+    "description": "Explain the source-backed decision concisely, preferably within 600 characters.",
+}
+
+
 ASSEMBLY_STATE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["name", "description", "confidence", "is_initial", "is_terminal", "is_error"],
     "properties": {
         "name": {"type": "string", "minLength": 1},
-        "description": {"type": "string"},
+        "description": {
+            "type": "string",
+            "description": "Explain state identity and supported aliases concisely, preferably within 400 characters.",
+        },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "is_initial": {"type": "boolean"},
         "is_terminal": {"type": "boolean"},
@@ -1152,7 +1164,7 @@ class ImplementationFSMBuilder:
                 "properties": {
                     "transition_id": {"type": "string", "enum": [transition["id"]]},
                     "fact_ids": fact_ids_schema,
-                    "rationale": {"type": "string", "minLength": 1, "maxLength": 600},
+                    "rationale": deepcopy(ASSEMBLY_RATIONALE_SCHEMA),
                 },
             }
 
@@ -1223,7 +1235,6 @@ class ImplementationFSMBuilder:
         state_schema = deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA)
         state_schema["required"].remove("transitions")
         del state_schema["properties"]["transitions"]
-        state_schema["properties"]["states"]["items"]["properties"]["description"]["maxLength"] = 400
 
         def validate_states(result: dict[str, Any]) -> None:
             if not protocol_label_matches(config.protocol, result["protocol"]):
@@ -1246,7 +1257,7 @@ class ImplementationFSMBuilder:
                     "Resolve aliases only when the full transition semantics support equivalence; declare every state needed by the facts.",
                     "Declare unique state names and exactly one is_initial=true. All roles must be supported by the facts.",
                     "Do not infer terminal status from absent outgoing edges or error status from the name.",
-                    "Use concise descriptions (at most 400 characters) that explain identity and any supported aliases.",
+                    "Use concise descriptions (preferably within 400 characters) that explain identity and any supported aliases.",
                 ],
                 "transition_facts": [
                     {key: value for key, value in fact.items() if key not in {"model_id", "evidence_ids"}}
@@ -1454,7 +1465,6 @@ class ImplementationFSMBuilder:
         state_schema = {
             **ASSEMBLY_STATE_SCHEMA,
             "properties": {**ASSEMBLY_STATE_SCHEMA["properties"],
-                           "description": {"type": "string", "maxLength": 400},
                            "is_initial": {"type": "boolean", "enum": [False]},
                            "name": {"type": "string", "enum": sorted(declarable or declared)}},
         }
@@ -1475,7 +1485,7 @@ class ImplementationFSMBuilder:
                             "supporting_fact_ids": {"type": "array", "minItems": 1,
                                                     "maxItems": min(16, len(related_fact_ids)),
                                                     "items": {"type": "string", "enum": sorted(related_fact_ids)}},
-                            "rationale": {"type": "string", "minLength": 1, "maxLength": 600},
+                            "rationale": deepcopy(ASSEMBLY_RATIONALE_SCHEMA),
                         },
                     },
                 },
@@ -1561,7 +1571,7 @@ class ImplementationFSMBuilder:
                 "requirements": [
                     "Return exactly one repair per missing endpoint. Never change valid endpoints or transition semantics.",
                     "Return only repairs and new_states for this request. Do not reproduce the global state catalogue, transitions, facts or evidence.",
-                    "Keep each rationale within 600 characters and each new state description within 400 characters. Cite at most 16 directly supporting fact IDs per repair.",
+                    "Keep explanations concise: preferably within 600 characters for rationale and 400 for state description. Preserve necessary reasoning. Cite at most 16 directly supporting fact IDs per repair.",
                     "Resolve an alias only when the related facts support equivalence with a declared state; do not guess from spelling similarity.",
                     "If a declaration was omitted, new_states may declare only a declarable_missing_state_names entry supported by that endpoint's facts.",
                     "The original unknown_state may itself be wrong. Choose an existing state alias only with semantic support, or a state from endpoint_fact_ids using the exact same-side fact spelling. Never substitute source for target or borrow a state from another transition.",
