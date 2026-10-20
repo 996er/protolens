@@ -278,6 +278,8 @@ TransitionFact 条目同样在扩展字段过滤前恢复明确别名，例如 s
 
 #### 4.3 FSMMerger
 
+合并判断的主请求和定向修复都在输出 Schema 中限定本次 record_id 与候选 ID；多记录请求使用候选并集，随后逐记录校验其实际范围，单记录修复只允许该记录的候选。请求中的 identity_scope 明确 query_id 仅为比较主体，不能写入 matches、differences[].candidate_id、unrelated_ids 或 uncertain_ids；普通比较不允许 null 候选，unmatched 判断才可使用 null。新增请求提示与枚举计入请求字节预算，但不改变已有语义记录的缓存身份。单候选比较若把 query 和 candidate 同列为同一类别，或为双方重复提供内容完全相同的差异记录，可仅移除冗余 query 引用并保留原值审计；仅有 query 的判断、不同类别、不同差异内容、多候选歧义及其他外来 ID 均不自动改写，仍走定向语义修复和严格失败策略。
+
 模型负责语义判断，程序负责身份、来源和图结构：
 
 ```text
