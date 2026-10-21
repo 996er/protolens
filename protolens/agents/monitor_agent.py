@@ -279,6 +279,12 @@ class MonitorAgent:
                 "seed candidates likely to break strong state guards. Mutate only the verified execution frontier "
                 "reconstructed from AFLNet IPSM/queue feedback. Use only client-sendable protocol messages. "
                 "Do not include transport actions such as TCP reset, half-close, or TLS renegotiation."
+                " When source_coverage is present, prioritize small frontier mutations that exercise its "
+                "uncovered source lines, branches and functions. Name the source file and line in "
+                "expected_new_coverage, explain the input/guard needed, and use recent_cases to avoid "
+                "repeating low-yield strategies. Diversify candidates across distinct uncovered regions. "
+                "Coverage measured on the independent gcov target is "
+                "an observation, not proof of identical coverage in the AFLNet binary."
             ),
             "protocol": config.protocol,
             "seed_message_contract": seed_message_contract(config.protocol),
@@ -290,6 +296,7 @@ class MonitorAgent:
                 "hangs": fuzz_result.hangs[:20],
             },
             "dynamic_feedback": _compact_dynamic(dynamic),
+            "source_coverage": dynamic.get("source_coverage", {"present": False}),
             "execution_frontier": _execution_frontier_context(dynamic),
             "planned_paths": _planned_path_context(planned_paths, config.protocol),
             "conflicts": _conflict_context(conflicts),
@@ -1206,6 +1213,8 @@ def _coverage_snapshot(dynamic: dict[str, Any]) -> dict[str, Any]:
     stats = dynamic.get("fuzzer_stats", {}) if isinstance(dynamic.get("fuzzer_stats"), dict) else {}
     latest = dynamic.get("latest_plot", {}) if isinstance(dynamic.get("latest_plot"), dict) else {}
     ipsm = dynamic.get("ipsm", {}) if isinstance(dynamic.get("ipsm"), dict) else {}
+    source = dynamic.get("source_coverage", {})
+    source_summary = source.get("summary", {}) if isinstance(source, dict) else {}
     return {
         "stats_present": bool(dynamic.get("stats_present") or stats),
         "execs_done": _as_int(stats.get("execs_done") or latest.get("total_execs") or 0),
@@ -1219,6 +1228,8 @@ def _coverage_snapshot(dynamic: dict[str, Any]) -> dict[str, Any]:
         "crash_count": _as_int(dynamic.get("crash_count") or 0),
         "hang_count": _as_int(dynamic.get("hang_count") or 0),
         "health_signals": list(dynamic.get("health_signals", [])),
+        "source_covered_lines": _as_int(source_summary.get("lines", {}).get("hit", 0)),
+        "source_covered_branches": _as_int(source_summary.get("branches", {}).get("hit", 0)),
     }
 
 
@@ -1232,6 +1243,8 @@ def _coverage_signature(snapshot: dict[str, Any]) -> tuple[Any, ...]:
         snapshot["queue_count"],
         snapshot["crash_count"],
         snapshot["hang_count"],
+        snapshot.get("source_covered_lines", 0),
+        snapshot.get("source_covered_branches", 0),
     )
 
 

@@ -638,6 +638,37 @@ SETUP /media --transport=RTP/AVP/TCP;unicast;interleaved=2-3
 
 为了让运行中的 AFLNet 立即消费这些 seed，仓库根目录 `afl-fuzz.c` 增加了 `AFLNET_PROTOLENS_IMPORT_DIR` 导入器。AFLNet 主循环会扫描该目录，执行每个未处理 seed，并且只有 `save_if_interesting()` 观察到真实新覆盖、crash 或 hang 时才加入 AFL 队列。成功导入的 queue entry 会设置更高 `handicap` 并跳到队尾优先 fuzz；未产生新覆盖的 seed 只会写 `.processed` 标记，不会被当成有效覆盖成果。
 
+#### 独立 gcov 目标与逐用例源码覆盖率
+
+`source_coverage.enabled=true` 时，pipeline 在 AFLNet 启动前初始化独立收集器，并在后台监听 AFLNet 输出目录的 `queue/`。新文件稳定后逐个重放，每个 queue 文件都保存一份覆盖率 JSON 和 HTML 快照；相同内容的新文件也会单独收集。已有 queue 在首次启动时补采。收集器独立于 MonitorAgent 的模型请求运行，AFLNet 结束时处理剩余 queue，再发布最终覆盖率。收集速度低于 queue 增长速度时，页面显示待处理数量，仍按用例逐个执行。
+
+fuzz 目标继续使用 `aflnet.cmd` 中的 AFLNet 插桩程序；覆盖率目标由 `source_coverage.target_cmd` 单独指定。两者使用不同的服务端口，例如 live555 使用 8554，live555-cov 使用 8555。独立目标每个用例重新启动，并使用该用例专属的 `GCOV_PREFIX`、`GCOV_PREFIX_STRIP=0` 收集 `.gcda`，不读取或清空构建目录中的历史 `.gcda`。收集器复制 `.gcno` 到专属目录，调用与编译器版本匹配的 `gcov --json-format --branch-probabilities --branch-counts`，基于原始计数计算累计覆盖及当前用例新增覆盖。不要求安装 gcovr、lcov 或前端依赖。
+
+配置示例见 `benchmarks/rtsp_live555_coverage.example.json`。把其中的 `source_coverage` 段加入实际 fuzz 配置后，`fuzz`/`run` 自动收集；示例自身用于独立收集现有 queue，`aflnet.dry_run=true` 不影响独立 `coverage` 命令。`build_root` 要包含这份覆盖率二进制对应的全部 `.gcno`；`source_root` 是覆盖率版本源码根目录，文件路径相对此目录展示。编译时建议使用 `--coverage -O0 -g`，保持源码、二进制和 `.gcno` 同一版本。gcov JSON 与 GCOV_PREFIX 的语义以 [GCC gcov 文档](https://gcc.gnu.org/onlinedocs/gcc/Invoking-Gcov.html) 和 [覆盖数据重定位文档](https://gcc.gnu.org/onlinedocs/gcc/Cross-profiling.html) 为准。
+
+覆盖率目标必须在配置的 `shutdown_signal` 后正常退出并刷出 gcov 计数。仓库 ProfuzzBench live555-cov 补丁为 SIGUSR1 注册了 `exit(0)` 处理；其他目标应提供等价机制并配置相应信号。未退出、重放失败、gcov 版本不匹配或没有产生专属 `.gcda` 时，该用例记录 `status=failed` 和错误，仍保存 HTML；不把缺失数据当作零新增覆盖的成功执行。不要用 SIGKILL 作为正常收集信号。失败用例也保留处理记录，修复目标/编译配置后使用新的 run_dir 重采，避免混合不同构建的覆盖。进程锁阻止同一 run_dir 同时运行两个收集器；构建签名变化时拒绝复用旧计数。
+
+独立收集命令支持已有实验或原生 AFLNet 结果：
+
+```bash
+# 一次性处理当前 queue，完成后退出
+python3 -m protolens.main coverage --config benchmarks/rtsp_live555_coverage.example.json --once
+
+# 持续监听 queue，并按配置提供 HTTP 页面；Ctrl+C 停止
+python3 -m protolens.main coverage --config benchmarks/rtsp_live555_coverage.example.json
+
+# 覆盖率采集结束后单独查看已有报告
+python3 -m protolens.main coverage-serve --run-dir runs/rtsp-live555-coverage --port 8080
+```
+
+`coverage --output-dir /path/to/aflnet-output` 可以覆盖 queue 所在输出目录；未指定时从 `aflnet.cmd -o` 读取。报告位于 `run_dir/source_coverage/html/index.html`。HTTP 默认仅监听 `127.0.0.1`，`source_coverage.http_port=0` 关闭 HTTP；用户可显式设置 `http_host` 或 `coverage-serve --host` 以选择监听网卡。服务只提供生成的 HTML 目录，拒绝指向目录外的符号链接，不直接暴露配置、原始 queue 或内部 checkpoint。pipeline 结束后后台 HTTP 服务关闭，可用 `coverage-serve` 继续查看。
+
+可视化页面包含行/分支/函数覆盖率、累计覆盖率曲线、文件筛选、源码执行次数、未覆盖行与部分分支、每个 queue 用例的增量和历史 HTML 链接。每个历史快照对应当时的累计计数；源码由本次构建共享保存，避免每个快照复制源码。全量 JSON 与每个 HTML 快照均保留，长实验需要预留磁盘空间。这里的 gcov 分支覆盖率与 AFLNet bitmap 槽位或 IPSM 状态边不是同一个指标。
+
+`source_coverage/feedback.json` 包含真实累计覆盖率、未覆盖行/分支/函数、带行号的有限源码片段及最近用例增量；`dynamic_analysis.json.source_coverage` 与 MonitorAgent prompt 接入此反馈，覆盖增长也纳入停滞签名。MonitorAgent 优先围绕实际 execution frontier 生成针对未覆盖区域的候选，并在 `expected_new_coverage` 中指出文件/行及所需输入或 guard。它仍遵守候选路径、消息合法性、去重和导入校验；源码未覆盖并不保证该区域能通过当前网络 harness 到达，gcov 版本上的新增覆盖也不自动证明 AFLNet 版本获得相同覆盖。
+
+产物：`source_coverage/checkpoint.json` 保存构建签名、累计计数及处理记录；`html/latest.json`、`html/history.json`、`html/status.json` 驱动实时页面；`html/snapshots/<序号>-<哈希>/index.html` 和 `coverage.json` 保存逐用例快照。采集进程重启后跳过已处理文件，避免重复累计。
+
 #### 6.6 Crash replay 与最小化
 
 `CrashReplayVerifier`：

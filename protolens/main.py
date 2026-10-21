@@ -5,10 +5,14 @@ from pathlib import Path
 import json
 import sys
 import traceback
+import time
 
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import Conflict, Divergence, ProtocolFSM
 from protolens.pipeline import ProtoLensPipeline
+from protolens.fuzzer.source_coverage import SourceCoverageCollector
+from protolens.fuzzer.coverage_report import CoverageHTTPServer
+from protolens.fuzzer.aflnet_adapter import _AFLNetCommandOptions
 from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.logger import Logger
 
@@ -87,7 +91,59 @@ def build_parser() -> ArgumentParser:
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--force-fsm", action="store_true", help="rebuild every FSM stage before reasoning and fuzzing")
     run_parser.set_defaults(func=cmd_run)
+    coverage_parser = subparsers.add_parser("coverage", help="replay new queue entries on the independent gcov target")
+    coverage_parser.add_argument("--config", required=True)
+    coverage_parser.add_argument("--output-dir", help="AFLNet output directory; defaults to aflnet.cmd -o")
+    coverage_parser.add_argument("--once", action="store_true", help="collect the current queue and exit")
+    coverage_parser.set_defaults(func=cmd_coverage)
+    serve_parser = subparsers.add_parser("coverage-serve", help="serve previously generated coverage HTML")
+    serve_parser.add_argument("--run-dir", required=True)
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8080)
+    serve_parser.set_defaults(func=cmd_coverage_serve)
     return parser
+
+
+def cmd_coverage(args: Namespace) -> dict[str, object]:
+    config = ProtoLensConfig.load(args.config)
+    options = _AFLNetCommandOptions.from_command(config.aflnet.cmd, config.aflnet.working_directory(config.source_root))
+    output = Path(args.output_dir).resolve() if args.output_dir else options.output_dir
+    if output is None or not (output / "queue").is_dir():
+        raise ValueError("coverage requires an AFLNet output directory containing queue/")
+    collector = SourceCoverageCollector(config, output)
+    try:
+        if args.once:
+            collector.initialize()
+            collector.scan_once(force=True)
+        else:
+            collector.start()
+            print(f"Coverage HTML: {collector.public.root / 'index.html'}", file=sys.stderr)
+            while collector.thread.is_alive():
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        collector.close()
+    return {"coverage_dir": str(collector.root), "collector_error": collector.error,
+            "processed": len(collector.state.get("cases", {})),
+            "failed": sum(case["status"] == "failed" for case in collector.state.get("cases", {}).values())}
+
+
+def cmd_coverage_serve(args: Namespace) -> dict[str, object]:
+    root = Path(args.run_dir).resolve() / "source_coverage/html"
+    if not (root / "index.html").is_file():
+        raise ValueError(f"coverage report does not exist: {root}")
+    server = CoverageHTTPServer(root, args.host, args.port)
+    try:
+        server.start()
+        print(f"Coverage HTML: http://{args.host}:{server.server.server_port}/", file=sys.stderr)
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
+    return {"coverage_dir": str(root)}
 
 
 def _add_debug_argument(parser: ArgumentParser) -> None:

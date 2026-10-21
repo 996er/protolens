@@ -276,6 +276,48 @@ class PathCalibrationConfig:
 
 
 @dataclass
+class SourceCoverageConfig:
+    """Independent gcov target and queue-driven coverage collection."""
+
+    enabled: bool = False
+    target_cmd: list[str] = field(default_factory=list)
+    source_root: Path | None = None
+    build_root: Path | None = None
+    cwd: Path | None = None
+    env: dict[str, str] = field(default_factory=dict)
+    host: str = "127.0.0.1"
+    port: int = 8555
+    gcov_binary: str = "gcov"
+    startup_seconds: float = 0.2
+    replay_timeout_seconds: float = 3.0
+    shutdown_seconds: float = 3.0
+    shutdown_signal: str = "SIGUSR1"
+    poll_seconds: float = 1.0
+    http_host: str = "127.0.0.1"
+    http_port: int = 0
+    max_monitor_regions: int = 20
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None, base_dir: Path) -> "SourceCoverageConfig":
+        data = data or {}
+        values = {key: data[key] for key in cls.__dataclass_fields__ if key in data}
+        for name in ("source_root", "build_root", "cwd"):
+            if values.get(name) is not None:
+                values[name] = _resolve_path(base_dir, values[name])
+        values["target_cmd"] = _parse_cmd(data.get("target_cmd", []))
+        if values["target_cmd"]:
+            first = Path(values["target_cmd"][0]).expanduser()
+            if not first.is_absolute() and first.parent != Path("."):
+                values["target_cmd"][0] = str((base_dir / first).resolve())
+        values["env"] = _parse_environment(data.get("env", {}))
+        return cls(**values)
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {key: str(value) if isinstance(value, Path) else value
+                for key, value in self.__dict__.items()}
+
+
+@dataclass
 class ProtoLensConfig:
     protocol: str
     target_name: str
@@ -293,6 +335,7 @@ class ProtoLensConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     fsm_build: FSMBuildConfig = field(default_factory=FSMBuildConfig)
     path_calibration: PathCalibrationConfig = field(default_factory=PathCalibrationConfig)
+    source_coverage: SourceCoverageConfig = field(default_factory=SourceCoverageConfig)
     debug: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -336,6 +379,7 @@ class ProtoLensConfig:
             llm=LLMConfig.from_dict(data.get("llm")),
             fsm_build=FSMBuildConfig.from_dict(data.get("fsm_build")),
             path_calibration=PathCalibrationConfig.from_dict(data.get("path_calibration")),
+            source_coverage=SourceCoverageConfig.from_dict(data.get("source_coverage"), base_dir),
             debug=bool(data.get("debug", False)),
             raw=dict(data),
         )
@@ -362,6 +406,29 @@ class ProtoLensConfig:
 
     def validate(self) -> None:
         """尽早拒绝会在长流程末端才暴露的无效配置。"""
+
+        coverage = self.source_coverage
+        if coverage.enabled:
+            import signal
+            if not coverage.target_cmd or not coverage.source_root or not coverage.build_root:
+                raise ValueError("source_coverage requires target_cmd, source_root and build_root")
+            if coverage.host not in {"127.0.0.1", "localhost"}:
+                raise ValueError("source_coverage.host must be loopback for the managed target")
+            if not 1 <= coverage.port <= 65535 or coverage.port == self.port:
+                raise ValueError("source_coverage.port must be valid and different from the AFLNet target port")
+            if not 0 <= coverage.http_port <= 65535:
+                raise ValueError("source_coverage.http_port must be between 0 and 65535 (0 disables HTTP)")
+            if coverage.http_port and coverage.http_port in {self.port, coverage.port}:
+                raise ValueError("source_coverage.http_port must differ from both target ports")
+            for name in ("startup_seconds", "replay_timeout_seconds", "shutdown_seconds", "poll_seconds"):
+                value = getattr(coverage, name)
+                if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"source_coverage.{name} must be finite and positive")
+            if coverage.max_monitor_regions <= 0:
+                raise ValueError("source_coverage.max_monitor_regions must be positive")
+            stop_signal = getattr(signal, coverage.shutdown_signal, None)
+            if not isinstance(stop_signal, int) or stop_signal in {signal.SIGKILL, signal.SIGSTOP}:
+                raise ValueError("source_coverage.shutdown_signal must allow graceful gcov flushing")
 
         for name in ("max_candidates", "max_depth", "max_expansions", "max_probes", "timeout_seconds", "startup_seconds"):
             value = getattr(self.path_calibration, name)
@@ -451,6 +518,7 @@ class ProtoLensConfig:
             "llm": self.llm.to_json_dict(),
             "fsm_build": self.fsm_build.__dict__,
             "path_calibration": self.path_calibration.__dict__,
+            "source_coverage": self.source_coverage.to_json_dict(),
             "debug": self.debug,
         }
 

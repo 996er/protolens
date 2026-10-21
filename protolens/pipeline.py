@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+from pathlib import Path
 import inspect
 import json
 import traceback
@@ -12,6 +13,7 @@ from protolens.agents.cross_layer_agent import CrossLayerAgent
 from protolens.agents.defender_agent import DefenderAgent
 from protolens.agents.direction_agent import DirectionGenerator
 from protolens.agents.monitor_agent import MonitorAgent
+from protolens.fuzzer.source_coverage import SourceCoverageCollector, coverage_feedback
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_merger import FSMMerger
 from protolens.fsm.fsm_model import (
@@ -437,16 +439,27 @@ class ProtoLensPipeline:
             campaign_complete=prepared.mode in {"dry-run", "error"},
         )
         if prepared.mode == "prepared":
-            fuzz_result = self.path_aware_fuzzer.execute(
-                self.config,
-                prepared,
-                on_progress=lambda result: self._handle_fuzz_progress(
-                    planned_paths,
-                    conflicts,
-                    result,
-                    transport_manifest,
-                ),
-            )
+            coverage_collector = None
+            try:
+                if self.config.source_coverage.enabled:
+                    coverage_collector = SourceCoverageCollector(self.config, Path(prepared.output_dir))
+                    coverage_collector.start()
+                    self.logger.info("source coverage collector started",
+                                     report=str(coverage_collector.public.root / "index.html"),
+                                     http_port=self.config.source_coverage.http_port)
+                fuzz_result = self.path_aware_fuzzer.execute(
+                    self.config,
+                    prepared,
+                    on_progress=lambda result: self._handle_fuzz_progress(
+                        planned_paths,
+                        conflicts,
+                        result,
+                        transport_manifest,
+                    ),
+                )
+            finally:
+                if coverage_collector is not None:
+                    coverage_collector.close(drain=True)
             self._write_campaign_artifacts(
                 planned_paths,
                 conflicts,
@@ -488,6 +501,7 @@ class ProtoLensPipeline:
         campaign_complete: bool,
     ) -> dict[str, object]:
         dynamic_analysis = self.dynamic_analyzer.analyze(fuzz_result, self.config.protocol)
+        dynamic_analysis["source_coverage"] = coverage_feedback(self.config)
         dynamic_analysis["campaign_complete"] = campaign_complete
         dynamic_analysis["campaign_phase"] = fuzz_result.mode
         state_mapping = self.state_mapper.map(dynamic_analysis, planned_paths)
@@ -679,6 +693,13 @@ class ProtoLensPipeline:
         seed_feedback = self._read_optional_json("seed_feedback.json")
         transport_result = self._read_optional_json("transport_harness_result.json")
         monitor_report = self._read_optional_json("monitor_agent_report.json")
+        source_coverage = coverage_feedback(self.config)
+        if source_coverage.get("present"):
+            lines.extend(["", "## Source Coverage (gcov)", "",
+                          f"- Summary: {json.dumps(source_coverage.get('summary', {}), ensure_ascii=False)}",
+                          f"- Replayed queue cases: {source_coverage.get('processed_count', 0)}",
+                          f"- Failed collections: {source_coverage.get('failed_count', 0)}",
+                          "- HTML: [source_coverage/html/index.html](source_coverage/html/index.html)"])
         if path_calibration:
             statuses = path_calibration.get("status_counts", {}) if isinstance(path_calibration, dict) else {}
             selected = path_calibration.get("selected_candidate_ids", []) if isinstance(path_calibration, dict) else []
