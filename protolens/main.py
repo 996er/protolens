@@ -267,6 +267,7 @@ def cmd_fuzz(args: Namespace) -> dict[str, object]:
         "run_dir": str(config.run_dir),
         "planned_paths": len(paths),
         "fuzz_mode": result.mode,
+        "directed_generation": store.read_json("directed_generation.json"),
         "command": result.command,
     }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import inspect
 import json
 import traceback
@@ -321,7 +321,13 @@ class ProtoLensPipeline:
                 )
                 for finding in unique_findings:
                     self.store.append_jsonl(f"findings/{agent.name}.jsonl", finding)
-        conflicts = self.conflict_detector.detect(divergences, findings)
+        conflicts = self.conflict_detector.detect(divergences, findings, fsm=fsm)
+        references = self.conflict_detector.reference_report
+        self.store.write_json("conflict_reference_report.json", references)
+        if references["rejected_count"]:
+            self.logger.warning("rejected invalid conflict references",
+                                rejected=references["rejected_count"],
+                                report=str(self.store.path("conflict_reference_report.json")))
         self.logger.debug(
             "conflict detection complete",
             findings=len(findings),
@@ -377,6 +383,26 @@ class ProtoLensPipeline:
                          statuses=calibration["status_counts"])
         planned_paths.extend(self.cross_layer_fuzzer.synthesize_interleavings(conflicts))
         seed_intents = self.state_aware_synthesizer.synthesize(planned_paths, conflicts, self.config.protocol, fsm=fsm)
+        directed_generation = {
+            "format": "protolens.directed_generation.v1",
+            "status": "generated" if seed_intents else "failed",
+            "reason": ("directed seed intents generated; execution and coverage remain unverified" if seed_intents
+                       else "directed generation failed: no executable directed seed intents; "
+                            "AFLNet may continue with existing corpus or a fallback seed"),
+            "conflict_count": len(conflicts),
+            "planned_path_count": len(planned_paths),
+            "reachable_path_count": sum(path.reachable for path in planned_paths),
+            "seed_intent_count": len(seed_intents),
+            "paths": [{"candidate_id": path.candidate_id, "conflict_id": path.conflict_id,
+                       "reachable": path.reachable, "message_count": len(path.messages),
+                       "reason": path.reason, "calibration_status": path.calibration.get("status")}
+                      for path in planned_paths],
+        }
+        self.store.write_json("directed_generation.json", directed_generation)
+        if not seed_intents:
+            self.logger.error("directed generation failed: no executable directed seed intents",
+                              conflicts=len(conflicts), paths=len(planned_paths),
+                              report=str(self.store.path("directed_generation.json")))
         transport_manifest = self.cross_layer_fuzzer.transport_harness_manifest(planned_paths)
         self.logger.debug("wrote artifact", path=self.store.write_json("planned_paths.json", planned_paths))
         self.logger.debug("wrote artifact", path=self.store.write_json("seed_intents.json", seed_intents))
@@ -401,6 +427,8 @@ class ProtoLensPipeline:
                 reachable=path.reachable,
             )
         prepared = self._prepare_fuzzer(planned_paths, seed_intents)
+        if not seed_intents:
+            prepared = replace(prepared, notes=[*prepared.notes, directed_generation["reason"]])
         self._write_campaign_artifacts(
             planned_paths,
             conflicts,
@@ -580,6 +608,7 @@ class ProtoLensPipeline:
             "conflicts": len(conflicts),
             "planned_paths": len(planned_paths),
             "fuzz_mode": fuzz_result.mode,
+            "directed_generation": self._read_optional_json("directed_generation.json"),
             "fsm_stage_reuse": dict(self.stage_reuse),
         }
 
@@ -602,9 +631,16 @@ class ProtoLensPipeline:
             f"- Conflicts: {len(conflicts)}",
             f"- Fuzz mode: {fuzz_result.mode}",
             "",
-            "## Top Conflicts",
-            "",
         ]
+        directed_generation = self._read_optional_json("directed_generation.json")
+        if isinstance(directed_generation, dict):
+            lines.extend([
+                "## Directed Generation", "",
+                f"- Status: {directed_generation.get('status')}",
+                f"- Reason: {directed_generation.get('reason')}",
+                f"- Directed seed intents: {directed_generation.get('seed_intent_count', 0)}", "",
+            ])
+        lines.extend(["## Top Conflicts", ""])
         for conflict in conflicts[:20]:
             lines.extend(
                 [

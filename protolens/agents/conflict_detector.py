@@ -1,26 +1,72 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
+from typing import Any
 
-from protolens.fsm.fsm_model import Conflict, Divergence, ReasoningFinding
+from protolens.fsm.fsm_model import Conflict, Divergence, ProtocolFSM, ReasoningFinding
+from protolens.fsm.references import FSMReferenceResolver
 
 
 class ConflictDetector:
     """把 FSM 差异和多 Agent 结论归一化为可排序的动态验证任务。"""
 
-    def detect(self, divergences: list[Divergence], findings: list[ReasoningFinding]) -> list[Conflict]:
-        conflicts: list[Conflict] = []
-        conflicts.extend(self._from_divergences(divergences))
-        conflicts.extend(self._from_cross_layer(findings))
-        conflicts.extend(self._from_asr(findings))
-        conflicts.extend(self._from_unvalidated_attacker(findings))
-        return _dedupe_sorted(conflicts)
+    def __init__(self) -> None:
+        self.reference_report: dict[str, Any] = {}
 
-    def _from_divergences(self, divergences: list[Divergence]) -> list[Conflict]:
+    def detect(
+        self, divergences: list[Divergence], findings: list[ReasoningFinding], *, fsm: ProtocolFSM,
+    ) -> list[Conflict]:
+        resolver = FSMReferenceResolver(fsm)
+        self.reference_report = {
+            "format": "protolens.conflict_references.v1", "accepted": [], "rejected": [],
+        }
+        normalized_findings = []
+        for finding in findings:
+            try:
+                state, transition = resolver.pair(finding.state, finding.transition)
+            except ValueError as exc:
+                self.reference_report["rejected"].append({
+                    "source_kind": "finding", "source_id": finding.id,
+                    "state": finding.state, "transition": finding.transition, "reason": str(exc),
+                })
+                continue
+            normalized_findings.append(replace(finding, state=state, transition=transition))
+            self.reference_report["accepted"].append({
+                "source_kind": "finding", "source_id": finding.id,
+                "original_state": finding.state, "original_transition": finding.transition,
+                "state": state, "transition": transition,
+            })
+        conflicts: list[Conflict] = []
+        conflicts.extend(self._from_divergences(divergences, resolver))
+        conflicts.extend(self._from_cross_layer(normalized_findings))
+        conflicts.extend(self._from_asr(normalized_findings))
+        conflicts.extend(self._from_unvalidated_attacker(normalized_findings))
+        result = _dedupe_sorted(conflicts)
+        self.reference_report.update(
+            accepted_count=len(self.reference_report["accepted"]),
+            rejected_count=len(self.reference_report["rejected"]), conflict_count=len(result),
+        )
+        return result
+
+    def _from_divergences(self, divergences: list[Divergence], resolver: FSMReferenceResolver) -> list[Conflict]:
         conflicts: list[Conflict] = []
         for divergence in divergences:
             if divergence.kind in {"extra_transition", "guard_mismatch", "state_mismatch", "action_mismatch"}:
-                state, transition = _state_and_transition(divergence.impl_element or divergence.spec_element)
+                side = "impl" if divergence.impl_element else "spec"
+                element = divergence.impl_element if side == "impl" else divergence.spec_element
+                try:
+                    state, transition = resolver.element(element, side)
+                except ValueError as exc:
+                    self.reference_report["rejected"].append({
+                        "source_kind": "divergence", "source_id": divergence.id,
+                        "side": side, "element": element, "reason": str(exc),
+                    })
+                    continue
+                self.reference_report["accepted"].append({
+                    "source_kind": "divergence", "source_id": divergence.id,
+                    "side": side, "element": element, "state": state, "transition": transition,
+                })
                 risk = {"P0": 3.0, "P1": 2.0, "P2": 1.0}[divergence.severity]
                 conflicts.append(
                     Conflict(
@@ -100,15 +146,6 @@ class ConflictDetector:
                     )
                 )
         return conflicts
-
-
-def _state_and_transition(label: str | None) -> tuple[str, str | None]:
-    if not label:
-        return "START", None
-    if "--" in label:
-        state, rest = label.split("--", 1)
-        return state.strip(), rest.strip()
-    return label.strip(), None
 
 
 def _dedupe_sorted(conflicts: list[Conflict]) -> list[Conflict]:

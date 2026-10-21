@@ -340,7 +340,8 @@ reason(fsm, divergences)
   -> 每个 agent 输出 ReasoningFinding
   -> 写 findings/<agent>.jsonl
   -> 写 findings/<agent>.llm.jsonl
-  -> ConflictDetector.detect(divergences, findings)
+  -> ConflictDetector.detect(divergences, findings, fsm=unified_fsm)
+  -> 写 conflict_reference_report.json
   -> 写 directions.json
   -> 写 conflicts.json
 ```
@@ -363,6 +364,8 @@ LLM 行为：
 
 ConflictDetector 会把 FSM divergence 和 agent finding 转为 `Conflict`，并按 P0/P1/P2 与 `risk_score` 排序。
 
+生成 conflict 前，`FSMReferenceResolver` 使用 unified FSM 的 `metadata.state_sources` 和 `metadata.transition_sources` 把原始状态名、transition ID 映射为统一标识。Divergence 按 `impl_element`/`spec_element` 的来源侧解析，同名的两侧 ID 不混用；transition 目标转换为该统一边的源状态和边 ID。Finding 先统一引用，再按状态聚合 Attacker/Defender 判断。引用缺失、有歧义、映射目标不存在或 state 与 transition 源状态不一致时，拒绝该输入，其他合法输入继续生成 conflict。原始 finding 保留，`conflict_reference_report.json` 记录输入来源、接受后的统一标识和拒绝原因。历史完整 transition 标签只在端点与 trigger 精确且唯一匹配时接受，不做模糊状态推断。
+
 ### 6. `synthesize_and_fuzz()` 执行流程
 
 ```text
@@ -378,6 +381,7 @@ synthesize_and_fuzz(fsm, conflicts)
   -> 立即写 transport_harness_manifest.json
   -> StateAwareTestSynthesizer 将每条选中的候选路径扩展为 seed family
   -> 立即写 seed_intents.json
+  -> 写 directed_generation.json，区分定向生成状态与 AFLNet 运行状态
   -> PathAwareFuzzer.prepare(config, planned_paths)
   -> 写 prepared/dry-run/error 快照:
        fuzz_result.json
@@ -420,6 +424,8 @@ Conflict
 ```
 
 找不到路径时，路径会被标记为 `reachable=false`，表示本次有界搜索未找到候选，不证明实现中绝对不可达；这类记录仍带稳定 `candidate_id`，并标记 `calibration.status=not_executable`，方便审计。`reachable=true` 只保留旧接口的图上候选含义。候选包含内容派生的 `candidate_id`、有序 `transition_ids` 和 `calibration`；`candidate_id` 同时由状态、消息、guard 和 conflict 派生。
+
+所有路径不可执行或未产生任何定向 seed intent 时，`directed_generation.json` 明确记录 `status=failed`、路径原因与零产出计数，日志输出 `directed generation failed`。`fuzz`/`run` 的 JSON 返回值和 `report.md` 同时展示该状态；即使 AFLNet 使用现有 corpus 或最小 fallback 继续运行，也不视为定向生成成功。有 seed intent 时记录 `status=generated`，仅表示生成了候选，不证明实际执行成功或覆盖增长。
 
 #### 6.1.0 执行校准与路径选择
 
@@ -1303,11 +1309,13 @@ runs/<protocol>-<target>-<timestamp>/
 │   ├── fsm_implementation.llm.jsonl
 │   └── fsm_merge.llm.jsonl
 ├── conflicts.json
+├── conflict_reference_report.json
 ├── candidate_paths.json
 ├── path_calibration.json
 ├── calibrated_paths.json
 ├── planned_paths.json
 ├── seed_intents.json
+├── directed_generation.json
 ├── seed_manifest.json
 ├── corpus/
 ├── dictionaries/
