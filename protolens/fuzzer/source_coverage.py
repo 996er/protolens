@@ -69,6 +69,7 @@ class SourceCoverageCollector:
         self.notes: list[Path] = []
         self.state: dict[str, Any] = {}
         self.error: str | None = None
+        self._gcov_format = "json"
 
     def initialize(self) -> None:
         if self.lock is not None:
@@ -138,11 +139,29 @@ class SourceCoverageCollector:
         shutil.copyfile(note, mirrored)
         generated = work / "json" / unit
         generated.mkdir(parents=True, exist_ok=True)
-        run = subprocess.run([self.settings.gcov_binary, "--json-format", "--branch-probabilities",
-                              "--branch-counts", str(mirrored)], cwd=generated,
-                             capture_output=True, text=True, timeout=self.settings.replay_timeout_seconds + 30)
+        env = {**os.environ, **self.settings.env, "LC_ALL": "C"}
+
+        def invoke(format_option: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [self.settings.gcov_binary, format_option, "--branch-probabilities",
+                 "--branch-counts", str(mirrored)], cwd=generated, env=env,
+                capture_output=True, text=True, timeout=self.settings.replay_timeout_seconds + 30,
+            )
+
+        option = "--json-format" if self._gcov_format == "json" else "--intermediate-format"
+        run = invoke(option)
+        diagnostic = (run.stderr + run.stdout).lower()
+        if (run.returncode and self._gcov_format == "json" and "json-format" in diagnostic
+                and any(message in diagnostic for message in ("unrecognized option", "unknown option",
+                                                               "unsupported option"))):
+            # GCC before 9 emits machine-readable text instead of JSON. Keep using
+            # the configured gcov so its version still matches the target's gcno.
+            self._gcov_format = "intermediate"
+            run = invoke("--intermediate-format")
         if run.returncode:
             raise RuntimeError(f"gcov failed for {note}: {run.stderr[-2000:]}")
+        if self._gcov_format == "intermediate":
+            return self._read_intermediate_reports(note, generated, unit)
         reports = list(generated.glob("*.gcov.json.gz"))
         if not reports:
             raise RuntimeError(f"gcov produced no JSON for {note}; use a matching GCC/gcov version with JSON support")
@@ -172,6 +191,76 @@ class SourceCoverageCollector:
                     item["functions"][key] = {"name": function.get("demangled_name", function["name"]),
                                                "line": function["start_line"], "count": function["execution_count"]}
                 _merge(result, {name: item})
+        return result
+
+    def _read_intermediate_reports(self, note: Path, generated: Path, unit: str) -> dict[str, Any]:
+        """Read GCC 4.9–8 intermediate output without requiring source text in cwd.
+
+        Legacy branches expose taken/not-taken, not execution frequencies. Their
+        counts therefore accumulate replay hits; coverage hit/total stays exact.
+        Format: https://gcc.gnu.org/onlinedocs/gcc-8.5.0/gcc/Invoking-Gcov.html
+        """
+        reports = sorted(generated.glob("*.gcov"))
+        if not reports:
+            raise RuntimeError(f"gcov produced no intermediate report for {note}")
+        result: dict[str, Any] = {}
+        source_root = self.settings.source_root.resolve()
+        for report_index, report in enumerate(reports):
+            item = None
+            with report.open(encoding="utf-8", errors="replace") as stream:
+                for record_index, record in enumerate(stream):
+                    tag, separator, value = record.rstrip("\r\n").partition(":")
+                    if not separator:
+                        continue
+                    if tag == "file":
+                        item = None
+                        source = Path(value)
+                        # Older gcno files do not carry the compilation cwd. The
+                        # object directory is the usual base (including live555);
+                        # also support builds relative to the configured roots.
+                        candidates = [source] if source.is_absolute() else [
+                            base / source for base in dict.fromkeys(
+                                (note.parent, self.settings.cwd or source_root, source_root)
+                            )
+                        ]
+                        for candidate in candidates:
+                            try:
+                                name = candidate.resolve().relative_to(source_root).as_posix()
+                            except ValueError:
+                                continue
+                            if candidate.is_file():
+                                item = result.setdefault(name, {"lines": {}, "branches": {}, "functions": {}})
+                                break
+                    elif item is not None:
+                        try:
+                            if tag == "lcount":
+                                fields = value.split(",")
+                                number, count = str(int(fields[0])), int(fields[1])
+                                item["lines"][number] = item["lines"].get(number, 0) + count
+                            elif tag == "function":
+                                # GCC 8 adds end_line before execution_count.
+                                fields = value.split(",", 3)
+                                if len(fields) == 4 and fields[2].lstrip("-").isdigit():
+                                    start, _, count, name = fields
+                                else:
+                                    start, count, name = value.split(",", 2)
+                                key = f"{unit}:{name}:{int(start)}"
+                                function = item["functions"].setdefault(
+                                    key, {"name": name, "line": int(start), "count": 0})
+                                function["count"] += int(count)
+                            elif tag == "branch":
+                                number, state = value.split(",", 1)
+                                if state not in {"taken", "nottaken", "notexec"}:
+                                    raise ValueError(f"unknown branch state {state!r}")
+                                key = f"{unit}:legacy:{report_index}:{record_index}"
+                                item["branches"][key] = {
+                                    "line": int(number), "count": int(state == "taken"),
+                                    "count_semantics": "replays_with_branch_taken",
+                                }
+                        except (ValueError, IndexError) as exc:
+                            raise RuntimeError(
+                                f"invalid gcov intermediate record in {report}:{record_index + 1}: {record.rstrip()}"
+                            ) from exc
         return result
 
     def _replay(self, payload: bytes, work: Path) -> dict[str, Any]:
