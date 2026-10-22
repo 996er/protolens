@@ -2,7 +2,7 @@
   "protocol": "rtsp",
   "target_name": "live555-openai",
   "spec_paths": [
-    "/home/ubuntu/protolens/benchmarks/specs/rtsp_minimal.txt"
+    "./specs/rtsp_minimal.txt"
   ],
   "source_root": "/home/ubuntu/experiments/live555",
   "entrypoints": [
@@ -55,6 +55,27 @@
       "8554"
     ]
   },
+    "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/live555-cov/testProgs/testOnDemandRTSPServer",
+      "8555"
+    ],
+    "source_root": "/home/ubuntu/experiments/live555-cov",
+    "build_root": "/home/ubuntu/experiments/live555-cov",
+    "cwd": "/home/ubuntu/experiments/live555-cov/testProgs",
+    "host": "127.0.0.1",
+    "port": 8555,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "127.0.0.1",
+    "http_port": 8080,
+    "max_monitor_regions": 20
+  },
   "fsm_build": {
     "rfc_queries": [
       "latest authoritative RTSP RFCs including security extensions, updates, and obsolete relationships"
@@ -103,7 +124,7 @@
   },
   "llm": {
     "provider": "openai-compatible",
-    "model": "deepseek-v4-pro",
+    "model": "deepseek-v4.1-flash",
     "temperature": 0.0,
     "timeout_seconds": 180,
     "response_format": "json_object",
