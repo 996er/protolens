@@ -273,6 +273,7 @@ class MonitorAgent:
         if self.llm_client.is_offline:
             return {"ok": False, "error": "monitor_agent requires an online LLM provider for stagnant coverage analysis"}
 
+        uncovered_regions = _uncovered_region_context(dynamic.get("source_coverage"))
         payload = {
             "task": (
                 "Analyze why the AFLNet campaign is coverage-stagnant and return concrete protocol "
@@ -282,7 +283,9 @@ class MonitorAgent:
                 " When source_coverage is present, prioritize small frontier mutations that exercise its "
                 "uncovered source lines, branches and functions. Name the source file and line in "
                 "expected_new_coverage, explain the input/guard needed, and use recent_cases to avoid "
-                "repeating low-yield strategies. Diversify candidates across distinct uncovered regions. "
+                "repeating low-yield strategies. When uncovered_regions is non-empty, every candidate must "
+                "set target_uncovered_region_id to a different available region and explain the code guard "
+                "visible in its source_excerpt. Diversify candidates across distinct uncovered regions. "
                 "Coverage measured on the independent gcov target is "
                 "an observation, not proof of identical coverage in the AFLNet binary."
             ),
@@ -297,6 +300,7 @@ class MonitorAgent:
             },
             "dynamic_feedback": _compact_dynamic(dynamic),
             "source_coverage": dynamic.get("source_coverage", {"present": False}),
+            "uncovered_regions": uncovered_regions,
             "execution_frontier": _execution_frontier_context(dynamic),
             "planned_paths": _planned_path_context(planned_paths, config.protocol),
             "conflicts": _conflict_context(conflicts),
@@ -315,6 +319,7 @@ class MonitorAgent:
                         "conflict_id": "id from planned_paths",
                         "candidate_id": "candidate_id from planned_paths; prefer this over conflict_id when present",
                         "frontier_queue_id": "queue_id from execution_frontier.candidates when available",
+                        "target_uncovered_region_id": "id from uncovered_regions; required when uncovered_regions is non-empty",
                         "messages": ["small mutation of a verified execution_frontier command sequence"],
                         "rationale": "why this sequence may reach a stronger guarded state",
                         "expected_new_coverage": "state/guard/branch expected to be exercised",
@@ -356,7 +361,7 @@ class MonitorAgent:
                 "raw": response.raw,
             }
             data = _load_json_object(response.text)
-            analysis = _validate_monitor_analysis(data)
+            analysis = _validate_monitor_analysis(data, uncovered_regions)
             conversation["parsed_candidates"] = len(analysis["seed_candidates"])
             self._llm_conversations.append(conversation)
             return {
@@ -383,6 +388,11 @@ class MonitorAgent:
         import_dir.mkdir(parents=True, exist_ok=True)
         (import_dir / ".processed").mkdir(exist_ok=True)
         conflict_index = {conflict.id: conflict for conflict in conflicts}
+        regions_by_id = {
+            str(region.get("id", "")): region
+            for region in analysis.get("uncovered_regions", [])
+            if isinstance(region, dict) and region.get("id")
+        }
         path_by_candidate = {path.candidate_id: path for path in planned_paths if path.candidate_id}
         paths_by_conflict: dict[str, list[PlannedStatePath]] = {}
         for path in planned_paths:
@@ -420,6 +430,8 @@ class MonitorAgent:
                 )
                 continue
             frontier_key = _candidate_frontier_key(candidate, messages, frontier_match)
+            target_region_id = str(candidate.get("target_uncovered_region_id", "")).strip()
+            target_region = regions_by_id.get(target_region_id, {})
             bucket = _frontier_bucket_status(
                 self._manifest_seeds,
                 frontier_key,
@@ -481,6 +493,8 @@ class MonitorAgent:
                 "source_candidate_id": path.candidate_id,
                 "frontier_key": frontier_key,
                 "frontier_queue_id": str(candidate.get("frontier_queue_id", "")).strip(),
+                "target_uncovered_region_id": target_region_id,
+                "target_uncovered_region": target_region,
                 "frontier_commands": frontier_match.get("frontier_commands", []) if isinstance(frontier_match, dict) else [],
                 "priority": conflict.priority if conflict else "P2",
                 "states": path.states,
@@ -676,6 +690,7 @@ MONITOR_ANALYSIS_SCHEMA: dict[str, Any] = {
                     "conflict_id": {"type": "string", "minLength": 1},
                     "candidate_id": {"type": "string"},
                     "frontier_queue_id": {"type": "string"},
+                    "target_uncovered_region_id": {"type": "string"},
                     "messages": {
                         "type": "array",
                         "minItems": 1,
@@ -704,13 +719,20 @@ def _load_json_object(text: str) -> dict[str, Any]:
     return data
 
 
-def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
+def _validate_monitor_analysis(
+    data: dict[str, Any],
+    uncovered_regions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     summary = str(data.get("bottleneck_summary", "")).strip()
     if not summary:
         raise ValueError("monitor LLM output requires bottleneck_summary")
     raw_candidates = data.get("seed_candidates")
     if not isinstance(raw_candidates, list):
         raise ValueError("monitor LLM output requires seed_candidates array")
+    region_ids = {
+        str(region.get("id", "")) for region in uncovered_regions or []
+        if isinstance(region, dict) and region.get("id")
+    }
     candidates: list[dict[str, Any]] = []
     for item in raw_candidates[:16]:
         if not isinstance(item, dict):
@@ -720,8 +742,11 @@ def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
         messages = [message for message in messages if message]
         rationale = str(item.get("rationale", "")).strip()
         expected = str(item.get("expected_new_coverage", "")).strip()
+        target_region_id = str(item.get("target_uncovered_region_id", "")).strip()
         if not conflict_id or not messages or not rationale or not expected:
             raise ValueError("monitor seed candidate requires conflict_id, messages, rationale, and expected_new_coverage")
+        if region_ids and target_region_id not in region_ids:
+            raise ValueError("monitor seed candidate must target an available uncovered region")
         if any(_looks_like_transport_action(message) for message in messages):
             raise ValueError("monitor seed candidate contains a transport action that AFLNet seed cannot encode")
         candidates.append(
@@ -729,12 +754,57 @@ def _validate_monitor_analysis(data: dict[str, Any]) -> dict[str, Any]:
                 "conflict_id": conflict_id,
                 "candidate_id": str(item.get("candidate_id", "")).strip(),
                 "frontier_queue_id": str(item.get("frontier_queue_id", "")).strip(),
+                "target_uncovered_region_id": target_region_id,
                 "messages": messages[:32],
                 "rationale": rationale,
                 "expected_new_coverage": expected,
             }
         )
-    return {"bottleneck_summary": summary, "seed_candidates": candidates}
+    return {
+        "bottleneck_summary": summary,
+        "seed_candidates": candidates,
+        "uncovered_regions": uncovered_regions or [],
+    }
+
+
+def _uncovered_region_context(source_coverage: Any) -> list[dict[str, Any]]:
+    if not isinstance(source_coverage, dict) or not source_coverage.get("present"):
+        return []
+    regions = source_coverage.get("uncovered_regions", [])
+    if not isinstance(regions, list):
+        return []
+    context: list[dict[str, Any]] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        file_name = str(region.get("file", "")).strip()
+        if not file_name:
+            continue
+        lines = sorted({_as_int(line) for line in region.get("uncovered_lines", []) if _as_int(line) > 0})
+        branches = sorted({_as_int(line) for line in region.get("uncovered_branch_lines", []) if _as_int(line) > 0})
+        functions = [
+            str(item).strip()
+            for item in region.get("uncovered_functions", [])
+            if str(item).strip()
+        ][:10]
+        identity = json.dumps(
+            {"file": file_name, "lines": lines[:40], "branches": branches[:40], "functions": functions},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        context.append(
+            {
+                "id": "cov_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16],
+                "file": file_name,
+                "uncovered_lines": lines[:40],
+                "uncovered_branch_lines": branches[:40],
+                "uncovered_functions": functions,
+                "missing_count": _as_int(region.get("missing_count", len(set(lines + branches)))),
+                "source_excerpt": str(region.get("source_excerpt", ""))[:4000],
+            }
+        )
+    return context
 
 
 def _compact_dynamic(dynamic: dict[str, Any]) -> dict[str, Any]:
@@ -934,6 +1004,7 @@ def _previous_seed_context(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "conflict_id": seed.get("conflict_id", ""),
                 "source_candidate_id": seed.get("source_candidate_id", ""),
+                "target_uncovered_region_id": seed.get("target_uncovered_region_id", ""),
                 "canonical_key": seed.get("canonical_key", ""),
                 "payload_sha256": seed.get("payload_sha256", ""),
                 "messages": list(seed.get("messages", []))[:16] if isinstance(seed.get("messages"), list) else [],
@@ -1031,6 +1102,7 @@ def _monitor_seed_sample(seed: dict[str, Any]) -> dict[str, Any]:
         "conflict_id": seed.get("conflict_id", ""),
         "source_candidate_id": seed.get("source_candidate_id", ""),
         "frontier_key": seed.get("frontier_key", ""),
+        "target_uncovered_region_id": seed.get("target_uncovered_region_id", ""),
         "canonical_key": seed.get("canonical_key", ""),
         "messages": list(seed.get("messages", []))[:12] if isinstance(seed.get("messages"), list) else [],
         "expected_new_coverage": seed.get("expected_new_coverage", ""),
