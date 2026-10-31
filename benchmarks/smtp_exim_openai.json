@@ -17,11 +17,13 @@
   "run_dir": "/home/ubuntu/experiments/runs/smtp-exim-openai",
   "aflnet": {
     "binary": "/home/ubuntu/protolens/afl-fuzz",
-    "timeout_ms": 5000,
+    "timeout_ms": 10000,
     "duration_seconds": 0,
     "dry_run": false,
-    "cwd": null,
-    "env": {},
+    "cwd": "/home/ubuntu/experiments/exim",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    },
     "cmd": [
       "/home/ubuntu/protolens/afl-fuzz",
       "-d",
@@ -60,6 +62,35 @@
       "-oP",
       "/var/lock/exim.pid"
     ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/exim-gcov/src/build-Linux-x86_64/exim",
+      "-bd",
+      "-d",
+      "-oX",
+      "2525",
+      "-oP",
+      "/var/lock/exim-coverage.pid"
+    ],
+    "source_root": "/home/ubuntu/experiments/exim-gcov",
+    "build_root": "/home/ubuntu/experiments/exim-gcov/src/build-Linux-x86_64",
+    "cwd": "/home/ubuntu/experiments/exim-gcov",
+    "host": "127.0.0.1",
+    "port": 2525,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGTERM",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8886,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
   },
   "fsm_build": {
     "rfc_queries": [

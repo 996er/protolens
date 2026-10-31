@@ -24,6 +24,18 @@ void destroy_message_code_map(){
   kh_destroy(32, message_code_map);
 }
 
+/* Preserve the interpretation of mapped state IDs in execution receipts. */
+int get_original_message_code(unsigned int mapped_code, unsigned int* original_code) {
+  if (!message_code_map) return 0;
+  for (khiter_t k = kh_begin(message_code_map); k != kh_end(message_code_map); ++k) {
+    if (kh_exist(message_code_map, k) && kh_value(message_code_map, k) == mapped_code) {
+      *original_code = kh_key(message_code_map, k);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 u32 get_mapped_message_code (u32 ori_message_code){
   u32 mapped_message_code = 0;
   khiter_t k = kh_get(32, message_code_map, ori_message_code);

@@ -245,6 +245,13 @@ class MonitorAgent:
             "decisions": list(self._decisions[-200:]),
         }
 
+    def refresh_feedback(self, config: ProtoLensConfig, dynamic: dict[str, Any] | None = None) -> None:
+        """Persist import outcomes even while coverage improves or LLM calls are suppressed."""
+        self._load_seed_manifest(config)
+        if self._manifest_seeds:
+            self._refresh_seed_receipts(config, dynamic)
+            self._write_seed_manifest(config)
+
     def drain_llm_conversations(self) -> list[dict[str, Any]]:
         conversations = list(self._llm_conversations)
         self._llm_conversations.clear()
@@ -288,6 +295,9 @@ class MonitorAgent:
                 "visible in its source_excerpt. Diversify candidates across distinct uncovered regions. "
                 "Coverage measured on the independent gcov target is "
                 "an observation, not proof of identical coverage in the AFLNet binary."
+                " Use monitor_seed_feedback execution_path to inspect the actual response-state sequence "
+                "and per-message cumulative states, including discarded seeds. Bitmap slots are hashed "
+                "feedback, not ordered source branches. Per-seed source_coverage describes a separate gcov replay."
             ),
             "protocol": config.protocol,
             "seed_message_contract": seed_message_contract(config.protocol),
@@ -635,6 +645,35 @@ class MonitorAgent:
             saved = bool(receipt.get("saved_interesting")) or bool(queue_matches)
             receipt["saved_interesting"] = saved
             receipt["outcome"] = _receipt_outcome(receipt)
+            trace_path = import_dir / ".traces" / seed_name
+            if receipt.get("execution_trace_written"):
+                try:
+                    trace = json.loads(trace_path.read_text())
+                    bitmap = trace["bitmap"]
+                    receipt["execution_path"] = {
+                        "status": "recorded", "basis": trace["basis"], "artifact": str(trace_path),
+                        "state_sequence": trace["state_sequence"], "messages": trace["messages"],
+                        "response_codes": trace.get("response_codes", []),
+                        "bitmap": {key: value for key, value in bitmap.items() if key != "entries"},
+                    }
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    receipt["execution_path"] = {"status": "unavailable", "artifact": str(trace_path)}
+            else:
+                receipt["execution_path"] = {
+                    "status": "unavailable" if receipt.get("processed") else "pending_import",
+                }
+            source_record = config.run_dir / "source_coverage" / "monitor" / f"{seed_name}.json"
+            if config.source_coverage.enabled:
+                try:
+                    coverage = json.loads(source_record.read_text())
+                    # Do not associate a stale replay with a changed seed payload.
+                    if coverage["payload_sha256"] != seed.get("payload_sha256"):
+                        raise ValueError("source coverage payload mismatch")
+                    receipt["source_coverage"] = {**coverage, "artifact": str(source_record)}
+                except (OSError, ValueError, KeyError, TypeError):
+                    receipt["source_coverage"] = {"status": "pending_replay" if receipt.get("executed") else "pending_import"}
+            else:
+                receipt["source_coverage"] = {"status": "disabled"}
             seed["execution_receipt"] = receipt
 
     def _scan_existing_import_seeds(self, config: ProtoLensConfig) -> None:
@@ -1124,8 +1163,22 @@ def _compact_receipt(receipt: Any) -> dict[str, Any]:
         "region_count",
         "messages_sent",
         "queue_files",
+        "source_coverage",
     )
-    return {key: receipt[key] for key in keys if key in receipt}
+    compact = {key: receipt[key] for key in keys if key in receipt}
+    path = receipt.get("execution_path")
+    if isinstance(path, dict):
+        states = path.get("state_sequence", [])
+        messages = path.get("messages", [])
+        compact["execution_path"] = {
+            **path, "state_sequence": states[:128], "response_codes": path.get("response_codes", [])[:128],
+            "messages": [{**message, "state_sequence": message.get("state_sequence", [])[:128],
+                          "response_codes": message.get("response_codes", [])[:128]}
+                         for message in messages[:32]],
+            "truncated": len(states) > 128 or len(messages) > 32
+                         or any(len(message.get("state_sequence", [])) > 128 for message in messages[:32]),
+        }
+    return compact
 
 
 def _frontier_bucket_status(seeds: list[dict[str, Any]], frontier_key: str, failure_threshold: int) -> dict[str, Any]:

@@ -619,6 +619,12 @@ MonitorAgent 的 LLM 上下文现在包含压缩后的 `seed_feedback`：已观�
 
 默认 `monitor_agent.max_llm_calls_per_stagnation_signature=1` 只限制成功分析次数。LLM 临时失败不会消耗成功预算，而是写入 `coverage_llm_failures` 并按 `monitor_agent.llm_failure_backoff_seconds` 指数退避；退避窗口内返回 `stagnant_llm_backoff`，失败超过 `monitor_agent.max_llm_failures_per_stagnation_signature` 后返回 `stagnant_llm_failure_suppressed`。如果模型返回与历史相同的 message 序列或最终 payload，则候选会进入 `skipped_candidates`，原因是 `duplicate_monitor_seed`。
 
+Monitor 导入用例的执行路径按种子保存，包含未被 AFLNet 保留的用例。`afl-fuzz` 在首次 `run_target()` 后、`save_if_interesting()` 校准重放前，将完整状态 ID 序列及对应原始响应码（初始/无映射状态为 null）、每条已尝试发送请求的字节范围及累计响应状态序列、分类后的 AFL feedback bitmap 写入 `monitor_import_queue/.traces/<seed_name>`；`.processed/<seed_name>` 中的 `execution_trace_written` 标明是否成功记录。bitmap 保存非零 slot 与命中计数桶及哈希，它包含所选 feedback 模式的数据，不代表无碰撞的源码边或有序源码执行轨迹。
+
+启用 `source_coverage` 后，采集器也会重放已有 `executed=true` 回执的 monitor 导入文件，不要求它进入 AFLNet queue。`source_coverage/monitor/<seed_name>.json` 将种子名和 payload SHA-256 关联到 `html/snapshots/.../case_coverage.json`，后者保存该次独立 gcov 重放的行、分支和函数执行次数；原来的 `coverage.json` 仍保存累计覆盖。失败重放会记录失败原因，不宣称获得了覆盖。这些源码结果来自独立 gcov 目标，不能当作 AFLNet 二进制首次执行的精确轨迹。
+
+pipeline 在运行回调及结束时刷新 `monitor_seed_manifest.json` 中每个种子的 `execution_receipt.execution_path` 和 `execution_receipt.source_coverage`，不依赖停滞或 LLM 预算。下一次 LLM 分析包含状态路径和逐用例覆盖摘要；完整 bitmap 与逐文件源码计数保存在上述工件。历史回执没有路径时标记 `unavailable`，待导入用例标记 `pending_import`。
+
 #### 6.6 Seed 参数与 Intent 审计关系
 
 `CorpusEncoder` 不再把模型给出的具体参数压成固定模板。FTP、SMTP、HTTP/DAAP-HTTP、RTSP encoder 会保留 message 中的目标字段和参数，例如：
@@ -662,6 +668,20 @@ python3 -m protolens.main coverage-serve --run-dir runs/rtsp-live555-coverage --
 ```
 
 `coverage --output-dir /path/to/aflnet-output` 可以覆盖 queue 所在输出目录；未指定时从 `aflnet.cmd -o` 读取。报告位于 `run_dir/source_coverage/html/index.html`。HTTP 默认仅监听 `127.0.0.1`，`source_coverage.http_port=0` 关闭 HTTP；用户可显式设置 `http_host` 或 `coverage-serve --host` 以选择监听网卡。服务只提供生成的 HTML 目录，拒绝指向目录外的符号链接，不直接暴露配置、原始 queue 或内部 checkpoint。pipeline 结束后后台 HTTP 服务关闭，可用 `coverage-serve` 继续查看。
+
+容器使用 Docker 桥接网络时，主机访问网页需要同时配置容器内监听地址和主机端口映射。以 `benchmarks/ftp_fftp_openai.json` 为例，`source_coverage.http_host` 设置为 `0.0.0.0`，`http_port` 为 `8881`；创建容器时在原有 `docker run` 参数中增加 `-p 127.0.0.1:8881:8881`，然后在 Docker 主机打开 `http://127.0.0.1:8881/`。Compose 对应 `ports: ["127.0.0.1:8881:8881"]`。主机端口和容器端口可以不同，浏览器使用主机端口。映射到主机 `127.0.0.1` 适用于主机本地访问。端口映射用法见 [Docker 文档](https://docs.docker.com/engine/network/port-publishing/)。
+
+`source_coverage.host` 是覆盖率目标的协议服务地址，继续使用 `127.0.0.1`；它与网页的 `http_host` 是两个独立配置。修改 JSON 不会改变已启动 HTTP 服务的监听地址，需要重启对应服务。已有容器缺少端口映射时，需通过创建该容器的启动配置添加映射并重建容器，单纯 `docker restart` 不会添加映射。重建前应确认实验数据保存在挂载目录或卷中。
+
+采集器完成初始化后才启动 HTTP；初始化失败、`aflnet.dry_run=true` 的 pipeline、尚未进入 fuzz 阶段或执行 `coverage --once` 时，不会启动持续的网页服务。已有报告可以在容器内单独提供，无需重新 fuzz；若同一端口已被占用，应选择另一个已映射的端口：
+
+```bash
+python3 -m protolens.main coverage-serve \
+  --run-dir /home/ubuntu/experiments/runs/ftp-fftp-openai \
+  --host 0.0.0.0 --port 8881
+```
+
+`coverage-serve` 使用命令行的 `--host`、`--port`，不会读取 benchmark JSON 中的 HTTP 配置。RTSP 配置若使用 `8080`，应相应设置 `http_host` 并映射 `8080` 端口。
 
 可视化页面包含行/分支/函数覆盖率、累计覆盖率曲线、文件筛选、源码执行次数、未覆盖行与部分分支、每个 queue 用例的增量和历史 HTML 链接。每个历史快照对应当时的累计计数；源码由本次构建共享保存，避免每个快照复制源码。全量 JSON 与每个 HTML 快照均保留，长实验需要预留磁盘空间。这里的 gcov 分支覆盖率与 AFLNet bitmap 槽位或 IPSM 状态边不是同一个指标。
 

@@ -1,0 +1,129 @@
+{
+  "protocol": "dtls",
+  "target_name": "tinydtls-openai",
+  "spec_paths": [
+    "./specs/dtls_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/tinydtls",
+  "entrypoints": [
+    "tests/dtls-server.c",
+    "dtls.c",
+    "dtls.h"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/tinydtls/tests/dtls-server",
+  "host": "127.0.0.1",
+  "port": 20220,
+  "run_dir": "/home/ubuntu/experiments/runs/dtls-tinydtls-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 10000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": "/home/ubuntu/experiments",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    },
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-dtls",
+      "-o",
+      "/home/ubuntu/experiments/runs/dtls-tinydtls-openai/output",
+      "-N",
+      "udp://127.0.0.1/20220",
+      "-P",
+      "DTLS12",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-W",
+      "30",
+      "-m",
+      "none",
+      "-t",
+      "5000",
+      "--",
+      "/home/ubuntu/experiments/tinydtls/tests/dtls-server"
+    ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/tinydtls-gcov/tests/dtls-server",
+      "-p",
+      "20221"
+    ],
+    "source_root": "/home/ubuntu/experiments/tinydtls-gcov",
+    "build_root": "/home/ubuntu/experiments/tinydtls-gcov",
+    "cwd": "/home/ubuntu/experiments",
+    "host": "127.0.0.1",
+    "port": 20221,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8892,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "authoritative DTLS 1.2 RFCs including RFC 6347, security updates, and relationships to later DTLS versions; restrict implementation analysis to TinyDTLS supported versions"
+    ],
+    "rfc_analysis_scope": [
+      "DTLS 1.2 record and handshake sequencing",
+      "HelloVerifyRequest cookies and peer validation",
+      "fragmentation, reassembly, retransmissions and handshake flights",
+      "epochs, sequence numbers, replay handling, alerts and supported cipher suites"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

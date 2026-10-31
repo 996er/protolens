@@ -1,0 +1,138 @@
+{
+  "protocol": "dicom",
+  "target_name": "dcmtk-openai",
+  "spec_paths": [
+    "./specs/dicom_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/dcmtk",
+  "entrypoints": [
+    "dcmqrdb/apps/dcmqrscp.cc",
+    "dcmnet/libsrc/dul.cc"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/dcmtk/build/bin/dcmqrscp --single-process -c /home/ubuntu/experiments/dcmtk/build/bin/dcmqrscp.cfg",
+  "host": "127.0.0.1",
+  "port": 5158,
+  "run_dir": "/home/ubuntu/experiments/runs/dicom-dcmtk-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 10000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": "/home/ubuntu/experiments/dcmtk/build/bin",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments",
+      "DCMDICTPATH": "/home/ubuntu/experiments/dcmtk/dcmdata/data/dicom.dic"
+    },
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-dicom",
+      "-o",
+      "/home/ubuntu/experiments/runs/dicom-dcmtk-openai/output",
+      "-N",
+      "tcp://127.0.0.1/5158",
+      "-P",
+      "DICOM",
+      "-D",
+      "10000",
+      "-E",
+      "-K",
+      "-m",
+      "none",
+      "-t",
+      "5000",
+      "-c",
+      "/home/ubuntu/experiments/clean",
+      "--",
+      "/home/ubuntu/experiments/dcmtk/build/bin/dcmqrscp",
+      "--single-process",
+      "-c",
+      "/home/ubuntu/experiments/dcmtk/build/bin/dcmqrscp.cfg"
+    ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/dcmtk-gcov/build/bin/dcmqrscp",
+      "--single-process",
+      "-c",
+      "/home/ubuntu/protolens/benchmarks/coverage/dcmqrscp.cfg"
+    ],
+    "source_root": "/home/ubuntu/experiments/dcmtk-gcov",
+    "build_root": "/home/ubuntu/experiments/dcmtk-gcov/build",
+    "cwd": "/home/ubuntu/experiments/dcmtk-gcov/build/bin",
+    "host": "127.0.0.1",
+    "port": 5159,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8893,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments",
+      "DCMDICTPATH": "/home/ubuntu/experiments/dcmtk/dcmdata/data/dicom.dic"
+    }
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "official DICOM PS3.8 network communication support and Upper Layer protocol",
+      "official DICOM PS3.7 message exchange and PS3.4 query/retrieve service classes supported by DCMTK dcmqrscp"
+    ],
+    "rfc_analysis_scope": [
+      "DICOM Upper Layer association negotiation, acceptance and rejection",
+      "P-DATA-TF framing and presentation-context negotiation",
+      "DIMSE query/retrieve and storage operations supported by dcmqrscp",
+      "association release, abort and invalid PDU handling"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org",
+      "dicom.nema.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".cc",
+      ".cpp",
+      ".cxx",
+      ".h",
+      ".hh",
+      ".hpp",
+      ".hxx"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

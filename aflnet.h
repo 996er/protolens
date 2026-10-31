@@ -162,5 +162,6 @@ u32 read_bytes_to_uint32(unsigned char* buf, unsigned int offset, int num_bytes)
 /* Mapping from original message code IDs to compact IDs starting from 1 */
 void init_message_code_map();
 void destroy_message_code_map();
+int get_original_message_code(unsigned int mapped_code, unsigned int* original_code);
 
 #endif /* __AFLNET_H */

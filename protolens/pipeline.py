@@ -504,6 +504,7 @@ class ProtoLensPipeline:
         dynamic_analysis["source_coverage"] = coverage_feedback(self.config)
         dynamic_analysis["campaign_complete"] = campaign_complete
         dynamic_analysis["campaign_phase"] = fuzz_result.mode
+        self.monitor_agent.refresh_feedback(self.config, dynamic_analysis)
         state_mapping = self.state_mapper.map(dynamic_analysis, planned_paths)
         seed_manifest = self._read_optional_json("seed_manifest.json")
         seed_feedback = self.seed_feedback_analyzer.analyze(

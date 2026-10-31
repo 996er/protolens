@@ -1,0 +1,149 @@
+{
+  "protocol": "sip",
+  "target_name": "kamailio-openai",
+  "spec_paths": [
+    "./specs/sip_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/kamailio",
+  "entrypoints": [
+    "src/main.c",
+    "src/core/receive.c",
+    "src/core/parser/msg_parser.c"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/kamailio/src/kamailio -f /home/ubuntu/experiments/kamailio-basic.cfg -L /home/ubuntu/experiments/kamailio/src/modules -Y /home/ubuntu/experiments/kamailio/runtime_dir -n 1 -D -E",
+  "host": "127.0.0.1",
+  "port": 5060,
+  "run_dir": "/home/ubuntu/experiments/runs/sip-kamailio-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 50000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": "/home/ubuntu/experiments/kamailio",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    },
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-sip",
+      "-o",
+      "/home/ubuntu/experiments/runs/sip-kamailio-openai/output",
+      "-N",
+      "udp://127.0.0.1/5060",
+      "-m",
+      "none",
+      "-P",
+      "SIP",
+      "-l",
+      "5061",
+      "-D",
+      "50000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-t",
+      "5000",
+      "-c",
+      "/home/ubuntu/experiments/run_pjsip",
+      "--",
+      "/home/ubuntu/experiments/kamailio/src/kamailio",
+      "-f",
+      "/home/ubuntu/experiments/kamailio-basic.cfg",
+      "-L",
+      "/home/ubuntu/experiments/kamailio/src/modules",
+      "-Y",
+      "/home/ubuntu/experiments/kamailio/runtime_dir",
+      "-n",
+      "1",
+      "-D",
+      "-E"
+    ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/kamailio-gcov/src/kamailio",
+      "-f",
+      "/home/ubuntu/protolens/benchmarks/coverage/kamailio.cfg",
+      "-L",
+      "/home/ubuntu/experiments/kamailio-gcov/src/modules",
+      "-Y",
+      "/home/ubuntu/experiments/kamailio-gcov/runtime_dir",
+      "-n",
+      "1",
+      "-D",
+      "-E"
+    ],
+    "source_root": "/home/ubuntu/experiments/kamailio-gcov",
+    "build_root": "/home/ubuntu/experiments/kamailio-gcov",
+    "cwd": "/home/ubuntu/experiments",
+    "host": "127.0.0.1",
+    "port": 5062,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGTERM",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8889,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative SIP RFCs including security extensions, updates, and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "SIP request parsing and response generation",
+      "REGISTER, INVITE, ACK, CANCEL and BYE sequencing",
+      "transaction and dialog lifecycle, retransmissions and timers",
+      "proxy routing, authentication and target-supported extensions"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

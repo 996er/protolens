@@ -1,0 +1,150 @@
+{
+  "protocol": "tls",
+  "target_name": "openssl-openai",
+  "spec_paths": [
+    "./specs/tls_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/openssl",
+  "entrypoints": [
+    "apps/openssl.c",
+    "apps/s_server.c",
+    "ssl/statem/statem_srvr.c"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/openssl/apps/openssl s_server -key /home/ubuntu/experiments/openssl/key.pem -cert /home/ubuntu/experiments/openssl/cert.pem -4 -naccept 1 -no_anti_replay",
+  "host": "127.0.0.1",
+  "port": 4433,
+  "run_dir": "/home/ubuntu/experiments/runs/tls-openssl-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 10000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": "/home/ubuntu/experiments/openssl",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    },
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-tls",
+      "-o",
+      "/home/ubuntu/experiments/runs/tls-openssl-openai/output",
+      "-x",
+      "/home/ubuntu/experiments/tls.dict",
+      "-N",
+      "tcp://127.0.0.1/4433",
+      "-P",
+      "TLS",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-R",
+      "-W",
+      "100",
+      "-m",
+      "none",
+      "-t",
+      "5000",
+      "--",
+      "/home/ubuntu/experiments/openssl/apps/openssl",
+      "s_server",
+      "-key",
+      "/home/ubuntu/experiments/openssl/key.pem",
+      "-cert",
+      "/home/ubuntu/experiments/openssl/cert.pem",
+      "-4",
+      "-naccept",
+      "1",
+      "-no_anti_replay"
+    ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/openssl-gcov/apps/openssl",
+      "s_server",
+      "-key",
+      "/home/ubuntu/experiments/openssl-gcov/key.pem",
+      "-cert",
+      "/home/ubuntu/experiments/openssl-gcov/cert.pem",
+      "-4",
+      "-naccept",
+      "1",
+      "-no_anti_replay",
+      "-accept",
+      "4434"
+    ],
+    "source_root": "/home/ubuntu/experiments/openssl-gcov",
+    "build_root": "/home/ubuntu/experiments/openssl-gcov",
+    "cwd": "/home/ubuntu/experiments/openssl-gcov",
+    "host": "127.0.0.1",
+    "port": 4434,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGTERM",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8891,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative TLS RFCs including security extensions, updates, and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "record framing and handshake message sequencing",
+      "version negotiation and target-supported cipher suites",
+      "certificate authentication and key establishment",
+      "session resumption, early data, alerts and connection closure"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

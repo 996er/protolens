@@ -5,24 +5,30 @@
     "./specs/ftp_minimal.txt"
   ],
   "source_root": "/home/ubuntu/experiments/LightFTP/Source",
-  "entrypoints": ["ftpserv.c", "ftpserv.h", "main.c"],
+  "entrypoints": [
+    "ftpserv.c",
+    "ftpserv.h",
+    "main.c"
+  ],
   "build_command": "",
-  "run_command": "/home/ubuntu/experiments/LightFTP/Source/Release/fftp /home/ubuntu/experiments/lightftp/fftp.conf 2200",
+  "run_command": "/home/ubuntu/experiments/LightFTP/Source/Release/fftp /home/ubuntu/experiments/LightFTP/Source/Release/fftp.conf 2200",
   "host": "127.0.0.1",
   "port": 2200,
   "transport_harness": {
-  "enabled": true,
-  "timeout_seconds": 3.0,
-  "max_actions": 20
+    "enabled": true,
+    "timeout_seconds": 3.0,
+    "max_actions": 20
   },
   "run_dir": "/home/ubuntu/experiments/runs/ftp-fftp-openai",
   "aflnet": {
     "binary": "/home/ubuntu/protolens/afl-fuzz",
-    "timeout_ms": 1000,
+    "timeout_ms": 10000,
     "duration_seconds": 0,
     "dry_run": false,
-    "cwd": null,
-    "env": {},
+    "cwd": "/home/ubuntu/experiments/LightFTP/Source/Release",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    },
     "cmd": [
       "/home/ubuntu/protolens/afl-fuzz",
       "-d",
@@ -56,26 +62,29 @@
     ]
   },
   "source_coverage": {
-  "enabled": true,
-  "target_cmd": [
-    "/home/ubuntu/experiments/LightFTP-gcov/Source/Release/fftp",
-    "/home/ubuntu/experiments/LightFTP-gcov/Source/Release/fftp.conf",
-    "2201"
-  ],
-  "source_root": "/home/ubuntu/experiments/LightFTP-gcov/Source",
-  "build_root": "/home/ubuntu/experiments/LightFTP-gcov/Source/Release",
-  "cwd": "/home/ubuntu/experiments/LightFTP-gcov/Source/Release",
-  "host": "127.0.0.1",
-  "port": 2201,
-  "gcov_binary": "gcov",
-  "startup_seconds": 0.2,
-  "replay_timeout_seconds": 3.0,
-  "shutdown_signal": "SIGUSR1",
-  "shutdown_seconds": 3.0,
-  "poll_seconds": 1.0,
-  "http_host": "127.0.0.1",
-  "http_port": 8881,
-  "max_monitor_regions": 20
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/LightFTP-gcov/Source/Release/fftp",
+      "/home/ubuntu/experiments/LightFTP-gcov/Source/Release/fftp.conf",
+      "2201"
+    ],
+    "source_root": "/home/ubuntu/experiments/LightFTP-gcov/Source",
+    "build_root": "/home/ubuntu/experiments/LightFTP-gcov/Source/Release",
+    "cwd": "/home/ubuntu/experiments/LightFTP-gcov/Source/Release",
+    "host": "127.0.0.1",
+    "port": 2201,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8881,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
   },
   "fsm_build": {
     "rfc_queries": [
@@ -97,14 +106,17 @@
       "datatracker.ietf.org",
       "ietf.org"
     ],
-    "source_extensions": [".c", ".h"],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
     "chunk_chars": 80000,
     "max_file_bytes": 2000000,
     "max_web_search_calls": 8
   },
   "llm": {
     "provider": "openai-compatible",
-    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "model": "deepseek-v4.1-flash",
     "temperature": 0.0,
     "timeout_seconds": 180,
     "response_format": "json_object",

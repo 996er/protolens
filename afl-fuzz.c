@@ -1000,6 +1000,7 @@ int send_over_network()
   u8 likely_buggy = 0;
   struct sockaddr_in serv_addr;
   struct sockaddr_in local_serv_addr;
+  messages_sent = 0;
 
   //Clean up the server if needed
   if (cleanup_script) system(cleanup_script);
@@ -1075,8 +1076,6 @@ int send_over_network()
 
   //write the request messages
   kliter_t(lms) *it;
-  messages_sent = 0;
-
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
     n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize);
     messages_sent++;
@@ -7890,6 +7889,79 @@ static void sync_fuzzers(char** argv) {
 }
 
 
+/* Snapshot the initial import execution before save_if_interesting() can
+   calibrate/replay and overwrite the global response and coverage buffers.
+   Bitmap slots are hashed feedback, not an ordered source-level path. */
+static void write_protolens_response_codes(FILE* stream, u32* states, u32 count) {
+  fprintf(stream, "[");
+  for (u32 i = 0; i < count; i++) {
+    u32 code;
+    if (i) fprintf(stream, ",");
+    if (get_original_message_code(states[i], &code)) fprintf(stream, "%u", code);
+    else fprintf(stream, "null"); /* Initial/unmapped protocol state. */
+  }
+  fprintf(stream, "]");
+}
+
+static u8 write_protolens_execution_trace(u8* directory, const char* seed_name,
+                                        region_t* regions, u32 region_count) {
+
+  u8 *trace_dir = alloc_printf("%s/.traces", directory);
+  u8 *path = alloc_printf("%s/%s", trace_dir, seed_name);
+  u8 *temporary = alloc_printf("%s/.%s.tmp", trace_dir, seed_name);
+  u8 written = 0;
+  FILE* stream = NULL;
+  u32 i, j, entries = 0;
+
+  if (mkdir((char*)trace_dir, 0700) && errno != EEXIST) goto done;
+  stream = fopen((char*)temporary, "w");
+  if (!stream) goto done;
+  fprintf(stream, "{\"format\":\"protolens.execution_trace.v1\","
+          "\"basis\":\"aflnet_initial_import_execution\","
+          "\"state_sequence\":[");
+  for (i = 0; i < state_count; i++)
+    fprintf(stream, "%s%u", i ? "," : "", state_sequence[i]);
+  fprintf(stream, "],\"response_codes\":");
+  write_protolens_response_codes(stream, state_sequence, state_count);
+  fprintf(stream, ",\"messages\":[");
+  for (i = 0; i < messages_sent && i < region_count; i++) {
+    u32 prefix_count = 0;
+    u32 size = response_bytes ? response_bytes[i] : 0;
+    u32* prefix = NULL;
+    if (size > (u32)response_buf_size) size = response_buf_size;
+    if (size) prefix = (*extract_response_codes)(response_buf, size, &prefix_count);
+    fprintf(stream, "%s{\"index\":%u,\"start_byte\":%d,\"end_byte\":%d,"
+            "\"response_bytes\":%u,\"state_sequence\":[", i ? "," : "",
+            i, regions[i].start_byte, regions[i].end_byte, size);
+    for (j = 0; j < prefix_count; j++)
+      fprintf(stream, "%s%u", j ? "," : "", prefix[j]);
+    fprintf(stream, "],\"response_codes\":");
+    write_protolens_response_codes(stream, prefix, prefix_count);
+    fprintf(stream, "}");
+    ck_free(prefix);
+  }
+  fprintf(stream, "],\"bitmap\":{\"basis\":\"afl_classified_feedback_slots\","
+          "\"feedback_type\":%u,\"map_size\":%u,\"hash32\":\"%08x\","
+          "\"entries\":[", feedback_type, MAP_SIZE,
+          hash32(trace_bits, MAP_SIZE, HASH_CONST));
+  for (i = 0; i < MAP_SIZE; i++) {
+    if (!trace_bits[i]) continue;
+    fprintf(stream, "%s[%u,%u]", entries ? "," : "", i, trace_bits[i]);
+    entries++;
+  }
+  fprintf(stream, "],\"slot_count\":%u}}\n", entries);
+  written = !ferror(stream);
+  if (fclose(stream)) written = 0;
+  if (written && rename((char*)temporary, (char*)path)) written = 0;
+  if (!written) unlink((char*)temporary);
+done:
+  ck_free(temporary);
+  ck_free(path);
+  ck_free(trace_dir);
+  return written;
+}
+
+
 /* Import seeds produced by ProtoLens' runtime monitor. The monitor writes raw
    AFLNet seed streams into AFLNET_PROTOLENS_IMPORT_DIR; this function executes
    each new seed immediately and lets save_if_interesting() add only inputs that
@@ -7935,6 +8007,7 @@ static u32 import_protolens_monitor_seeds(char** argv) {
     u32 monitor_case = 0, before_queued = queued_paths, after_queued = queued_paths;
     u32 receipt_region_count = 0, receipt_messages_sent = 0;
     u8 receipt_executed = 0, receipt_fault = 255, receipt_saved = 0;
+    u8 receipt_trace_written = 0;
 
     if (qd_ent->d_name[0] == '.' || strstr(qd_ent->d_name, "README")) continue;
 
@@ -7964,21 +8037,26 @@ static u32 import_protolens_monitor_seeds(char** argv) {
 
         region_t *regions;
         u32 region_count;
+        u64 before_execs = total_execs;
 
         write_to_testcase(mem, st.st_size);
         regions = (*extract_requests)(mem, st.st_size, &region_count);
         kl_messages = construct_kl_messages(path, regions, region_count);
         fault = run_target(argv, exec_tmout);
-        receipt_executed = 1;
-        receipt_fault = fault;
+        receipt_executed = total_execs > before_execs;
+        receipt_fault = receipt_executed ? fault : 255;
         receipt_region_count = region_count;
-        receipt_messages_sent = messages_sent;
+        receipt_messages_sent = receipt_executed ? messages_sent : 0;
+        if (receipt_executed)
+          receipt_trace_written = write_protolens_execution_trace(
+              protolens_import_dir, qd_ent->d_name, regions, region_count);
         before_queued = queued_paths;
 
         corpus_read_or_sync = 2;
         syncing_party = (u8*)"protolens_monitor";
         syncing_case = monitor_case;
-        receipt_saved = save_if_interesting(argv, mem, st.st_size, fault);
+        if (receipt_executed && !stop_soon)
+          receipt_saved = save_if_interesting(argv, mem, st.st_size, fault);
         queued_imported += receipt_saved;
         syncing_party = 0;
         corpus_read_or_sync = 0;
@@ -7995,24 +8073,19 @@ static u32 import_protolens_monitor_seeds(char** argv) {
         delete_kl_messages(kl_messages);
         munmap(mem, st.st_size);
 
-        if (stop_soon) {
-          close(fd);
-          ck_free(path);
-          ck_free(marker);
-          break;
-        }
-
       }
 
     }
 
     close(fd);
-    marker_fd = open((char*)marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    u8* marker_tmp = alloc_printf("%s/.%s.tmp", processed_dir, qd_ent->d_name);
+    marker_fd = open((char*)marker_tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (marker_fd >= 0) {
-      dprintf(marker_fd,
+      s32 written = dprintf(marker_fd,
               "{\"processed\":true,\"executed\":%s,\"fault\":%u,"
               "\"saved_interesting\":%s,\"queued_before\":%u,\"queued_after\":%u,"
-              "\"region_count\":%u,\"messages_sent\":%u,\"seed_file\":\"%s\"}\n",
+              "\"region_count\":%u,\"messages_sent\":%u,"
+              "\"execution_trace_written\":%s,\"seed_file\":\"%s\"}\n",
               receipt_executed ? "true" : "false",
               receipt_fault,
               receipt_saved ? "true" : "false",
@@ -8020,11 +8093,16 @@ static u32 import_protolens_monitor_seeds(char** argv) {
               after_queued,
               receipt_region_count,
               receipt_messages_sent,
+              receipt_trace_written ? "true" : "false",
               qd_ent->d_name);
-      close(marker_fd);
+      s32 closed = close(marker_fd);
+      if (written >= 0 && !closed) rename((char*)marker_tmp, (char*)marker);
+      unlink((char*)marker_tmp);
     }
+    ck_free(marker_tmp);
     ck_free(path);
     ck_free(marker);
+    if (stop_soon) break;
 
   }
 

@@ -17,12 +17,13 @@
   "run_dir": "/home/ubuntu/experiments/runs/rtsp-live555-openai",
   "aflnet": {
     "binary": "/home/ubuntu/protolens/afl-fuzz",
-    "timeout_ms": 5000,
+    "timeout_ms": 10000,
     "duration_seconds": 0,
     "dry_run": false,
     "cwd": "/home/ubuntu/experiments/live555/testProgs",
     "env": {
-      "PWD": "/home/ubuntu/experiments/live555/testProgs"
+      "PWD": "/home/ubuntu/experiments/live555/testProgs",
+      "WORKDIR": "/home/ubuntu/experiments"
     },
     "cmd": [
       "/home/ubuntu/protolens/afl-fuzz",
@@ -55,7 +56,7 @@
       "8554"
     ]
   },
-    "source_coverage": {
+  "source_coverage": {
     "enabled": true,
     "target_cmd": [
       "/home/ubuntu/experiments/live555-cov/testProgs/testOnDemandRTSPServer",
@@ -74,7 +75,10 @@
     "poll_seconds": 1.0,
     "http_host": "127.0.0.1",
     "http_port": 8080,
-    "max_monitor_regions": 20
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
   },
   "fsm_build": {
     "rfc_queries": [

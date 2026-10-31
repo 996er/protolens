@@ -1,0 +1,145 @@
+{
+  "protocol": "ssh",
+  "target_name": "openssh-openai",
+  "spec_paths": [
+    "./specs/ssh_minimal.txt"
+  ],
+  "source_root": "/home/ubuntu/experiments/openssh",
+  "entrypoints": [
+    "sshd.c",
+    "auth2.c",
+    "packet.c"
+  ],
+  "build_command": "",
+  "run_command": "/home/ubuntu/experiments/openssh/sshd -d -e -p 22 -r -f /home/ubuntu/experiments/openssh/sshd_config",
+  "host": "127.0.0.1",
+  "port": 22,
+  "run_dir": "/home/ubuntu/experiments/runs/ssh-openssh-openai",
+  "aflnet": {
+    "binary": "/home/ubuntu/protolens/afl-fuzz",
+    "timeout_ms": 10000,
+    "duration_seconds": 0,
+    "dry_run": false,
+    "cwd": "/home/ubuntu/experiments/openssh",
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments",
+      "LD_LIBRARY_PATH": "/home/ubuntu/experiments/openssl-install/lib"
+    },
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-ssh",
+      "-o",
+      "/home/ubuntu/experiments/runs/ssh-openssh-openai/output",
+      "-x",
+      "/home/ubuntu/experiments/ssh.dict",
+      "-N",
+      "tcp://127.0.0.1/22",
+      "-P",
+      "SSH",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-W",
+      "10",
+      "-m",
+      "none",
+      "-t",
+      "5000",
+      "--",
+      "/home/ubuntu/experiments/openssh/sshd",
+      "-d",
+      "-e",
+      "-p",
+      "22",
+      "-r",
+      "-f",
+      "/home/ubuntu/experiments/openssh/sshd_config"
+    ]
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/openssh-gcov/sshd",
+      "-d",
+      "-e",
+      "-p",
+      "2222",
+      "-r",
+      "-f",
+      "/home/ubuntu/experiments/openssh-gcov/sshd_config"
+    ],
+    "source_root": "/home/ubuntu/experiments/openssh-gcov",
+    "build_root": "/home/ubuntu/experiments/openssh-gcov",
+    "cwd": "/home/ubuntu/experiments/openssh-gcov",
+    "host": "127.0.0.1",
+    "port": 2222,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGTERM",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "0.0.0.0",
+    "http_port": 8890,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments",
+      "LD_LIBRARY_PATH": "/home/ubuntu/experiments/openssl-install/lib"
+    }
+  },
+  "fsm_build": {
+    "rfc_queries": [
+      "latest authoritative SSH RFCs including security extensions, updates, and obsolete relationships"
+    ],
+    "rfc_analysis_scope": [
+      "transport identification and version exchange",
+      "key exchange, algorithm negotiation, NEWKEYS and rekeying",
+      "user authentication and service requests",
+      "channel lifecycle, disconnects and protocol errors"
+    ],
+    "target_supported_extensions_only": true,
+    "ignore_directories": [
+      ".git",
+      ".hg",
+      ".svn",
+      ".idea",
+      ".vscode",
+      "__pycache__",
+      "node_modules",
+      "vendor",
+      "dist",
+      "build",
+      "target",
+      "coverage",
+      "Deprecated"
+    ],
+    "allowed_rfc_domains": [
+      "rfc-editor.org",
+      "datatracker.ietf.org",
+      "ietf.org"
+    ],
+    "source_extensions": [
+      ".c",
+      ".h"
+    ],
+    "chunk_chars": 80000,
+    "max_file_bytes": 2000000,
+    "max_web_search_calls": 8
+  },
+  "llm": {
+    "provider": "openai-compatible",
+    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "temperature": 0.0,
+    "timeout_seconds": 180,
+    "response_format": "json_object",
+    "max_tokens": 24000,
+    "retries": 2
+  }
+}

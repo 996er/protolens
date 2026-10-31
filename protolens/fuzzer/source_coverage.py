@@ -1,4 +1,4 @@
-"""Replay each new queue entry against an isolated gcov-instrumented target."""
+"""Replay queue entries and executed monitor imports on an isolated gcov target."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -340,7 +340,17 @@ class SourceCoverageCollector:
     def scan_once(self, *, force: bool = False) -> int:
         """Wait for stable queue files; a new filename is collected even for identical bytes."""
         candidates = []
-        for path in sorted((self.output_dir / "queue").glob("*")):
+        import_dir = self.config.monitor_agent.import_dir or (self.config.run_dir / "monitor_import_queue")
+        paths = [(path, "queue") for path in sorted((self.output_dir / "queue").glob("*"))]
+        for path in sorted(import_dir.glob("id:*src:protolens_monitor*")):
+            try:
+                receipt = json.loads((import_dir / ".processed" / path.name).read_text())
+            except (OSError, ValueError):
+                continue
+            # Replays describe executed imports, including those AFLNet discarded.
+            if isinstance(receipt, dict) and receipt.get("executed") is True:
+                paths.append((path, "monitor_import"))
+        for path, origin in paths:
             if path.is_symlink() or not path.is_file() or path.name.startswith("."):
                 continue
             try:
@@ -348,11 +358,12 @@ class SourceCoverageCollector:
             except FileNotFoundError:
                 continue
             stamp = (st.st_size, st.st_mtime_ns)
-            stable = self.seen.get(path.name) == stamp
-            self.seen[path.name] = stamp
+            identity = path.name if origin == "queue" else f"monitor_import/{path.name}"
+            stable = self.seen.get(identity) == stamp
+            self.seen[identity] = stamp
             if not stamp[0] or not (force or stable):
                 continue
-            if self.completed_stamps.get(path.name) == stamp:
+            if self.completed_stamps.get(identity) == stamp:
                 continue
             try:
                 payload = path.read_bytes()
@@ -361,31 +372,36 @@ class SourceCoverageCollector:
                 continue
             if (after.st_size, after.st_mtime_ns) != stamp:
                 continue
-            key = hashlib.sha256(path.name.encode() + b"\0" + payload).hexdigest()
+            key = hashlib.sha256(identity.encode() + b"\0" + payload).hexdigest()
             if key not in self.state["cases"]:
-                candidates.append((path, payload, key, stamp))
+                candidates.append((path, payload, key, stamp, identity, origin))
             else:
-                self.completed_stamps[path.name] = stamp
+                self.completed_stamps[identity] = stamp
+                if origin == "monitor_import":
+                    self.store.write_json(f"monitor/{path.name}.json", self.state["cases"][key])
         self._status("collecting" if candidates else "watching", pending=len(candidates))
-        for index, (path, payload, key, stamp) in enumerate(candidates):
+        for index, (path, payload, key, stamp, identity, origin) in enumerate(candidates):
             if self.stop_event.is_set() and not force:
                 break
             self._status("collecting", pending=len(candidates) - index, seed_file=path.name)
-            self.collect_case(path.name, payload, key)
-            self.completed_stamps[path.name] = stamp
+            self.collect_case(path.name, payload, key, origin=origin)
+            self.completed_stamps[identity] = stamp
         return len(candidates)
 
-    def collect_case(self, seed_file: str, payload: bytes, key: str) -> None:
+    def collect_case(self, seed_file: str, payload: bytes, key: str, *, origin: str = "queue") -> None:
         before = _summary(self.state["files"])
         record: dict[str, Any] = {"seed_file": seed_file, "payload_sha256": hashlib.sha256(payload).hexdigest(),
                                   "key": key, "sequence": len(self.state["history"]) + 1,
-                                  "completed_at": _now(), "status": "collected"}
+                                  "completed_at": _now(), "status": "collected", "origin": origin,
+                                  "basis": "independent_gcov_replay_not_aflnet_execution"}
         next_files = deepcopy(self.state["files"])
+        case_files: dict[str, Any] = {}
         started = time.monotonic()
         try:
             with TemporaryDirectory(dir=self.root, prefix="replay-") as work:
                 replay = self._replay(payload, Path(work))
-                _merge(next_files, replay.pop("files"))
+                case_files = replay.pop("files")
+                _merge(next_files, case_files)
                 record.update(replay)
         except Exception as exc:
             record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -395,6 +411,12 @@ class SourceCoverageCollector:
         record["delta"] = {name: record["summary"][name]["hit"] - before[name]["hit"] for name in before}
         relative = f"snapshots/{len(self.state['history']) + 1:06d}-{key[:12]}"
         record["report"] = relative + "/index.html"
+        record["case_coverage"] = relative + "/case_coverage.json"
+        record["case_summary"] = _summary(case_files)
+        # Keep this execution's counts separately from the cumulative snapshot.
+        self.public.write_json(record["case_coverage"], {
+            **record, "summary": record["case_summary"], "files": self._with_summaries(case_files),
+        })
         snapshot = {**record, "files": self._with_summaries(next_files)}
         self.public.write_json(relative + "/coverage.json", snapshot)
         write_view(self.public.root, snapshot=self.public.path(relative))
@@ -402,6 +424,8 @@ class SourceCoverageCollector:
         self.state["cases"][key] = record
         self.state["history"].append(record)
         self.store.write_json("checkpoint.json", self.state)
+        if origin == "monitor_import":
+            self.store.write_json(f"monitor/{seed_file}.json", record)
         self._publish()
 
     @staticmethod
