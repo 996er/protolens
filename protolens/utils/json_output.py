@@ -50,19 +50,92 @@ def load_json_object(
         data = json.loads(stripped, parse_constant=reject_constant)
     except json.JSONDecodeError as exc:
         if exc.msg == "Extra data" and schema is not None and schema.get("properties"):
-            return _join_json_objects(
+            data = _join_json_objects(
                 stripped, schema, json.JSONDecoder(parse_constant=reject_constant),
                 normalizations,
             )
-        raise InvalidJSONOutput(
-            f"LLM final output is not valid JSON: {exc.msg} "
-            f"at line {exc.lineno}, column {exc.colno} (char {exc.pos}); "
-            "return only the complete JSON object, without prose or HTML",
-            stripped,
-        ) from exc
+        else:
+            raise InvalidJSONOutput(
+                f"LLM final output is not valid JSON: {exc.msg} "
+                f"at line {exc.lineno}, column {exc.colno} (char {exc.pos}); "
+                "return only the complete JSON object, without prose or HTML",
+                stripped,
+            ) from exc
     if not isinstance(data, dict):
         raise ValueError("LLM output must be a JSON object")
+    if schema is not None:
+        _normalize_specification_result(data, schema, normalizations)
     return data
+
+
+def _normalize_specification_result(
+    data: dict[str, Any], schema: dict[str, Any],
+    normalizations: list[dict[str, Any]] | None,
+) -> None:
+    """Recover explicit specification containers without creating graph data.
+
+    Run in both the transport's completeness check and the recorder's decoder,
+    before unknown fields are removed. Every recovered value still undergoes
+    the normal graph, source and evidence validation.
+    """
+    properties = schema.get("properties", {})
+    if not {"fsm", "sources", "latestness_rationale", "uncertainties"} <= properties.keys():
+        return
+    graph_fields = properties["fsm"].get("properties", {})
+    if not {"states", "transitions"} <= graph_fields.keys():
+        return
+    aliases = {
+        "specification_fsm": "fsm", "spec_fsm": "fsm",
+        "state_machine": "fsm", "finite_state_machine": "fsm",
+        "rfc_sources": "sources", "normative_sources": "sources",
+    }
+
+    def move(target: dict[str, Any], key: str, value: Any, origin: str, path: str) -> None:
+        if key in target and json.dumps(target[key], sort_keys=True) != json.dumps(value, sort_keys=True):
+            raise ValueError(
+                f"Conflicting specification result fields: {path} and {origin}; "
+                "return one consistent object with fsm, sources, latestness_rationale and uncertainties"
+            )
+        target[key] = value
+        if normalizations is not None:
+            normalizations.append({"path": path, "original_path": origin,
+                                   "reason": "specification_result_container_normalized"})
+
+    def normalize(container: dict[str, Any], path: str, depth: int = 0) -> None:
+        if depth > 8:
+            raise ValueError("Specification result has too many nested result containers")
+        # Only named result envelopes qualify; never search arbitrary metadata
+        # or pick one of multiple candidate answers.
+        for envelope in ("result", "data", "output", "specification", "specification_result"):
+            nested = container.get(envelope)
+            if not isinstance(nested, dict):
+                continue
+            normalize(nested, f"{path}.{envelope}", depth + 1)
+            if not ({"fsm", "sources"} & nested.keys()):
+                continue
+            for key in properties:
+                if key in nested:
+                    move(container, key, nested[key], f"{path}.{envelope}.{key}", f"{path}.{key}")
+                    del nested[key]
+            if not nested:
+                del container[envelope]
+        for alias, canonical in aliases.items():
+            if alias in container:
+                move(container, canonical, container[alias], f"{path}.{alias}", f"{path}.{canonical}")
+                del container[alias]
+        # A flattened graph must explicitly supply both collections. Missing
+        # sources are never inferred from URLs or filled with an empty array.
+        if {"states", "transitions"} <= container.keys():
+            graph = container.get("fsm", {})
+            if not isinstance(graph, dict):
+                raise ValueError(f"{path}.fsm conflicts with flattened specification graph")
+            for key in graph_fields:
+                if key in container:
+                    move(graph, key, container[key], f"{path}.{key}", f"{path}.fsm.{key}")
+                    del container[key]
+            container["fsm"] = graph
+
+    normalize(data, "$")
 
 
 def _join_json_objects(

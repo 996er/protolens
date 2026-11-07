@@ -596,6 +596,8 @@ IPSM 状态标签是 campaign-global observation，不是 per-seed execution pro
 
 #### 6.5 MonitorAgent 运行时覆盖率闭环
 
+详细职责、逐步流程、状态与配置说明见 [MonitorAgent 功能与执行流程](MONITOR_AGENT.md)。
+
 `MonitorAgent` 在 AFLNet running 回调中周期性工作：
 
 ```text

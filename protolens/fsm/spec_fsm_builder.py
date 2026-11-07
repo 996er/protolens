@@ -166,6 +166,10 @@ class SpecificationFSMBuilder:
                 "Do not infer a normative transition without evidence; record uncertainty instead.",
                 f"Stop searching after at most {config.fsm_build.max_web_search_calls} tool calls and always emit the final JSON object.",
                 "Return only data conforming to the supplied JSON Schema.",
+                "The root object must contain fsm, sources, latestness_rationale and uncertainties. "
+                "Put the graph under fsm and the nonempty authoritative source list under sources; "
+                "do not return a research summary, a JSON Schema, or a wrapper around the result. "
+                "Even after validation feedback, regenerate the entire result, not only corrected fields.",
                 "fsm must include initial_state, terminal_states and error_states. Use exact declared state names. "
                 "Return empty terminal_states/error_states arrays only when the specification supports no such roles in this modeled scope.",
             ],
