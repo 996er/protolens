@@ -140,7 +140,7 @@
   },
   "llm": {
     "provider": "openai-compatible",
-    "model": "workbuddy-ai/deepseek-v4.1-flash",
+    "model": "deepseek-flash",
     "temperature": 0.0,
     "timeout_seconds": 180,
     "response_format": "json_object",

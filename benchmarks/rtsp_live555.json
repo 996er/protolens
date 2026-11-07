@@ -1,9 +1,13 @@
 {
   "protocol": "rtsp",
   "target_name": "sample-live555",
-  "spec_paths": ["./specs/rtsp_minimal.txt"],
+  "spec_paths": [
+    "./specs/rtsp_minimal.txt"
+  ],
   "source_root": "./sample_targets",
-  "entrypoints": ["rtsp_server.c"],
+  "entrypoints": [
+    "rtsp_server.c"
+  ],
   "build_command": "",
   "run_command": "./testOnDemandRTSPServer 8554",
   "host": "127.0.0.1",
@@ -14,6 +18,8 @@
     "timeout_ms": 1000,
     "duration_seconds": 0,
     "dry_run": true,
+    "cwd": null,
+    "env": {},
     "cmd": [
       "../afl-fuzz",
       "-d",
@@ -45,5 +51,29 @@
     "provider": "offline",
     "model": "rule-based",
     "temperature": 0.0
+  },
+  "source_coverage": {
+    "enabled": false,
+    "target_cmd": [
+      "/home/ubuntu/experiments/live555-cov/testProgs/testOnDemandRTSPServer",
+      "8555"
+    ],
+    "source_root": "/home/ubuntu/experiments/live555-cov",
+    "build_root": "/home/ubuntu/experiments/live555-cov",
+    "cwd": "/home/ubuntu/experiments/live555-cov/testProgs",
+    "host": "127.0.0.1",
+    "port": 8555,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "127.0.0.1",
+    "http_port": 0,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
   }
 }

@@ -1,0 +1,63 @@
+{
+  "protocol": "rtsp",
+  "target_name": "live555-coverage",
+  "source_root": "/home/ubuntu/experiments/live555",
+  "host": "127.0.0.1",
+  "port": 8554,
+  "run_dir": "/home/ubuntu/experiments/runs/rtsp-live555-coverage",
+  "aflnet": {
+    "dry_run": true,
+    "cwd": "/home/ubuntu/experiments/live555/testProgs",
+    "cmd": [
+      "/home/ubuntu/protolens/afl-fuzz",
+      "-d",
+      "-i",
+      "/home/ubuntu/experiments/in-rtsp",
+      "-o",
+      "/home/ubuntu/experiments/runs/rtsp-live555-coverage/output",
+      "-N",
+      "tcp://127.0.0.1/8554",
+      "-P",
+      "RTSP",
+      "-D",
+      "10000",
+      "-q",
+      "3",
+      "-s",
+      "3",
+      "-E",
+      "-K",
+      "-R",
+      "--",
+      "/home/ubuntu/experiments/live555/testProgs/testOnDemandRTSPServer",
+      "8554"
+    ],
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
+  },
+  "source_coverage": {
+    "enabled": true,
+    "target_cmd": [
+      "/home/ubuntu/experiments/live555-cov/testProgs/testOnDemandRTSPServer",
+      "8555"
+    ],
+    "source_root": "/home/ubuntu/experiments/live555-cov",
+    "build_root": "/home/ubuntu/experiments/live555-cov",
+    "cwd": "/home/ubuntu/experiments/live555-cov/testProgs",
+    "host": "127.0.0.1",
+    "port": 8555,
+    "gcov_binary": "gcov",
+    "startup_seconds": 0.2,
+    "replay_timeout_seconds": 3.0,
+    "shutdown_signal": "SIGUSR1",
+    "shutdown_seconds": 3.0,
+    "poll_seconds": 1.0,
+    "http_host": "127.0.0.1",
+    "http_port": 8895,
+    "max_monitor_regions": 20,
+    "env": {
+      "WORKDIR": "/home/ubuntu/experiments"
+    }
+  }
+}
