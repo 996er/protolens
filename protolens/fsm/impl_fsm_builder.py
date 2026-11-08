@@ -323,6 +323,7 @@ class ImplementationFSMBuilder:
     """Recover implementation state semantics through LLM source analysis only."""
 
     CACHE_VERSION = "implementation-transition-facts-v2-protocol-contract"
+    ASSEMBLY_CACHE_VERSION = "implementation-assembly-v1-scoped-catalogue"
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_implementation", llm_client)
@@ -334,6 +335,7 @@ class ImplementationFSMBuilder:
         self._state_declaration_repairs: list[dict[str, Any]] = []
         self._state_reference_repairs: list[dict[str, Any]] = []
         self.last_reused_chunks = 0
+        self._assembly_state_aliases: dict[str, str] = {}
 
     def build(
         self, config: ProtoLensConfig, *, force: bool = False,
@@ -349,6 +351,7 @@ class ImplementationFSMBuilder:
         self._state_declaration_repairs = []
         self._state_reference_repairs = []
         self.last_reused_chunks = 0
+        self._assembly_state_aliases = {}
         self.last_transition_facts = {}
         self.last_evidence_table = {}
         self.last_manifest = manifest
@@ -438,7 +441,7 @@ class ImplementationFSMBuilder:
         }
         if on_progress:
             on_progress(f"assembling implementation FSM from {len(facts)} verified transition facts")
-        assembled = self._assemble_fsm(config, facts, evidence_table, on_progress=on_progress)
+        assembled = self._assemble_fsm(config, facts, evidence_table, force=force, on_progress=on_progress)
         materialized = self._materialize_assembled_fsm(assembled, facts, evidence_table)
         fsm = fsm_from_llm(
             materialized,
@@ -457,6 +460,7 @@ class ImplementationFSMBuilder:
                 "evidence_repairs": self._evidence_repairs,
                 "state_declaration_repairs": self._state_declaration_repairs,
                 "state_reference_repairs": self._state_reference_repairs,
+                "state_aliases": self._assembly_state_aliases,
             },
         )
         normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
@@ -1018,7 +1022,7 @@ class ImplementationFSMBuilder:
     def _assemble_fsm(
         self, config: ProtoLensConfig, facts: list[dict[str, Any]],
         evidence_table: dict[str, dict[str, Any]],
-        *, on_progress: Callable[[str], None] | None = None,
+        *, force: bool = False, on_progress: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         payload = {
             "task": "Assemble one coherent implementation FSM from compact transition facts.",
@@ -1065,7 +1069,13 @@ class ImplementationFSMBuilder:
             self._state_reference_repairs = reference_repairs
 
         batches = self._assembly_batches(facts)
-        if len(batches) == 1:
+        # A previous single-request assembly may have exceeded its output
+        # budget and saved a catalogue before failing in a transition batch.
+        # Resume that path directly instead of repeating the oversized request.
+        has_catalogue = (not force and ArtifactStore(config.run_dir).path(
+            f"{self._assembly_checkpoint_root(config, facts, evidence_table)}/states.json"
+        ).is_file())
+        if len(batches) == 1 and not has_catalogue:
             try:
                 return self.recorder.call_chat(
                     system=(
@@ -1084,7 +1094,7 @@ class ImplementationFSMBuilder:
                 # Never parse or accept a truncated JSON prefix. Change the
                 # request shape after the client's output retry budget expires.
         assembled, state_repairs, reference_repairs = self._assemble_fsm_batches(
-            config, payload, batches, evidence_table, on_progress=on_progress,
+            config, batches, evidence_table, force=force, on_progress=on_progress,
         )
         validate_result(assembled)
         self._state_declaration_repairs = state_repairs + self._state_declaration_repairs
@@ -1226,58 +1236,189 @@ class ImplementationFSMBuilder:
             batches.append(batch)
         return batches
 
+    @staticmethod
+    def _state_catalogue_context(facts: list[dict[str, Any]]) -> dict[str, Any]:
+        """Losslessly deduplicate state semantics, without fact/evidence identities."""
+        names = sorted({fact[side] for fact in facts for side in ("source", "target")})
+        indices = {name: index for index, name in enumerate(names)}
+        fields = ("trigger", "message_type", "guard", "action", "error_handling")
+        rows: list[list[Any]] = []
+        seen: set[str] = set()
+        for fact in facts:
+            row = [indices[fact["source"]], indices[fact["target"]], *[fact.get(key) for key in fields]]
+            identity = stable_fingerprint(row)
+            if identity not in seen:
+                seen.add(identity)
+                rows.append(row)
+        return {"candidate_states": names,
+                "context_fields": ["source_index", "target_index", *fields],
+                "transition_contexts": rows}
+
+    @staticmethod
+    def _validate_catalogue_aliases(catalogue: dict[str, Any], candidates: set[str]) -> dict[str, str]:
+        names = {state["name"] for state in catalogue["states"]}
+        aliases: dict[str, str] = {}
+        for row in catalogue["state_aliases"]:
+            alias, name = row["alias"], row["name"]
+            if alias not in candidates or name not in names:
+                raise ValueError(f"state alias must map a candidate to a declared state: {row!r}")
+            if alias in aliases or (alias in names and alias != name):
+                raise ValueError(f"duplicate or conflicting state alias: {alias!r}")
+            aliases[alias] = name
+        missing = candidates - names - aliases.keys()
+        if missing:
+            raise ValueError(f"state catalogue omitted candidate identities: {sorted(missing)!r}")
+        return aliases
+
+    @staticmethod
+    def _scoped_assembly_states(
+        catalogue: dict[str, Any], aliases: dict[str, str], batch: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        endpoints = {fact[side] for fact in batch for side in ("source", "target")}
+        relevant = endpoints | {aliases[name] for name in endpoints if name in aliases}
+        return {
+            "declared_states": [state for state in catalogue["states"] if state["name"] in relevant],
+            "state_aliases": [{"alias": name, "name": aliases[name]}
+                              for name in sorted(endpoints) if name in aliases],
+        }
+
+    @staticmethod
+    def _load_assembly_checkpoint(
+        store: ArtifactStore, path: str, *, force: bool,
+        validator: Callable[[dict[str, Any]], None],
+        on_progress: Callable[[str], None] | None,
+    ) -> dict[str, Any] | None:
+        if force or not store.path(path).is_file():
+            return None
+        try:
+            saved = store.read_json(path)
+            if not isinstance(saved, dict) or not isinstance(saved.get("content"), dict):
+                raise ValueError("malformed assembly checkpoint")
+            content = saved["content"]
+            if saved.get("sha256") != stable_fingerprint(content):
+                raise ValueError("assembly checkpoint checksum mismatch")
+            # Cache validation is local only; never make repair requests on a hit.
+            validator(content)
+            return content
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+            if on_progress:
+                on_progress(f"rebuilding invalid implementation assembly checkpoint {path} ({exc})")
+            return None
+
+    @staticmethod
+    def _save_assembly_checkpoint(store: ArtifactStore, path: str, content: dict[str, Any]) -> None:
+        store.write_json(path, {"content": content, "sha256": stable_fingerprint(content)})
+
+    def _assembly_checkpoint_root(
+        self, config: ProtoLensConfig, facts: list[dict[str, Any]], evidence_table: dict[str, dict[str, Any]],
+    ) -> str:
+        client_identity = getattr(self.recorder.llm_client, "cache_identity", None)
+        fingerprint = stable_fingerprint({
+            "version": self.ASSEMBLY_CACHE_VERSION, "builder": self.CACHE_VERSION,
+            "protocol": config.protocol, "target_name": config.target_name,
+            "source_root": str(config.source_root.resolve()), "source_manifest": self.last_manifest,
+            "entrypoints": config.entrypoints,
+            "llm": client_identity() if callable(client_identity) else LLMClient.from_config(config.llm).cache_identity(),
+            "facts": facts, "evidence": evidence_table,
+        })
+        return f"checkpoints/implementation_assembly/{fingerprint}"
+
     def _assemble_fsm_batches(
-        self, config: ProtoLensConfig, payload: dict[str, Any],
+        self, config: ProtoLensConfig,
         batches: list[list[dict[str, Any]]], evidence_table: dict[str, dict[str, Any]],
-        *, on_progress: Callable[[str], None] | None = None,
+        *, force: bool = False, on_progress: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         # Decide aliases and roles once using global context. Independent FSMs
         # per batch would disagree on state names and produce multiple entries.
         state_schema = deepcopy(IMPLEMENTATION_ASSEMBLY_SCHEMA)
         state_schema["required"].remove("transitions")
         del state_schema["properties"]["transitions"]
+        state_schema["required"].append("state_aliases")
+        state_schema["properties"]["state_aliases"] = {
+            "type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["alias", "name"],
+                "properties": {key: {"type": "string", "minLength": 1} for key in ("alias", "name")},
+            },
+        }
+        all_facts = [fact for batch in batches for fact in batch]
+        context = self._state_catalogue_context(all_facts)
+        candidate_names = set(context["candidate_states"])
+        state_schema["properties"]["state_aliases"]["maxItems"] = len(candidate_names)
+        store = ArtifactStore(config.run_dir)
+        checkpoint_root = self._assembly_checkpoint_root(config, all_facts, evidence_table)
+        state_checkpoint = f"{checkpoint_root}/states.json"
         accepted_role_repairs: list[dict[str, Any]] = []
+
+        def check_states(result: dict[str, Any]) -> None:
+            if not protocol_label_matches(config.protocol, result["protocol"]):
+                raise ValueError(f"state catalogue protocol must match {config.protocol!r}")
+            states, _ = self._coalesce_assembly_states(result["states"])
+            if any(state["name"] != state["name"].strip() for state in states):
+                raise ValueError("state names must not have leading or trailing whitespace")
+            if sum(state["is_initial"] for state in states) != 1:
+                raise ValueError("declare exactly one evidence-backed initial state")
+            self._validate_catalogue_aliases(result, candidate_names)
 
         def validate_states(result: dict[str, Any]) -> None:
             nonlocal accepted_role_repairs
             if not protocol_label_matches(config.protocol, result["protocol"]):
                 raise ValueError(f"state catalogue protocol must match {config.protocol!r}")
             repaired_states, role_repairs = self._repair_conflicting_assembly_states(
-                config, result, [fact for batch in batches for fact in batch],
+                config, result, all_facts,
             )
-            states, _ = self._coalesce_assembly_states(repaired_states)
-            if any(state["name"] != state["name"].strip() for state in states):
-                raise ValueError("state names must not have leading or trailing whitespace")
-            if sum(state["is_initial"] for state in states) != 1:
-                raise ValueError("declare exactly one evidence-backed initial state")
+            check_states({**result, "states": repaired_states})
             result["states"] = repaired_states
             accepted_role_repairs = role_repairs
 
-        if on_progress:
-            on_progress(f"assembling global implementation state catalogue for {len(batches)} transition batches")
-        catalogue = self.recorder.call_chat(
-            system="You are ProtoLens ImplementationFSM state assembler. Use the complete facts to resolve state identities and roles.",
-            payload={
-                **payload,
-                "task": "Declare the global state catalogue only. Transitions will be assembled in separate bounded batches.",
-                "requirements": [
-                    "Return protocol, version, states and uncertainties only; do not reproduce transitions or fact ID lists.",
-                    "Resolve aliases only when the full transition semantics support equivalence; declare every state needed by the facts.",
-                    "Declare unique state names and exactly one is_initial=true. All roles must be supported by the facts.",
-                    "Do not infer terminal status from absent outgoing edges or error status from the name.",
-                    "Use concise descriptions (preferably within 400 characters) that explain identity and any supported aliases.",
-                ],
-                "transition_facts": [
-                    {key: value for key, value in fact.items() if key not in {"model_id", "evidence_ids"}}
-                    for fact in payload["transition_facts"]
-                ],
-            },
-            schema=state_schema,
-            schema_name="protolens_impl_fsm_states",
-            validator=validate_states,
+        def validate_saved_states(content: dict[str, Any]) -> None:
+            validate_json_schema(content["result"], state_schema)
+            check_states(content["result"])
+            names = [state["name"] for state in content["result"]["states"]]
+            if len(names) != len(set(names)):
+                raise ValueError("cached catalogue contains duplicate states")
+            if (not isinstance(content["repairs"], list)
+                    or any(not isinstance(repair, dict) for repair in content["repairs"])):
+                raise ValueError("invalid state repair audit")
+
+        saved_states = self._load_assembly_checkpoint(
+            store, state_checkpoint, force=force, validator=validate_saved_states, on_progress=on_progress,
         )
-        catalogue["states"], state_repairs = self._coalesce_assembly_states(catalogue["states"])
-        state_repairs = accepted_role_repairs + state_repairs
+        if saved_states is not None:
+            catalogue, state_repairs = saved_states["result"], saved_states["repairs"]
+            if on_progress:
+                on_progress("implementation state catalogue: reused validated checkpoint")
+        else:
+            if on_progress:
+                on_progress(f"assembling global implementation state catalogue for {len(batches)} transition batches "
+                            f"({len(candidate_names)} candidate states, {len(context['transition_contexts'])} distinct contexts)")
+            catalogue = self.recorder.call_chat(
+                system="You are ProtoLens ImplementationFSM state assembler. Resolve state identities and roles from candidate states and their transition contexts.",
+                payload={
+                    "protocol": config.protocol, "target_name": config.target_name,
+                    "task": "Declare the global state catalogue only. Transitions will be assembled in separate bounded batches.",
+                    "requirements": [
+                        "Return protocol, version, states, state_aliases and uncertainties; do not reproduce transitions or contexts.",
+                        "context_fields defines each transition_contexts row; source_index/target_index are zero-based indices into candidate_states.",
+                        "Contexts are deduplicated by exact semantics, without truncation. Distinct guards, actions and error paths are retained.",
+                        "Resolve aliases only when transition semantics support equivalence. Every candidate name must be a declared state or appear as an alias mapping to a declared state.",
+                        "state_aliases contains only renamed candidates: {alias: original candidate name, name: declared canonical name}. Use [] when every candidate keeps its name. Never map a declared state name to another state.",
+                        "Declare unique state names and exactly one is_initial=true. All roles must be supported by the contexts.",
+                        "Do not infer terminal status from absent outgoing edges or error status from the name.",
+                        "Use concise descriptions (preferably within 400 characters) that explain identity and any supported aliases.",
+                    ],
+                    **context,
+                },
+                schema=state_schema,
+                schema_name="protolens_impl_fsm_states",
+                validator=validate_states,
+            )
+            catalogue["states"], state_repairs = self._coalesce_assembly_states(catalogue["states"])
+            state_repairs = accepted_role_repairs + state_repairs
+            self._save_assembly_checkpoint(store, state_checkpoint, {"result": catalogue, "repairs": state_repairs})
+        aliases = self._validate_catalogue_aliases(catalogue, candidate_names)
+        self._assembly_state_aliases = dict(aliases)
+        catalogue = {key: value for key, value in catalogue.items() if key != "state_aliases"}
         batch_schema = {
             "type": "object", "additionalProperties": False,
             "required": ["transitions", "uncertainties"],
@@ -1289,13 +1430,49 @@ class ImplementationFSMBuilder:
         transitions: list[dict[str, Any]] = []
         uncertainties = list(catalogue["uncertainties"])
         reference_repairs: list[dict[str, Any]] = []
-        all_facts = [fact for batch in batches for fact in batch]
 
         def assemble_batch(batch: list[dict[str, Any]], label: str) -> None:
-            if on_progress:
-                on_progress(f"assembling implementation transition batch {label} ({len(batch)} facts)")
             accepted_candidate: dict[str, Any] | None = None
             accepted_repairs: list[dict[str, Any]] = []
+            batch_checkpoint = (f"{checkpoint_root}/batch_{label}_" + stable_fingerprint({
+                "facts": batch, "catalogue": catalogue, "aliases": aliases,
+            }) + ".json")
+            current_names = {state["name"] for state in catalogue["states"]}
+
+            def validate_completed(candidate: dict[str, Any]) -> None:
+                validate_json_schema(candidate, ASSEMBLED_IMPLEMENTATION_SCHEMA)
+                self._validate_fact_coverage(candidate, batch)
+                declared = {state["name"]: state for state in candidate["states"]}
+                if len(declared) != len(candidate["states"]):
+                    raise ValueError("batch contains duplicate state declarations")
+                if any(declared.get(state["name"]) != state for state in catalogue["states"]):
+                    raise ValueError("batch changed an existing global state declaration")
+                fsm = fsm_from_llm(
+                    self._materialize_assembled_fsm(candidate, batch, evidence_table),
+                    builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA,
+                )
+                normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
+                self._validate_code_evidence(fsm)
+
+            def validate_saved_batch(content: dict[str, Any]) -> None:
+                nonlocal accepted_candidate, accepted_repairs
+                if content.get("kind") == "split" and len(batch) > 1:
+                    return
+                if content.get("kind") != "completed":
+                    raise ValueError("invalid batch checkpoint kind")
+                validate_json_schema(content["result"], self._assembly_fact_schema(batch_schema, batch))
+                additions = content["state_additions"]
+                validate_json_schema(additions, {"type": "array", "items": ASSEMBLY_STATE_SCHEMA})
+                if any(state["name"] in current_names for state in additions):
+                    raise ValueError("cached state addition overwrites an existing state")
+                candidate = {**catalogue, **content["result"], "states": [*catalogue["states"], *additions]}
+                validate_completed(candidate)
+                repairs = content["repairs"]
+                transition_ids = {item["id"] for item in candidate["transitions"]}
+                if (not isinstance(repairs, list) or any(not isinstance(repair, dict)
+                        or repair.get("transition_id") not in transition_ids for repair in repairs)):
+                    raise ValueError("invalid cached state-reference repair audit")
+                accepted_candidate, accepted_repairs = candidate, repairs
 
             def validate_batch(result: dict[str, Any]) -> None:
                 nonlocal accepted_candidate, accepted_repairs
@@ -1303,48 +1480,71 @@ class ImplementationFSMBuilder:
                 candidate, repairs = self._repair_assembly_state_references(
                     config, {**catalogue, **result}, batch, evidence_table,
                 )
-                fsm = fsm_from_llm(
-                    self._materialize_assembled_fsm(candidate, batch, evidence_table),
-                    builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA,
-                )
-                normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
-                self._validate_code_evidence(fsm)
+                validate_completed(candidate)
                 # Failed candidates must not alter the shared catalogue or audit.
                 # Keep the response shape intact; the recorder retains raw output.
                 result["transitions"] = candidate["transitions"]
                 accepted_candidate, accepted_repairs = candidate, repairs
 
-            try:
-                result = self.recorder.call_chat(
-                    system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and existing global state identities.",
-                    payload={
-                        "task": "Assemble only this batch of transitions; do not reproduce state declarations or source evidence.",
-                        "protocol": config.protocol,
-                        "target_name": config.target_name,
-                        "requirements": [
-                            "Every supplied fact id must be covered by fact_ids; never reference facts outside this batch.",
-                            "fact_ids must contain only transition_facts[].id values; never use evidence IDs or model IDs.",
-                            "Use unique transition IDs within this response. Use exact state names from declared_states when they represent the fact endpoints.",
-                            "Deduplicate only equivalent facts; preserve distinct guards, actions and error paths. Do not invent behavior.",
-                            "Preserve existing state identities and roles. Use their descriptions to resolve supported aliases.",
-                            "If a fact endpoint has no equivalent declared state, retain its exact fact endpoint name; ProtoLens will request a fact-backed declaration separately. Never force it into an unrelated state.",
-                            "Keep text concise and return only transitions and uncertainties.",
-                        ],
-                        "declared_states": catalogue["states"],
-                        "transition_facts": self._assembly_fact_payload(batch),
-                    },
-                    schema=self._assembly_fact_schema(batch_schema, batch),
-                    schema_name=f"protolens_impl_fsm_transitions_{label}",
-                    validator=validate_batch,
-                    result_normalizer=lambda value: self._repair_assembly_fact_references(config, value, batch, all_facts),
-                )
-            except IncompleteLLMResponse as exc:
-                if not self._assembly_output_exhausted(exc) or len(batch) <= 1:
-                    raise
+            saved_batch = self._load_assembly_checkpoint(
+                store, batch_checkpoint, force=force, validator=validate_saved_batch, on_progress=on_progress,
+            )
+            if saved_batch is not None and saved_batch["kind"] == "split":
+                if on_progress:
+                    on_progress(f"implementation transition batch {label}: resuming saved subdivision")
                 midpoint = len(batch) // 2
                 assemble_batch(batch[:midpoint], f"{label}_a")
                 assemble_batch(batch[midpoint:], f"{label}_b")
                 return
+            if saved_batch is not None:
+                result = saved_batch["result"]
+                if on_progress:
+                    on_progress(f"implementation transition batch {label}: reused validated checkpoint")
+            else:
+                if on_progress:
+                    on_progress(f"assembling implementation transition batch {label} ({len(batch)} facts)")
+                try:
+                    result = self.recorder.call_chat(
+                        system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and existing global state identities.",
+                        payload={
+                            "task": "Assemble only this batch of transitions; do not reproduce state declarations or source evidence.",
+                            "protocol": config.protocol,
+                            "target_name": config.target_name,
+                            "requirements": [
+                                "Every supplied fact id must be covered by fact_ids; never reference facts outside this batch.",
+                                "fact_ids must contain only transition_facts[].id values; never use evidence IDs or model IDs.",
+                                "Use unique transition IDs within this response. Use exact state names from declared_states when they represent the fact endpoints.",
+                                "Deduplicate only equivalent facts; preserve distinct guards, actions and error paths. Do not invent behavior.",
+                                "Preserve existing state identities and roles. Use their descriptions to resolve supported aliases.",
+                                "declared_states is the subset relevant to this batch; use state_aliases to map original fact endpoints to canonical names. Other global states are intentionally omitted.",
+                                "If a fact endpoint has no equivalent declared state, retain its exact fact endpoint name; ProtoLens will request a fact-backed declaration separately. Never force it into an unrelated state.",
+                                "Keep text concise and return only transitions and uncertainties.",
+                            ],
+                            **self._scoped_assembly_states(catalogue, aliases, batch),
+                            "transition_facts": self._assembly_fact_payload(batch),
+                        },
+                        schema=self._assembly_fact_schema(batch_schema, batch),
+                        schema_name=f"protolens_impl_fsm_transitions_{label}",
+                        validator=validate_batch,
+                        result_normalizer=lambda value: self._repair_assembly_fact_references(config, value, batch, all_facts),
+                    )
+                except IncompleteLLMResponse as exc:
+                    if not self._assembly_output_exhausted(exc) or len(batch) <= 1:
+                        raise
+                    # Scheduling marker, not an accepted result. Resume the
+                    # successful children without retrying the oversized parent.
+                    self._save_assembly_checkpoint(store, batch_checkpoint, {"kind": "split"})
+                    midpoint = len(batch) // 2
+                    assemble_batch(batch[:midpoint], f"{label}_a")
+                    assemble_batch(batch[midpoint:], f"{label}_b")
+                    return
+                assert accepted_candidate is not None
+                self._save_assembly_checkpoint(store, batch_checkpoint, {
+                    "kind": "completed", "result": result,
+                    "state_additions": [state for state in accepted_candidate["states"]
+                                        if state["name"] not in current_names],
+                    "repairs": accepted_repairs,
+                })
             assert accepted_candidate is not None
             # Publish verified additions only after this batch is accepted, so
             # later batches see them without changing earlier state identities.

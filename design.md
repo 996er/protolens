@@ -218,7 +218,9 @@ SpecificationFSMBuilder.build(config, implementation_capabilities)
   -> 只接收 TransitionFact 中去重后的 message_type/trigger 能力
   -> 生成默认协议查询或读取 fsm_build.rfc_queries
   -> LLMClient.responses_json(web_search=true, tool_choice=required)
+  -> SSE 保留 response.output_item.done 中已完成的搜索记录，补回终止响应遗漏的 output 项和来源字段；要求搜索但仍没有实际搜索记录时，在客户端有界重试后报告工具记录缺失并保留原始响应，不进入缺字段修补
   -> max_web_search_calls 限制工具调用；有实际 Web Search 记录时，空正文、非 JSON 正文或缺少必需顶层字段都会触发无工具 Schema 补全请求。补全结果仍无效时只重试最终 JSON，反馈具体错误，不重复检索；耗尽后保留最后正文与检索记录
+  -> 无工具补全使用专门的最终结果指令，替换研究阶段要求先搜索的指令；回放搜索记录时同时保留兼容网关放在 output_text/choices 中、未写入 output 消息的研究正文
   -> 最终正文提取不回退读取 reasoning_content、encrypted_content 或工具参数。JSON 解析接受 BOM 和完整代码围栏，拒绝混入说明文字、HTML、多个 JSON 对象或非对象结果；完整 Schema 和 FSM 语义仍由 builder 校验
   -> 缺字段时按 Schema 递归收集所有缺失位置，验证已有值、实际检索记录和来源域名后，将可修复字段一次性提交给无工具补全请求。响应 Schema 为每个缺失位置分配独立字段，本地仅写入这些位置，不覆盖已有值；状态角色只能选择已声明名称。缺失整个图、状态名、来源 URL 或证据文本等核心数据时拒绝补造。补全结果重新执行完整 Schema、图结构和来源证据校验，记录 metadata.field_repairs；仅含角色字段时保留 metadata.state_role_repairs。补全耗尽重试后不会重启检索。客户端对缺少顶层说明字段的可解析结果交由此流程处理，避免提前重生整张图
   -> status=incomplete 且 reason=max_output_tokens 时保留原始响应：已完成 Web Search 的请求回放原始输入、搜索输出和加密推理上下文后进入无工具收口，其他请求按 2 倍提高 max_output_tokens 后重试；收口预算最低 24000，逐次倍增，上限 128000
@@ -250,7 +252,9 @@ ImplementationFSMBuilder.build(config)
   -> 省略号/改写/错误路径证据只对失败的 transition 发起修复：模型选择当前 chunk 的源码片段和局部行号范围，本地直接复制原文并记录真实字符位置，保留已验证事实
   -> 修复不得修改或丢弃 transition；不受源码支持的边明确标记 unresolved，仍要求模型重生，重试耗尽则构建失败
   -> 本地把完全相同的源码证据去重到 EvidenceTable，TransitionFact 只保留 evidence_ids
-  -> 小规模 compact TransitionFact 一次组装；大规模先用全部 facts 统一状态定义，再按最多 64 条及序列化字节预算分批生成边和 fact_ids，不传源码摘录
+  -> 小规模 compact TransitionFact 一次组装；大规模先从全部 facts 提取去重候选状态及必要转移上下文，统一状态定义，再按最多 64 条及序列化字节预算分批生成边和 fact_ids，不传源码摘录。目录输入以 candidate_states 索引表示端点，context_fields 定义上下文行字段；精确去重 trigger/message_type/guard/action/error_handling 语义组合，不携带事实 ID、证据 ID 或置信度，不截断或丢弃不同条件与错误路径
+  -> 全局目录显式返回 state_aliases（原候选名到规范状态名），必须覆盖所有未按原名声明的候选，禁止冲突映射或引用不存在的状态；别名仅由模型依据上下文判断。转移批次只传当前事实端点相关的状态声明及别名，完整状态目录留在本地供引用修复与最终校验使用；别名保存在 impl_fsm.metadata.state_aliases
+  -> 全局目录与每个已校验转移批次立即原子写入 checkpoints/implementation_assembly/<fingerprint>/。指纹绑定组装版本、协议、目标、源码清单与根目录、入口点、模型配置、全部事实和证据；批次另绑定输入状态目录和当前事实。缓存恢复检查内容哈希、Schema、状态身份、事实覆盖及源码证据，不调用 LLM 修复缓存；损坏缓存重新生成。批次缓存只保存转移结果、新增状态及修复审计，不重复存整张目录。输出截断时保存拆分安排，重跑直接恢复已成功子批；--force 跳过读取缓存。已有目录的单批回退任务直接恢复分批流程，不重复尝试此前过大的整图请求
   -> 组装与引用修复请求只传事实的规范 id 和语义字段，不传 model_id/evidence_ids；完整组装与每个转移批次的 fact_ids Schema 均枚举当前请求允许的事实 ID。模型误用证据 ID 时，仅在完整事实集合中该证据唯一属于一个当前批次事实时恢复规范 ID，并记录原值；共享证据不会展开为多个事实，也不凭 ev_ 前缀推断。仍无法确定的引用按单条转换定向修复，只返回固定 transition_id、fact_ids 和 rationale，保留已合法引用及其他语义字段，不重写其他转换。单值引用可转数组，重复引用去重；缺失、歧义或越界引用不能自动绑定到尚未覆盖的事实。定向修复耗尽则严格中止并保留已验证源码块缓存，最后仍检查全部事实覆盖、状态引用和源码证据
   -> 单次完整组装耗尽输出预算时切换为分批组装；转移批次因 max_output_tokens 截断时二分重试，单条仍失败则明确终止，不接受截断结果；结构或语义不合格输出仍使用配置重试预算
   -> assembler 在每个状态声明中输出 is_initial/is_terminal/is_error 布尔属性；本地生成标准 FSM 的初始/终止/错误状态引用，避免模型单独维护名称列表导致悬空引用；必须恰有一个初始状态
