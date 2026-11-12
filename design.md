@@ -222,7 +222,8 @@ SpecificationFSMBuilder.build(config, implementation_capabilities)
   -> max_web_search_calls 限制工具调用；有实际 Web Search 记录时，空正文、非 JSON 正文或缺少必需顶层字段都会触发无工具 Schema 补全请求。补全结果仍无效时只重试最终 JSON，反馈具体错误，不重复检索；耗尽后保留最后正文与检索记录
   -> 无工具补全使用专门的最终结果指令，替换研究阶段要求先搜索的指令；回放搜索记录时同时保留兼容网关放在 output_text/choices 中、未写入 output 消息的研究正文
   -> 最终正文提取不回退读取 reasoning_content、encrypted_content 或工具参数。JSON 解析接受 BOM 和完整代码围栏，拒绝混入说明文字、HTML、多个 JSON 对象或非对象结果；完整 Schema 和 FSM 语义仍由 builder 校验
-  -> 缺字段时按 Schema 递归收集所有缺失位置，验证已有值、实际检索记录和来源域名后，将可修复字段一次性提交给无工具补全请求。响应 Schema 为每个缺失位置分配独立字段，本地仅写入这些位置，不覆盖已有值；状态角色只能选择已声明名称。缺失整个图、状态名、来源 URL 或证据文本等核心数据时拒绝补造。补全结果重新执行完整 Schema、图结构和来源证据校验，记录 metadata.field_repairs；仅含角色字段时保留 metadata.state_role_repairs。补全耗尽重试后不会重启检索。客户端对缺少顶层说明字段的可解析结果交由此流程处理，避免提前重生整张图
+  -> 构建层仍遇到缺失 fsm/sources 时，若已有实际搜索记录及来源，保留原任务范围、实现能力、原始研究正文和搜索输出，单独请求生成缺失的根字段；已有字段不覆盖，恢复的来源须在搜索记录中出现且属于权威域名。该请求独立使用有界重试，失败不重启整轮检索，无检索来源时仍拒绝补造
+  -> 缺字段时按 Schema 递归收集所有缺失位置，验证已有值、实际检索记录和来源域名后，将可修复字段一次性提交给无工具补全请求。响应 Schema 为每个缺失位置分配独立字段，本地仅写入这些位置，不覆盖已有值；状态角色只能选择已声明名称。根字段恢复后仍缺失状态名、来源 URL 或证据文本等核心数据时拒绝补造。补全结果重新执行完整 Schema、图结构和来源证据校验，记录 metadata.field_repairs；仅含角色字段时保留 metadata.state_role_repairs。补全耗尽重试后不会重启检索。客户端对缺少顶层说明字段的可解析结果交由此流程处理，避免提前重生整张图
   -> status=incomplete 且 reason=max_output_tokens 时保留原始响应：已完成 Web Search 的请求回放原始输入、搜索输出和加密推理上下文后进入无工具收口，其他请求按 2 倍提高 max_output_tokens 后重试；收口预算最低 24000，逐次倍增，上限 128000
   -> 失败的 incomplete 原始响应及 usage 会写入 findings/fsm_*.llm.jsonl，便于区分模型输出耗尽与空响应
   -> Web Search 仅允许 rfc-editor.org / datatracker.ietf.org / ietf.org
