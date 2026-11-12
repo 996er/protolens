@@ -67,7 +67,7 @@ def _wire_graph(fsm: ProtocolFSM) -> dict[str, Any]:
 class FSMMerger:
     """Compare bounded candidate blocks, then assemble every input locally."""
 
-    CACHE_VERSION = "fsm-semantic-records-v4"
+    CACHE_VERSION = "fsm-semantic-records-v5-shared-scope"
     # Evidence selection changes assembled results, while the record contract
     # stays compatible. Reuse verified records whose exact inputs are unchanged.
     DECISION_CONTRACT = "fsm-semantic-records-v3"
@@ -83,6 +83,10 @@ class FSMMerger:
     ) -> tuple[ProtocolFSM, list[Divergence]]:
         if self.recorder.llm_client.is_offline:
             raise RuntimeError("FSM comparison and merge require an online LLM")
+        spec_policy = spec_fsm.metadata.get("modeling_policy")
+        impl_policy = impl_fsm.metadata.get("modeling_policy")
+        if spec_policy != impl_policy:
+            raise ValueError("specification and implementation FSMs use different analysis scopes or abstraction policies; rebuild both with build-fsm")
         spec_fsm, impl_fsm = deepcopy(spec_fsm), deepcopy(impl_fsm)
         normalize_fsm_protocol(impl_fsm, spec_fsm.protocol, component="ImplementationFSM")
         for fsm in (spec_fsm, impl_fsm):
@@ -142,6 +146,7 @@ class FSMMerger:
                 "input_versions": {"spec": spec_fsm.version, "impl": impl_fsm.version},
                 "semantic_decision_count": len(runner.completed), "comparison_record_count": len(all_results),
                 "merge_limits": limits,
+                "modeling_policy": deepcopy(spec_policy),
             },
         )
         validate_json_schema(_wire_graph(unified), MERGED_FSM_SCHEMA)

@@ -6,6 +6,7 @@ from typing import Any
 import re
 
 from protolens.config import ProtoLensConfig
+from protolens.fsm.abstraction import compact_graph, modeling_policy
 from protolens.protocols import seed_message_contract
 from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
@@ -112,7 +113,7 @@ def _transition_evidence_repair_schema(
 class SpecificationFSMBuilder:
     """Build a specification FSM exclusively through an online LLM call."""
 
-    CACHE_VERSION = "specification-scoped-web-v3-protocol-contract"
+    CACHE_VERSION = "specification-scoped-web-v4-shared-abstraction"
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_specification", llm_client)
@@ -150,7 +151,8 @@ class SpecificationFSMBuilder:
             "allowed_standard_domains": config.fsm_build.allowed_rfc_domains,
             "as_of_utc": datetime.now(timezone.utc).date().isoformat(),
             "rfc_search_queries": queries,
-            "analysis_scope": config.fsm_build.rfc_analysis_scope,
+            "analysis_scope": config.fsm_build.effective_analysis_scope,
+            "modeling_policy": modeling_policy(config),
             "target_implementation_capabilities": implementation_capabilities or [],
             "legacy_local_spec_name_hints": [path.name for path in config.spec_paths],
             "requirements": [
@@ -160,6 +162,9 @@ class SpecificationFSMBuilder:
                 "Determine obsoletes/updates relationships and prefer the newest applicable normative text.",
                 "Model only behavior inside analysis_scope, using the selected protocol's transport, message framing, sequencing and security semantics.",
                 extension_requirement,
+                "Keep mandatory behavior within analysis_scope even when target implementation capabilities do not mention it; this may be a missing implementation.",
+                "Only include optional extensions with positive target support evidence when target_supported_extensions_only applies; do not expand them just because a search result mentions them.",
+                "For considered behaviors excluded by scope or optional-extension applicability, record the behavior, exclusion reason and authoritative source in uncertainties. Do not claim excluded behavior was compared.",
                 "Do not expand file contents, directory listing formats, registry-only metadata, or unrelated application semantics into states.",
                 "Every transition must cite a declared sources[].url and section in evidence.location.",
                 "Each evidence item must include source_type='rfc' (the legacy normative-standard evidence category), location, a nonempty verbatim standard excerpt, and confidence. A URL or section number alone is not complete evidence.",
@@ -231,7 +236,7 @@ class SpecificationFSMBuilder:
                 "rfc_sources": sources,
                 "latestness_rationale": data.get("latestness_rationale", ""),
                 "uncertainties": data.get("uncertainties", []),
-                "analysis_scope": config.fsm_build.rfc_analysis_scope,
+                "analysis_scope": config.fsm_build.effective_analysis_scope,
                 "target_implementation_capabilities": implementation_capabilities or [],
                 "target_supported_extensions_only": config.fsm_build.target_supported_extensions_only,
                 "web_search_verified": True,
@@ -251,7 +256,7 @@ class SpecificationFSMBuilder:
         )
         fsm.metadata["evidence_repairs"] = list(self.last_evidence_repairs)
         validate_fsm(fsm)
-        return fsm
+        return compact_graph(fsm, config)
 
     def _recover_missing_evidence_fields(
         self, config: ProtoLensConfig, data: dict[str, Any], response: LLMResponse,

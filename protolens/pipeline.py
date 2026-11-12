@@ -16,6 +16,7 @@ from protolens.agents.monitor_agent import MonitorAgent
 from protolens.fuzzer.source_coverage import SourceCoverageCollector, coverage_feedback
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_merger import FSMMerger
+from protolens.fsm.abstraction import modeling_policy
 from protolens.fsm.fsm_model import (
     Conflict,
     Divergence,
@@ -102,11 +103,13 @@ class ProtoLensPipeline:
             "implementation_transition_facts.json",
             "implementation_evidence_table.json",
             "implementation_source_manifest.json",
+            "implementation_scope.json",
         ]
         source_snapshot = self.impl_builder.input_snapshot(self.config)
         fingerprint = stable_fingerprint(
             {
                 "builder": self.impl_builder.CACHE_VERSION,
+                "modeling_policy": modeling_policy(self.config),
                 "protocol": self.config.protocol,
                 "target_name": self.config.target_name,
                 "entrypoints": self.config.entrypoints,
@@ -162,6 +165,12 @@ class ProtoLensPipeline:
         if not facts_path.is_file():
             raise ValueError("implementation_transition_facts.json is required; run build-impl first")
         fact_artifact = self.store.read_json("implementation_transition_facts.json")
+        if isinstance(fact_artifact, dict):
+            if fact_artifact.get("scope_status", "complete") != "complete":
+                raise ValueError("implementation scope selection is incomplete; run build-impl first")
+            saved_policy = fact_artifact.get("modeling_policy")
+            if saved_policy is not None and saved_policy != modeling_policy(self.config):
+                raise ValueError("implementation facts use a different analysis scope or abstraction policy; run build-impl first")
         capabilities = _implementation_capabilities(fact_artifact)
         artifacts = ["spec_fsm.json"]
         fingerprint = stable_fingerprint(
@@ -169,7 +178,7 @@ class ProtoLensPipeline:
                 "builder": self.spec_builder.CACHE_VERSION,
                 "protocol": self.config.protocol,
                 "rfc_queries": self.config.fsm_build.rfc_queries,
-                "rfc_analysis_scope": self.config.fsm_build.rfc_analysis_scope,
+                "modeling_policy": modeling_policy(self.config),
                 "target_supported_extensions_only": self.config.fsm_build.target_supported_extensions_only,
                 "allowed_rfc_domains": self.config.fsm_build.allowed_rfc_domains,
                 "max_web_search_calls": self.config.fsm_build.max_web_search_calls,
@@ -206,6 +215,10 @@ class ProtoLensPipeline:
                 raise ValueError(f"{name} is required before merge-fsm")
         spec_fsm = ProtocolFSM.from_dict(self.store.read_json("spec_fsm.json"))
         impl_fsm = self._load_implementation_fsm()
+        for fsm in (spec_fsm, impl_fsm):
+            saved_policy = fsm.metadata.get("modeling_policy")
+            if saved_policy is not None and saved_policy != modeling_policy(self.config):
+                raise ValueError("input FSM uses a different analysis scope or abstraction policy; run build-fsm first")
         artifacts = ["unified_fsm.json", "divergences.json", "merge_decisions.json"]
         fingerprint = stable_fingerprint(
             {
@@ -885,9 +898,20 @@ def _implementation_capabilities(artifact: object) -> list[dict[str, str]]:
 
     capabilities: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    included = artifact.get("included_fact_ids")
+    if included is not None:
+        if (not isinstance(included, list) or not all(isinstance(item, str) for item in included)
+                or len(set(included)) != len(included)):
+            raise ValueError("implementation included_fact_ids must be unique fact IDs")
+        known = {fact.get("id") for fact in facts if isinstance(fact, dict)}
+        if not set(included) <= known:
+            raise ValueError("implementation included_fact_ids references unknown facts")
+        included = set(included)
     for fact in facts:
         if not isinstance(fact, dict):
             raise ValueError("implementation transition fact must be an object")
+        if included is not None and fact.get("id") not in included:
+            continue
         trigger = str(fact.get("trigger", "")).strip()
         if not trigger:
             raise ValueError("implementation transition fact requires trigger")

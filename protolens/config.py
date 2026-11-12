@@ -186,6 +186,9 @@ class FSMBuildConfig:
             "optional extensions evidenced as supported by the target implementation",
         ]
     )
+    # Empty shared scope inherits the legacy RFC scope for both builders.
+    analysis_scope: list[str] = field(default_factory=list)
+    compact_fsm: bool = True
     target_supported_extensions_only: bool = True
     allowed_rfc_domains: list[str] = field(
         default_factory=lambda: ["rfc-editor.org", "datatracker.ietf.org", "ietf.org"]
@@ -216,6 +219,12 @@ class FSMBuildConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "FSMBuildConfig":
         data = data or {}
         defaults = cls()
+        if not isinstance(data.get("analysis_scope", []), list):
+            raise ValueError("fsm_build.analysis_scope must be an array of nonempty strings")
+        if any(not isinstance(item, str) or not item.strip() for item in data.get("analysis_scope", [])):
+            raise ValueError("fsm_build.analysis_scope must be an array of nonempty strings")
+        if not isinstance(data.get("compact_fsm", True), bool):
+            raise ValueError("fsm_build.compact_fsm must be a boolean")
         return cls(
             rfc_queries=[str(item).strip() for item in data.get("rfc_queries", []) if str(item).strip()],
             rfc_analysis_scope=[
@@ -223,6 +232,8 @@ class FSMBuildConfig:
                 for item in data.get("rfc_analysis_scope", defaults.rfc_analysis_scope)
                 if str(item).strip()
             ],
+            analysis_scope=[item.strip() for item in data.get("analysis_scope", [])],
+            compact_fsm=data.get("compact_fsm", defaults.compact_fsm),
             target_supported_extensions_only=bool(
                 data.get("target_supported_extensions_only", defaults.target_supported_extensions_only)
             ),
@@ -248,6 +259,10 @@ class FSMBuildConfig:
             merge_candidate_limit=int(data.get("merge_candidate_limit", defaults.merge_candidate_limit)),
             merge_request_bytes=int(data.get("merge_request_bytes", defaults.merge_request_bytes)),
         )
+
+    @property
+    def effective_analysis_scope(self) -> list[str]:
+        return list(self.analysis_scope or self.rfc_analysis_scope)
 
 
 @dataclass
@@ -491,8 +506,12 @@ class ProtoLensConfig:
             raise ValueError("fsm_build.merge_request_bytes must be at least 8000")
         if not self.fsm_build.allowed_rfc_domains:
             raise ValueError("fsm_build.allowed_rfc_domains must not be empty")
-        if not self.fsm_build.rfc_analysis_scope:
-            raise ValueError("fsm_build.rfc_analysis_scope must not be empty")
+        if not self.fsm_build.effective_analysis_scope:
+            raise ValueError("fsm_build.analysis_scope or rfc_analysis_scope must not be empty")
+        if any(not isinstance(item, str) or not item.strip() for item in self.fsm_build.effective_analysis_scope):
+            raise ValueError("FSM analysis scope entries must be nonempty strings")
+        if not isinstance(self.fsm_build.compact_fsm, bool):
+            raise ValueError("fsm_build.compact_fsm must be a boolean")
         if not self.fsm_build.source_extensions:
             raise ValueError("fsm_build.source_extensions must not be empty")
 

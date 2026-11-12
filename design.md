@@ -113,7 +113,7 @@ main(argv)
 2. `build-impl`：只分析源码，生成 TransitionFact、EvidenceTable 和 ImplementationFSM。
 3. `build-spec`：读取实现能力，按限定范围检索 RFC 并生成 SpecificationFSM。
 4. `merge-fsm`：读取两个已完成 FSM，生成 UnifiedFSM 和 divergence。
-5. `build-fsm`：按 `build-impl -> build-spec -> merge-fsm` 恢复执行，默认复用有效 checkpoint。
+5. (`build-fsm`：按 `build-impl -> build-spec -> merge-fsm` 恢复执行，默认复用有效 checkpoint。)
 6. `reason`：读取已有 FSM/divergence，运行 agent 和 conflict detector。
 7. `fuzz`：读取已有 FSM/conflict，规划路径并准备或执行 AFLNet。
 8. `run`：端到端串行执行 `init_run -> build_fsm -> reason -> synthesize_and_fuzz -> write_report`。
@@ -143,7 +143,7 @@ ProtoLensConfig.load(config_path)
 4. `run_command` 只是配置快照/人工参考字段，不作为 AFLNet 启动入口。
 5. `AFLNetAdapter._build_command()` 只返回 `config.aflnet.cmd`，不展开占位符、不合成命令、不从其他字段兜底。
 6. FSM 构建要求在线 `llm.provider`，并要求服务实现 Responses API、Web Search 和 Structured Outputs；离线 provider 不会触发规则 fallback。
-7. `fsm_build.rfc_queries` 控制 RFC 检索问题，`rfc_analysis_scope` 限定规范分析面，`target_supported_extensions_only=true` 时可选扩展必须先出现在实现 TransitionFact 的能力列表中。`allowed_rfc_domains` 限制权威来源，`max_web_search_calls` 防止模型只搜索而不输出。RFC URL 按文档身份规范化，去除搜索跟踪片段并识别 RFC Editor/IETF 的 HTML、TXT、PDF、info、errata 和 datatracker 路径。模型若引用尚未出现在搜索结果中的 RFC，系统不会重建大型 FSM，而是分批执行只打开缺失 URL 的小型定向 Web Search；结构化验证输出失败时，已完成工具调用中的来源证据仍会保留。补证后仍未验证的来源不允许进入 FSM。`source_extensions`、`ignore_directories`、`chunk_chars`、`max_file_bytes` 控制源码语料读取。
+7. `fsm_build.rfc_queries` 控制 RFC 检索问题，`analysis_scope` 定义两侧共用的分析范围，未配置或为空时两侧继承旧字段 `rfc_analysis_scope`；`compact_fsm` 默认开启共同状态抽象与保守缩图，`target_supported_extensions_only=true` 时可选扩展必须先出现在实现 TransitionFact 的能力列表中。`allowed_rfc_domains` 限制权威来源，`max_web_search_calls` 防止模型只搜索而不输出。RFC URL 按文档身份规范化，去除搜索跟踪片段并识别 RFC Editor/IETF 的 HTML、TXT、PDF、info、errata 和 datatracker 路径。模型若引用尚未出现在搜索结果中的 RFC，系统不会重建大型 FSM，而是分批执行只打开缺失 URL 的小型定向 Web Search；结构化验证输出失败时，已完成工具调用中的来源证据仍会保留。补证后仍未验证的来源不允许进入 FSM。`source_extensions`、`ignore_directories`、`chunk_chars`、`max_file_bytes` 控制源码语料读取。
 
 ### 2. `init` 执行流程
 
@@ -192,7 +192,7 @@ build_fsm(force=false)
      -> 源码文件 SHA-256 + 配置 + 模型形成 implementation fingerprint
      -> checkpoint 有效则直接读取工件，否则生成 TransitionFact/EvidenceTable/ImplementationFSM
   -> build_specification()
-     -> 从 TransitionFact 提取 message_type/trigger 能力，不传源码证据
+     -> 从范围筛选保留的 TransitionFact 提取 message_type/trigger 能力，不传源码证据
      -> RFC 范围 + 能力 + 配置 + 模型形成 specification fingerprint
      -> checkpoint 有效则直接读取工件，否则执行限定范围的 RFC web search
   -> merge_fsms()
@@ -208,6 +208,33 @@ ImplementationFSM 还会将每个通过校验的源码块原子保存到 `checkp
 FSM 对话审计日志跨运行追加保存，每条记录包含开始时间、schema/stage、原始响应和校验失败原因。结构化结果的 Schema 校验和语义校验共用有界重试预算；空 states/transitions、重复状态、未知端点、错误协议、缺失事实映射等都在接受结果前验证并向模型反馈。传输重试由 LLMClient 负责，耗尽后 recorder 不再次重复整组请求。最终错误标明组件和 schema，方便从 `findings/fsm_implementation.llm.jsonl` 等文件定位。
 
 共享响应入口对规范、实现和合并 FSM 的缺失 `protocol` 从受信任的请求上下文补齐，缺失 `version` 补为 `null`（仅当 Schema 允许空值）。未提供的状态说明记为空字符串，未提供的状态级引用在 Schema 允许空列表时记为 `[]`；边上必须存在的证据不适用此规则。每项处理在对话记录的 `normalizations` 中保存字段路径及原因。已有值不覆盖，类型错误和协议冲突仍拒绝；不补造状态、边或证据内容。此处理先于 Schema 校验和缺失字段定向补全，因此多字段同时遗漏也可恢复。
+
+两个 FSM 共用 `fsm_build.analysis_scope` 与 `compact_fsm`。例如：
+
+```json
+{
+  "fsm_build": {
+    "analysis_scope": [
+      "服务端控制连接的建立与关闭",
+      "认证、权限与命令顺序，包括异常输入和失败路径",
+      "数据连接的建立、传输与关闭，以及所需前置行为",
+      "目标实现有支持证据的可选扩展及其协议依赖"
+    ],
+    "compact_fsm": true,
+    "target_supported_extensions_only": true
+  }
+}
+```
+
+`analysis_scope=[]` 继承旧 `rfc_analysis_scope`，所以现有配置也会将相同范围应用于实现侧。范围列表描述分析行为；状态抽象规则由共用的 `modeling_policy` 提供。`compact_fsm=false` 关闭抽象粒度提示和本地缩图，但仍进行共同范围筛选。没有状态数硬上限，不截断图或证据。
+
+实现侧先提取并保存全部原始 TransitionFact/EvidenceTable，再由模型逐条判定 include、exclude 或 uncertain。请求每批最多 32 条，超过约 60000 字节时继续拆分，单条事实及其证据不截断。每条判断必须覆盖一个已知事实 ID，引用该事实自己的证据，并说明适用的范围条目与理由；只有明确完全在范围外的事实才排除。混合行为、依赖不明或是否适用不确定时保留，初始化、清理、认证、错误处理等范围内行为的前置依赖也须保留。每批结果独立缓存，改变范围会重做筛选和组装，但不重做已验证的源码提取。全部被排除时明确报错，不生成空图。
+
+`implementation_scope.json` 保存完整筛选决定、范围及保留事实 ID。`implementation_transition_facts.json` 仍保存所有事实，并包含 `included_fact_ids` 和 `scope_decisions`；仅保留事实进入组装，保留集合仍须被输出转换完整覆盖。`scope_status=pending` 的事实工件不能用于 build-spec。规范侧根据同一范围和保留的实现能力生成图；范围内强制行为不因实现未找到而删除，已考虑但不纳入的规范行为及来源、理由记录在 uncertainties 中。可选扩展仍遵守 `target_supported_extensions_only`。
+
+两侧生成阶段使用同一状态粒度：状态表达影响后续命令合法性、权限或连接行为的持久条件，瞬时动作优先表达为转换的 guard/action/error_handling。行为等价且角色一致的别名由模型归并；不同条件、权限和错误路径不得为缩小图而合并。生成后由 `protolens/fsm/abstraction.py` 做保守的本地归并：只有说明文本完全相同、角色一致且后续标记行为在分区细化中等价的状态可以合并；初始状态、空说明状态、没有出边的状态单独保留。转换仅在映射后的端点和 trigger/message_type/guard/action/error_handling 全部相同时去重，引用取并集，置信度取保守最小值。不按不可达性删除状态，也不进行模糊语义匹配。
+
+`metadata.abstraction` 保存缩图前后计数、状态和转换成员映射，以及受影响元素的原始声明；审计中的证据以内容指纹关联合并图上的原始引用，避免在实现 FSM metadata 重复存储源码摘录。实现图的 `metadata.transition_fact_ids` 同步归并，仍可追溯到全部保留事实。范围及抽象策略参与阶段指纹和组装缓存；合并时拒绝两侧策略不一致的工件，旧图与新图混用需要重新执行 build-fsm。比较结果仅描述所选范围，不把被排除的行为计作 missing/extra。
 
 #### 4.1 SpecificationFSMBuilder
 
@@ -227,7 +254,7 @@ SpecificationFSMBuilder.build(config, implementation_capabilities)
   -> status=incomplete 且 reason=max_output_tokens 时保留原始响应：已完成 Web Search 的请求回放原始输入、搜索输出和加密推理上下文后进入无工具收口，其他请求按 2 倍提高 max_output_tokens 后重试；收口预算最低 24000，逐次倍增，上限 128000
   -> 失败的 incomplete 原始响应及 usage 会写入 findings/fsm_*.llm.jsonl，便于区分模型输出耗尽与空响应
   -> Web Search 仅允许 rfc-editor.org / datatracker.ietf.org / ietf.org
-  -> 仅分析控制连接状态、认证与命令顺序、数据连接建立、TLS/安全扩展
+  -> 根据共同 analysis_scope 分析；默认覆盖控制连接、认证与命令顺序、数据连接及适用安全扩展
   -> 可选扩展仅在目标实现能力列表存在对应命令/触发条件时纳入
   -> 排除文件内容、目录展示、纯注册表元数据和无关应用语义
   -> 模型解析 RFC update/obsolete 链和最新适用规范
@@ -263,7 +290,7 @@ ImplementationFSMBuilder.build(config)
   -> 未声明的边端点按最多 8 个、相关转移与事实序列化约 24 KB 分组管理，组内逐端点请求与重试；单个超大端点上下文不截断。每次固定 transition_id 和 source/target 侧，只返回一项修复及至多一个新声明，避免一个错误重生成其他端点。候选仅包含本轮修复开始前的已有状态及当前 transition 的 fact_ids 在同侧端点上的真实名称；允许纠正 assembler 写错的名称，不要求真实名称等于原错误名称。本轮刚新增的状态不能因处理顺序而成为其他端点的无条件别名候选。新增声明不能新增初始状态。每项说明建议不超过 600 字符、新状态描述建议不超过 400 字符；这两项仅为输出建议，完整长文本保留在结果及审计中，不截断、不改成占位说明，也不因超长触发重试。该规则同时适用于全局状态目录、状态引用修复和事实引用修复；rationale 仍须为非空字符串。支持 fact ID 最多 16 个，禁止重输出整张状态表或图。每个端点按配置预算独立重试，失败不再触发外层重生成转移批次；耗尽后严格中止并保留已验证源码块缓存。程序仅在本地候选上应用端点修改和受支持声明，保留其余边属性和全部 fact_ids；各项校验身份覆盖、来源及状态角色，全部完成后再校验完整 FSM，记录 metadata.state_reference_repairs 及 repair_batch。不会猜测补标点或接受残缺 JSON
   -> 新引入状态的 supporting_fact_ids 由程序按当前 transition 的已验证 facts、精确同侧端点名称恢复，取稳定排序后的至多 16 个直接支持项，保留原模型引用及恢复原因。这只恢复已知关联，不推断状态、角色或新行为。对原有状态的语义别名，仍要求模型选择本转换的支持事实并提供 rationale；不存在同侧事实支持的新名称仍拒绝，不拿 source 的事实充当 target 支持，也不为缺失论据生成默认值
   -> 分批组装同样执行端点修复；已有状态定义和角色保持不变，事实支持的遗漏声明仅在整批校验成功后加入全局状态表，供后续批次使用。失败候选不修改共享状态；修复审计中的 transition_id 同步为最终批次前缀 ID，并保留原始 ID 和批次编号
-  -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验
+  -> 本地按 fact_ids 恢复内存中的证据并执行最终精确原文校验；两侧随后执行共同保守缩图并保留映射
   -> 校验协议名、FSM 结构和每条 transition 的源码证据
   -> evidence.excerpt 必须是已读取源码中的精确原文，否则构建失败
   -> ImplementationFSM 和 UnifiedFSM 同样归一到配置协议 ID，避免模型展示名称传播到后续组件
@@ -1012,14 +1039,14 @@ class Conflict:
 
 1. 协议名和 `fsm_build.rfc_queries`。
 2. 当前 UTC 日期和 RFC/IETF 权威域名白名单。
-3. `rfc_analysis_scope` 和从实现 TransitionFact 提取的紧凑能力列表。
+3. 共同 `analysis_scope`（缺省继承 `rfc_analysis_scope`）、抽象策略，以及从保留的实现 TransitionFact 提取的紧凑能力列表。
 
 处理流程：
 
 1. 通过 Responses API 强制调用 Web Search，检索最新适用 RFC 及 update/obsolete 关系。
 2. LLM 只在配置范围内阅读检索结果；可选扩展还必须由目标实现能力列表证明支持。
-3. Structured Outputs 强制结果满足 SpecificationFSM JSON Schema。
-4. Builder 校验 Web Search 调用、权威 URL、RFC 边证据和 FSM 引用完整性。
+3. 按共同状态粒度生成图，Structured Outputs 强制结果满足 SpecificationFSM JSON Schema。
+4. Builder 校验 Web Search 调用、权威 URL、RFC 边证据和 FSM 引用完整性，再保守归并等价状态及重复转换。
 5. 输出 `spec_fsm.json` 和 `findings/fsm_specification.llm.jsonl`。
 
 输出：
@@ -1040,9 +1067,9 @@ class Conflict:
 1. 本地遍历、读取、分块源码，不执行正则、AST 或启发式协议语义抽取。
 2. LLM 对每个源码 chunk 分析网络入口、parser、state variable、dispatch、guard、side effect、error return，只返回 TransitionFact。
 3. Builder 验证证据原文后建立去重 EvidenceTable，facts 和后续 assembler 只传递 evidence ID。
-4. 小规模 compact facts 一次组装；大规模先让 LLM 基于全部 facts 统一状态名称、别名及角色，再按最多 64 条及序列化字节预算分批组装转移。完整组装因输出预算截断时也切换为此流程，转移批次截断则递归二分；其他错误仍明确报告。每批共享已有状态定义，并对遗漏端点执行基于事实的定向修复；新增声明须通过整批校验后才能供后续批次使用，不修改既有状态角色，不凭名称推断 EOF 等状态的含义。校验 fact 覆盖、端点和源码证据后，本地为边 ID 添加批次前缀并同步修复审计中的 ID，再合并完整图；单次模型响应的数量上限不限制本地合并后的图、修复候选和证据总数。状态角色由声明内的布尔属性转换为公共 FSM 引用。该变更不影响已验证的源码分块缓存。
-5. Builder 验证每个 fact 都被覆盖，并验证每条最终实现边至少有一段可在项目源码中精确找到的证据原文。
-6. 输出 `impl_fsm.json`、`implementation_transition_facts.json`、`implementation_evidence_table.json`、source manifest 和对话审计文件。
+4. 先按共同范围筛选并保留审计，再对保留的 compact facts 组装；小规模一次完成，大规模先让 LLM 基于全部保留 facts 统一状态名称、别名及角色，再按最多 64 条及序列化字节预算分批组装转移。完整组装因输出预算截断时也切换为此流程，转移批次截断则递归二分；其他错误仍明确报告。每批共享已有状态定义，并对遗漏端点执行基于事实的定向修复；新增声明须通过整批校验后才能供后续批次使用，不修改既有状态角色，不凭名称推断 EOF 等状态的含义。校验 fact 覆盖、端点和源码证据后，本地为边 ID 添加批次前缀并同步修复审计中的 ID，再合并完整图；单次模型响应的数量上限不限制本地合并后的图、修复候选和证据总数。状态角色由声明内的布尔属性转换为公共 FSM 引用。该变更不影响已验证的源码分块缓存。
+5. Builder 验证每个范围内或不确定的保留 fact 都被覆盖，按共同规则缩图，并验证每条最终实现边至少有一段可在项目源码中精确找到的证据原文。
+6. 输出 `impl_fsm.json`、`implementation_transition_facts.json`、`implementation_evidence_table.json`、`implementation_scope.json`、source manifest 和对话审计文件。
 
 输出：
 
@@ -1483,6 +1510,8 @@ runs/<protocol>-<target>-<timestamp>/
       "TLS and protocol security extensions",
       "optional extensions evidenced as supported by the target implementation"
     ],
+    "analysis_scope": [],
+    "compact_fsm": true,
     "target_supported_extensions_only": true,
     "allowed_rfc_domains": [
       "rfc-editor.org",

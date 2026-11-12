@@ -11,6 +11,7 @@ import json
 import re
 
 from protolens.config import ProtoLensConfig
+from protolens.fsm.abstraction import compact_graph, modeling_policy, select_implementation_facts
 from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
@@ -323,7 +324,7 @@ class ImplementationFSMBuilder:
     """Recover implementation state semantics through LLM source analysis only."""
 
     CACHE_VERSION = "implementation-transition-facts-v2-protocol-contract"
-    ASSEMBLY_CACHE_VERSION = "implementation-assembly-v1-scoped-catalogue"
+    ASSEMBLY_CACHE_VERSION = "implementation-assembly-v2-shared-scope"
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_implementation", llm_client)
@@ -431,6 +432,7 @@ class ImplementationFSMBuilder:
             "version": 1,
             "protocol": config.protocol,
             "facts": facts,
+            "scope_status": "pending",
             "analyzed_files": sorted(reported_files),
             "uncertainties": uncertainties,
         }
@@ -439,7 +441,23 @@ class ImplementationFSMBuilder:
             "source_root": str(config.source_root),
             "entries": evidence_table,
         }
+        # Persist original facts before selection, including when a later model
+        # request fails. Scope changes reuse verified source extraction caches.
+        store.write_json("implementation_transition_facts.json", self.last_transition_facts)
+        store.write_json("implementation_evidence_table.json", self.last_evidence_table)
+        all_fact_count = len(facts)
+        facts, scope_decisions = select_implementation_facts(
+            config, self.recorder, facts, evidence_table, force=force, on_progress=on_progress,
+        )
+        self.last_transition_facts.update({
+            "scope_status": "complete",
+            "modeling_policy": modeling_policy(config),
+            "included_fact_ids": [fact["id"] for fact in facts],
+            "scope_decisions": scope_decisions,
+        })
+        store.write_json("implementation_transition_facts.json", self.last_transition_facts)
         if on_progress:
+            on_progress(f"implementation scope: retained {len(facts)}/{all_fact_count} facts; originals preserved")
             on_progress(f"assembling implementation FSM from {len(facts)} verified transition facts")
         assembled = self._assemble_fsm(config, facts, evidence_table, force=force, on_progress=on_progress)
         materialized = self._materialize_assembled_fsm(assembled, facts, evidence_table)
@@ -451,11 +469,17 @@ class ImplementationFSMBuilder:
                 "source_root": str(config.source_root),
                 "entrypoints": config.entrypoints,
                 "source_manifest": manifest,
-                "uncertainties": assembled.get("uncertainties", []) + uncertainties,
+                "uncertainties": assembled.get("uncertainties", []) + uncertainties + [
+                    f"Scope uncertain; retained {row['fact_id']}: {row['rationale']}"
+                    for row in scope_decisions if row["decision"] == "uncertain"
+                ],
                 "semantic_extractor": "llm_only",
                 "transition_facts_artifact": "implementation_transition_facts.json",
                 "evidence_table_artifact": "implementation_evidence_table.json",
-                "transition_fact_count": len(facts),
+                "transition_fact_count": all_fact_count,
+                "included_transition_fact_count": len(facts),
+                "scope_artifact": "implementation_scope.json",
+                "transition_fact_ids": {item["id"]: item["fact_ids"] for item in assembled["transitions"]},
                 "evidence_count": len(evidence_table),
                 "evidence_repairs": self._evidence_repairs,
                 "state_declaration_repairs": self._state_declaration_repairs,
@@ -465,7 +489,12 @@ class ImplementationFSMBuilder:
         )
         normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")
         self._validate_code_evidence(fsm)
-        return fsm
+        compacted = compact_graph(fsm, config)
+        self._validate_code_evidence(compacted)
+        if on_progress:
+            on_progress(f"implementation FSM: {len(fsm.states)} -> {len(compacted.states)} states, "
+                        f"{len(fsm.transitions)} -> {len(compacted.transitions)} transitions after compaction")
+        return compacted
 
     def drain_conversations(self) -> list[dict[str, Any]]:
         return self.recorder.drain_conversations()
@@ -1026,6 +1055,7 @@ class ImplementationFSMBuilder:
     ) -> dict[str, Any]:
         payload = {
             "task": "Assemble one coherent implementation FSM from compact transition facts.",
+            "modeling_policy": modeling_policy(config),
             "protocol": config.protocol,
             "target_name": config.target_name,
             "requirements": [
@@ -1315,6 +1345,7 @@ class ImplementationFSMBuilder:
         client_identity = getattr(self.recorder.llm_client, "cache_identity", None)
         fingerprint = stable_fingerprint({
             "version": self.ASSEMBLY_CACHE_VERSION, "builder": self.CACHE_VERSION,
+            "modeling_policy": modeling_policy(config),
             "protocol": config.protocol, "target_name": config.target_name,
             "source_root": str(config.source_root.resolve()), "source_manifest": self.last_manifest,
             "entrypoints": config.entrypoints,
@@ -1397,6 +1428,7 @@ class ImplementationFSMBuilder:
                 payload={
                     "protocol": config.protocol, "target_name": config.target_name,
                     "task": "Declare the global state catalogue only. Transitions will be assembled in separate bounded batches.",
+                    "modeling_policy": modeling_policy(config),
                     "requirements": [
                         "Return protocol, version, states, state_aliases and uncertainties; do not reproduce transitions or contexts.",
                         "context_fields defines each transition_contexts row; source_index/target_index are zero-based indices into candidate_states.",
@@ -1508,6 +1540,7 @@ class ImplementationFSMBuilder:
                         system="You are ProtoLens ImplementationFSM transition assembler. Preserve all supplied facts and existing global state identities.",
                         payload={
                             "task": "Assemble only this batch of transitions; do not reproduce state declarations or source evidence.",
+                            "modeling_policy": modeling_policy(config),
                             "protocol": config.protocol,
                             "target_name": config.target_name,
                             "requirements": [
