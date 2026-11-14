@@ -1332,26 +1332,27 @@ class ImplementationFSMBuilder:
         decisions: list[dict[str, Any]] = []
         for candidate_name in sorted(candidates - names - fixed.keys()):
             new_state_schema = deepcopy(ASSEMBLY_STATE_SCHEMA)
-            new_state_schema["type"] = ["object", "null"]
             new_state_schema["properties"]["name"] = {"type": "string", "enum": [candidate_name]}
             new_state_schema["properties"]["is_initial"] = {"type": "boolean", "enum": [False]}
             schema = {
                 "type": "object", "additionalProperties": False,
-                "required": ["alias", "name", "new_state", "rationale"],
+                "required": ["alias", "name", "new_states", "rationale"],
                 "properties": {
                     "alias": {"type": "string", "enum": [candidate_name]},
                     "name": {"type": "string", "enum": sorted(names | {candidate_name})},
-                    "new_state": new_state_schema,
+                    # Some Responses providers reject object/null type unions.
+                    # An empty or singleton array expresses the same choice.
+                    "new_states": {"type": "array", "items": new_state_schema, "maxItems": 1},
                     "rationale": deepcopy(ASSEMBLY_RATIONALE_SCHEMA),
                 },
             }
 
             def validate_repair(value: dict[str, Any]) -> None:
                 if value["name"] == candidate_name:
-                    if value["new_state"] is None:
-                        raise ValueError("retaining the candidate name requires its state declaration")
-                elif value["new_state"] is not None:
-                    raise ValueError("mapping to an existing state requires new_state=null")
+                    if len(value["new_states"]) != 1:
+                        raise ValueError("retaining the candidate name requires exactly one state declaration")
+                elif value["new_states"]:
+                    raise ValueError("mapping to an existing state requires new_states=[]")
                 if not value["rationale"].strip():
                     raise ValueError("state alias repair requires a non-empty semantic rationale")
 
@@ -1366,9 +1367,9 @@ class ImplementationFSMBuilder:
                         "proposed_state_aliases": original,
                         "fixed_state_aliases": [{"alias": alias, "name": name} for alias, name in sorted(fixed.items())],
                         "requirements": [
-                            "Return one object with alias, name, new_state and a non-empty rationale. Copy candidate_name exactly into alias; do not return an alias list or omit this candidate.",
-                            "If the contexts support equivalence to a declared state, copy its exact name into name and return new_state=null.",
-                            "If this candidate is a distinct state omitted from the catalogue, use candidate_name as name and supply its full new_state declaration with that exact name. Do not force a distinct state into an unrelated existing state.",
+                            "Return one object with alias, name, new_states and a non-empty rationale. Copy candidate_name exactly into alias; do not return an alias list or omit this candidate.",
+                            "If the contexts support equivalence to a declared state, copy its exact name into name and return new_states=[].",
+                            "If this candidate is a distinct state omitted from the catalogue, use candidate_name as name and put exactly one full declaration with that exact name in new_states. Do not force a distinct state into an unrelated existing state.",
                             "Do not rename or modify existing declarations or roles. A new declaration must have is_initial=false, preserving the catalogue's existing initial state.",
                             "Ground identity, description, confidence and roles in transition contexts. Do not infer equivalence from spelling, abbreviations or order, terminal status from missing outgoing edges, or error status from names.",
                             "context_fields defines each transition_contexts row; source_index and target_index index candidate_states. Use the full supplied context to explain the decision.",
@@ -1384,8 +1385,8 @@ class ImplementationFSMBuilder:
                     "verified source chunk checkpoints retained, "
                     f"no implementation FSM generated: {exc}"
                 ) from exc
-            if repaired["new_state"] is not None:
-                additions.append(deepcopy(repaired["new_state"]))
+            if repaired["new_states"]:
+                additions.extend(deepcopy(repaired["new_states"]))
             else:
                 aliases[candidate_name] = repaired["name"]
             decisions.append(deepcopy(repaired))
