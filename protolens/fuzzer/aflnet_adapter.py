@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,8 +10,10 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
+import threading
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
 from protolens.config import ProtoLensConfig
 from protolens.fsm.fsm_model import FuzzResult, PlannedStatePath, SeedIntent
@@ -140,6 +143,15 @@ class AFLNetAdapter:
         if prepared.mode != "prepared":
             return prepared
 
+        with _campaign_exit_signals():
+            return self._execute(config, prepared, on_progress)
+
+    def _execute(
+        self,
+        config: ProtoLensConfig,
+        prepared: FuzzResult,
+        on_progress: ProgressCallback | None,
+    ) -> FuzzResult:
         build_error = _run_build_command(config)
         if build_error:
             return replace(
@@ -161,7 +173,7 @@ class AFLNetAdapter:
                 (import_dir / ".processed").mkdir(exist_ok=True)
                 env["AFLNET_PROTOLENS_IMPORT_DIR"] = str(import_dir)
             process = subprocess.Popen(
-                command,
+                _parent_bound_command(command),
                 cwd=str(config.aflnet.working_directory(config.source_root)),
                 start_new_session=True,
                 env=env,
@@ -233,6 +245,10 @@ class AFLNetAdapter:
                     f"ProtoLens aborted AFLNet campaign after internal error: {type(exc).__name__}: {exc}",
                 ),
             )
+        finally:
+            # Also covers SystemExit and other BaseException exits.
+            if process is not None and process.poll() is None:
+                _terminate_process_group(process)
 
     def prepare_and_run(
         self,
@@ -405,15 +421,52 @@ def _monitor_import_dir(config: ProtoLensConfig) -> Path:
     return config.monitor_agent.import_dir or (config.run_dir / "monitor_import_queue")
 
 
+@contextmanager
+def _campaign_exit_signals() -> Iterator[None]:
+    """Let termination signals unwind the campaign's cleanup on the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+    stopping = False
+
+    def stop(signum: int, _frame: object) -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise SystemExit(128 + signum)
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            previous[signum] = signal.signal(signum, stop)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _parent_bound_command(command: list[str]) -> list[str]:
+    if not sys.platform.startswith("linux"):
+        return command
+    # Use a fresh interpreter instead of preexec_fn, which can deadlock when
+    # monitor/coverage threads are running. exec preserves the child's PID.
+    launcher = Path(__file__).with_name("_parent_death_exec.py")
+    return [sys.executable, str(launcher), str(os.getpid()), *command]
+
+
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait()
         return
     try:
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait()
 
 
