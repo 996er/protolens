@@ -287,7 +287,8 @@ class MonitorAgent:
                 "seed candidates likely to break strong state guards. Mutate only the verified execution frontier "
                 "reconstructed from AFLNet IPSM/queue feedback. Use only client-sendable protocol messages. "
                 "Do not include transport actions such as TCP reset, half-close, or TLS renegotiation."
-                " When source_coverage is present, prioritize small frontier mutations that exercise its "
+                " Top-level source_coverage is global cumulative coverage across all collected gcov replays. "
+                "When it is present, prioritize small frontier mutations that exercise its "
                 "uncovered source lines, branches and functions. Name the source file and line in "
                 "expected_new_coverage, explain the input/guard needed, and use recent_cases to avoid "
                 "repeating low-yield strategies. When uncovered_regions is non-empty, every candidate must "
@@ -297,7 +298,9 @@ class MonitorAgent:
                 "an observation, not proof of identical coverage in the AFLNet binary."
                 " Use monitor_seed_feedback execution_path to inspect the actual response-state sequence "
                 "and per-message cumulative states, including discarded seeds. Bitmap slots are hashed "
-                "feedback, not ordered source branches. Per-seed source_coverage describes a separate gcov replay."
+                "feedback, not ordered source branches. Per-seed source_coverage contains only replay status, "
+                "global coverage totals at collection time and that replay's new-coverage delta; "
+                "it does not contain a per-seed source execution trace."
             ),
             "protocol": config.protocol,
             "seed_message_contract": seed_message_contract(config.protocol),
@@ -669,6 +672,10 @@ class MonitorAgent:
                     # Do not associate a stale replay with a changed seed payload.
                     if coverage["payload_sha256"] != seed.get("payload_sha256"):
                         raise ValueError("source coverage payload mismatch")
+                    # Older runs may still have snapshot links in receipt files.
+                    # Only summaries are part of the global-coverage contract.
+                    for field in ("report", "case_coverage", "case_summary"):
+                        coverage.pop(field, None)
                     receipt["source_coverage"] = {**coverage, "artifact": str(source_record)}
                 except (OSError, ValueError, KeyError, TypeError):
                     receipt["source_coverage"] = {"status": "pending_replay" if receipt.get("executed") else "pending_import"}

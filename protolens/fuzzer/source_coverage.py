@@ -1,4 +1,4 @@
-"""Replay queue entries and executed monitor imports on an isolated gcov target."""
+"""Accumulate global coverage from queue and monitor replays on an isolated gcov target."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -113,6 +113,14 @@ class SourceCoverageCollector:
                     raise ValueError("gcov found no source files under source_coverage.source_root")
                 self.state = {"build_signature": signature, "files": baseline, "cases": {}, "history": []}
                 self.store.write_json("checkpoint.json", self.state)
+            # Old checkpoints contain links to per-case reports. Keep their
+            # processed keys and cumulative counts, but retire snapshot metadata.
+            migrated = False
+            for record in [*self.state["cases"].values(), *self.state["history"]]:
+                for field in ("report", "case_coverage", "case_summary"):
+                    if field in record:
+                        del record[field]
+                        migrated = True
             sources = {}
             for name in self.state["files"]:
                 path = (self.settings.source_root / name).resolve()
@@ -123,6 +131,8 @@ class SourceCoverageCollector:
                     sources[name] = []
             if (self.public.root / "sources.json").is_file() and self.public.read_json("sources.json") != sources:
                 raise ValueError("coverage source text changed; use a new run_dir for matching source and coverage")
+            if migrated:
+                self.store.write_json("checkpoint.json", self.state)
             self.public.write_json("sources.json", sources)
             write_view(self.public.root)
             self._publish()
@@ -395,13 +405,11 @@ class SourceCoverageCollector:
                                   "completed_at": _now(), "status": "collected", "origin": origin,
                                   "basis": "independent_gcov_replay_not_aflnet_execution"}
         next_files = deepcopy(self.state["files"])
-        case_files: dict[str, Any] = {}
         started = time.monotonic()
         try:
             with TemporaryDirectory(dir=self.root, prefix="replay-") as work:
                 replay = self._replay(payload, Path(work))
-                case_files = replay.pop("files")
-                _merge(next_files, case_files)
+                _merge(next_files, replay.pop("files"))
                 record.update(replay)
         except Exception as exc:
             record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -409,17 +417,8 @@ class SourceCoverageCollector:
         record["completed_at"] = _now()
         record["summary"] = _summary(next_files)
         record["delta"] = {name: record["summary"][name]["hit"] - before[name]["hit"] for name in before}
-        relative = f"snapshots/{len(self.state['history']) + 1:06d}-{key[:12]}"
-        record["report"] = relative + "/index.html"
-        record["case_coverage"] = relative + "/case_coverage.json"
-        record["case_summary"] = _summary(case_files)
-        # Keep this execution's counts separately from the cumulative snapshot.
-        self.public.write_json(record["case_coverage"], {
-            **record, "summary": record["case_summary"], "files": self._with_summaries(case_files),
-        })
-        snapshot = {**record, "files": self._with_summaries(next_files)}
-        self.public.write_json(relative + "/coverage.json", snapshot)
-        write_view(self.public.root, snapshot=self.public.path(relative))
+        # Persist only the global counters and a small per-case summary.
+        # Detailed replay counts are consumed by the merge and never archived.
         self.state["files"] = next_files
         self.state["cases"][key] = record
         self.state["history"].append(record)
@@ -436,7 +435,8 @@ class SourceCoverageCollector:
         history = self.state["history"]
         self.public.write_json("history.json", history)
         latest = history[-1] if history else {"summary": _summary(self.state["files"]), "delta": {}}
-        self.public.write_json("latest.json", {**latest, "files": self._with_summaries(self.state["files"])})
+        self.public.write_json("latest.json", {**latest, "scope": "global",
+                                               "files": self._with_summaries(self.state["files"])})
         regions = []
         for name, file in self.state["files"].items():
             missed_lines = [int(line) for line, count in file["lines"].items() if count == 0]
@@ -454,7 +454,7 @@ class SourceCoverageCollector:
                                 "source_excerpt": "\n".join(f"{i+1}: {source[i]}" for i in range(max(0, line-4), min(len(source), line+4))),
                                 "missing_count": len(locations)})
         regions.sort(key=lambda region: (-len(region["uncovered_branch_lines"]), -region["missing_count"], region["file"]))
-        self.store.write_json("feedback.json", {"present": True, "basis": "independent gcov target; line/branch coverage, not AFL bitmap edges",
+        self.store.write_json("feedback.json", {"present": True, "scope": "global", "basis": "independent gcov target; line/branch coverage, not AFL bitmap edges",
                              "source_root": str(self.settings.source_root), "summary": _summary(self.state["files"]),
                              "processed_count": len(history), "failed_count": sum(h["status"] == "failed" for h in history),
                              "updated_at": _now(), "uncovered_regions": regions[:self.settings.max_monitor_regions],
