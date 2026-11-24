@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
+from httpx import TransportError
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 from protolens.utils.json_output import load_json_object
 import json
@@ -490,7 +491,11 @@ class LLMClient:
                         raise RuntimeError(
                             f"LLM returned non-JSON HTTP content: {response.text[:400]}"
                         ) from exc
-        except APIConnectionError as exc:
+        except (APIConnectionError, TransportError) as exc:
+            # SDK request setup wraps connection errors, but consuming a
+            # streaming response can raise raw httpx transport errors (e.g.
+            # RemoteProtocolError for an incomplete chunked body). Route both
+            # through our existing bounded retries; never accept partial text.
             raise RuntimeError(_connection_error_message(exc)) from exc
         if not isinstance(raw, dict):
             raise RuntimeError("LLM returned JSON that is not an object")
@@ -645,7 +650,7 @@ def _http_error_message(error: APIStatusError, max_body_chars: int = 2000) -> st
     return f"HTTP Error {error.status_code}: {error.response.reason_phrase}"
 
 
-def _connection_error_message(error: APIConnectionError) -> str:
+def _connection_error_message(error: APIConnectionError | TransportError) -> str:
     cause: BaseException = error
     seen: set[int] = set()
     while cause.__cause__ is not None and id(cause) not in seen:
