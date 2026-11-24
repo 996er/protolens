@@ -299,6 +299,10 @@ ImplementationFSMBuilder.build(config)
 
 空白或无状态语义的 chunk 可以返回空 TransitionFact 数组，全部 chunk 合并后不允许为空。超出 `max_file_bytes` 的源码会明确报错并终止，不会跳过后伪称已分析。`implementation_evidence_table.json` 是结构化 FSM 工件中源码摘录的唯一存储位置；`implementation_transition_facts.json` 和 `impl_fsm.json` 只保存 `evidence_ids`。`merge-fsm` 在内存中解析引用后再调用 FSMMerger。自动恢复、丢弃和重试过的证据只记录位置和摘要，不在 FSM metadata 重复保存源码原文；LLM 原始结果及 rejected 状态保留在 `findings/fsm_implementation.llm.jsonl` 供调用审计。
 
+完整实现图组装后、保守缩图前，执行不受路径规划预算限制的有向 BFS，检查初始状态能否到达全部保留状态；不能在单个转移批次上提前判断全图连通性。`implementation_connectivity.json` 保存入口、可达数量、不可达状态及转换、修复前后结果和模型决策。若存在不可达状态，模型基于已验证事实返回修复增量：对齐语义等价且终止/错误角色一致的状态别名、纠正有事实支持的入口，或恢复事实已明确表达的初始化、线程交接、回调及分发步骤。已有转换的请求、guard、action、message_type 和事实引用保持不变；不根据名称猜边，不将内部事件改成客户端请求，也不删除未解决的孤立状态。修复必须通过完整事实覆盖、状态引用、精确源码证据和最终可达性校验。
+
+若事实不足以解释剩余连接，构建明确失败并保留 `unresolved_states`、报告和已验证源码/组装缓存，不发布成功的实现阶段 checkpoint。源码提取缺失的关系仍需补充分析，连通性修复不能凭空补造事实。成功修复增量保存在 `checkpoints/implementation_connectivity/`，恢复时重新验证；报告纳入最终阶段工件校验。实现阶段指纹包含组装及连通性版本，升级后旧的最终 FSM 自动失效，但仍可复用源码块和兼容的组装缓存。重建建议执行 `build-fsm --config ...`，随后重新 `reason`、`fuzz`；无需为了启用此修复而加 `--force`。
+
 源码块响应在通用扩展字段过滤之前执行格式规范化，主请求及同块重试共用该入口：`facts` / `transitions` 映射为 `transition_facts`，已知 `result` / `data` / `output` / `implementation` / `fsm` 对象包装中的字段提升到结果根节点；重复字段冲突时拒绝选择其一。单个事实和以事实 ID 为键的对象可无损转换为数组，键与事实内 ID 冲突时仍拒绝。遗漏或 null 的 uncertainties 只记作未提供说明并保存审计，不推断分析确定性；结构化说明保留为 JSON 文本。transition_facts 和 analyzed_files 缺失或 null 均不能补造为空或复制请求清单来伪称已分析，仍要求模型在原块内补齐，并通过完整文件覆盖和原文证据校验。完整结构错误路径写入对话日志，重试反馈按大小限制返回诊断；校验重试统一由源码块外层循环计数，终止错误显示实际块校验尝试次数，不再只显示内层单次调用的 `after 1 attempt(s)`。传输异常仍由客户端处理，已经验证的其他块缓存可继续复用。
 
 源码证据元数据在首次分析和单事实修复中使用同一规范化入口：单个 evidence 对象转为数组，sourceType/type 和 confidenceScore/confidence_score 先归一为规范字段，冲突仍拒绝。仅当字段遗漏时，source_type 由源码分析上下文补为 code；证据 confidence 记为保守的 0.0，并在审计中标明模型未评分，不表示程序评估过支持强度，也不继承转换置信度。选择源码范围的证据修复使用同一缺省评分规则。显式 null、非法值仍需修复；location、excerpt、转换语义及转换自身的 confidence 不按此规则补造。元数据规范化后仍必须通过完整 Schema、文件覆盖和源码原文校验，真正缺失的信息耗尽定向修复后严格中止。

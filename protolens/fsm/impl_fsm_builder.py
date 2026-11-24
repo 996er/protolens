@@ -12,6 +12,7 @@ import re
 
 from protolens.config import ProtoLensConfig
 from protolens.fsm.abstraction import compact_graph, modeling_policy, select_implementation_facts
+from protolens.fsm.connectivity import CONNECTIVITY_VERSION, repair_connectivity
 from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
@@ -325,6 +326,7 @@ class ImplementationFSMBuilder:
 
     CACHE_VERSION = "implementation-transition-facts-v2-protocol-contract"
     ASSEMBLY_CACHE_VERSION = "implementation-assembly-v2-shared-scope"
+    CONNECTIVITY_VERSION = CONNECTIVITY_VERSION
 
     def __init__(self, llm_client: LLMClient) -> None:
         self.recorder = LLMConversationRecorder("fsm_implementation", llm_client)
@@ -460,6 +462,34 @@ class ImplementationFSMBuilder:
             on_progress(f"implementation scope: retained {len(facts)}/{all_fact_count} facts; originals preserved")
             on_progress(f"assembling implementation FSM from {len(facts)} verified transition facts")
         assembled = self._assemble_fsm(config, facts, evidence_table, force=force, on_progress=on_progress)
+
+        def validate_connected_assembly(candidate: dict[str, Any]) -> None:
+            validate_json_schema(candidate, ASSEMBLED_IMPLEMENTATION_SCHEMA)
+            self._validate_fact_coverage(candidate, facts)
+            graph = fsm_from_llm(
+                self._materialize_assembled_fsm(candidate, facts, evidence_table),
+                builder="LLMImplementationFSMBuilder", schema=IMPLEMENTATION_FSM_SCHEMA,
+            )
+            normalize_fsm_protocol(graph, config.protocol, component="ImplementationFSM")
+            self._validate_code_evidence(graph)
+
+        assembled, connectivity = repair_connectivity(
+            assembled, facts, recorder=self.recorder, store=store,
+            transition_schema=ASSEMBLY_TRANSITION_SCHEMA,
+            validate_assembly=validate_connected_assembly,
+            context={"protocol": config.protocol, "target_name": config.target_name,
+                     "modeling_policy": modeling_policy(config),
+                     "evidence_sha256": stable_fingerprint(evidence_table),
+                     "llm": LLMClient.from_config(config.llm).cache_identity()},
+            force=force, on_progress=on_progress,
+        )
+        connectivity_aliases = {row["alias"]: row["name"]
+                                for row in connectivity.get("patch", {}).get("state_aliases", [])}
+        self._assembly_state_aliases = {
+            **{alias: connectivity_aliases.get(name, name)
+               for alias, name in self._assembly_state_aliases.items()},
+            **connectivity_aliases,
+        }
         materialized = self._materialize_assembled_fsm(assembled, facts, evidence_table)
         fsm = fsm_from_llm(
             materialized,
@@ -485,6 +515,7 @@ class ImplementationFSMBuilder:
                 "state_declaration_repairs": self._state_declaration_repairs,
                 "state_reference_repairs": self._state_reference_repairs,
                 "state_aliases": self._assembly_state_aliases,
+                "connectivity": connectivity,
             },
         )
         normalize_fsm_protocol(fsm, config.protocol, component="ImplementationFSM")

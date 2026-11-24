@@ -104,11 +104,14 @@ class ProtoLensPipeline:
             "implementation_evidence_table.json",
             "implementation_source_manifest.json",
             "implementation_scope.json",
+            "implementation_connectivity.json",
         ]
         source_snapshot = self.impl_builder.input_snapshot(self.config)
         fingerprint = stable_fingerprint(
             {
                 "builder": self.impl_builder.CACHE_VERSION,
+                "assembly": self.impl_builder.ASSEMBLY_CACHE_VERSION,
+                "connectivity": self.impl_builder.CONNECTIVITY_VERSION,
                 "modeling_policy": modeling_policy(self.config),
                 "protocol": self.config.protocol,
                 "target_name": self.config.target_name,
