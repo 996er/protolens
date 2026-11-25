@@ -10,7 +10,7 @@ from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
-CONNECTIVITY_VERSION = "implementation-connectivity-v1"
+CONNECTIVITY_VERSION = "implementation-connectivity-v2-source-recovery"
 CONNECTIVITY_REPORT = "implementation_connectivity.json"
 
 
@@ -49,6 +49,7 @@ def repair_connectivity(
     validate_assembly: Callable[[dict[str, Any]], None],
     context: dict[str, Any], force: bool = False,
     on_progress: Callable[[str], None] | None = None,
+    recover_relationships: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Reconcile identities or restore fact-supported steps; never guess edges.
 
@@ -58,7 +59,8 @@ def repair_connectivity(
     """
     before = connectivity_report(assembled)
     audit: dict[str, Any] = {"format": CONNECTIVITY_VERSION, "before": before,
-                             "status": "connected", "after": before}
+                             "status": "connected", "after": before,
+                             "unresolved_states": before["unreachable_states"]}
     if not before["unreachable_states"]:
         store.write_json(CONNECTIVITY_REPORT, audit)
         return assembled, audit
@@ -178,7 +180,8 @@ def repair_connectivity(
                 if saved["sha256"] != stable_fingerprint(saved["patch"]):
                     raise ValueError("connectivity checkpoint checksum mismatch")
                 candidate = apply_repair(saved["patch"])
-                if connectivity_report(candidate)["unreachable_states"]:
+                if (connectivity_report(candidate)["unreachable_states"]
+                        and not (saved.get("requires_source_recovery") and recover_relationships)):
                     raise ValueError("incomplete connectivity checkpoint")
                 patch = saved["patch"]
             except (OSError, ValueError, KeyError, TypeError):
@@ -191,15 +194,31 @@ def repair_connectivity(
             )
         repaired = apply_repair(patch)
         audit.update(patch=patch, after=connectivity_report(repaired))
+        audit["unresolved_states"] = audit["after"]["unreachable_states"]
+        requires_source_recovery = bool(audit["after"]["unreachable_states"])
+        if requires_source_recovery and recover_relationships is not None:
+            audit["status"] = "recovering_source_relationships"
+            store.write_json(CONNECTIVITY_REPORT, audit)
+            candidate = recover_relationships(deepcopy(repaired), audit)
+            if (candidate["states"] != repaired["states"]
+                    or candidate["transitions"][:len(repaired["transitions"])] != repaired["transitions"]):
+                raise ValueError("source relationship recovery must preserve retained states and transitions")
+            validate_assembly(candidate)
+            repaired = candidate
+            audit["after"] = connectivity_report(repaired)
+            audit["unresolved_states"] = audit["after"]["unreachable_states"]
         if audit["after"]["unreachable_states"]:
             raise ValueError("verified facts do not establish paths to all retained implementation states; "
                              "inspect unresolved_states and recover missing source relationships")
         audit["status"] = "repaired"
         store.write_json(CONNECTIVITY_REPORT, audit)
-        store.write_json(checkpoint, {"patch": patch, "sha256": stable_fingerprint(patch)})
+        store.write_json(checkpoint, {"patch": patch, "sha256": stable_fingerprint(patch),
+                                      "requires_source_recovery": requires_source_recovery})
         return repaired, audit
     except Exception as exc:
         audit.update(status="failed", error=str(exc))
+        if audit.get("source_recovery", {}).get("status") == "recovering":
+            audit["source_recovery"]["status"] = "failed"
         store.write_json(CONNECTIVITY_REPORT, audit)
         raise RuntimeError(
             f"implementation connectivity repair failed: {exc}; "

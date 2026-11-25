@@ -12,7 +12,9 @@ import re
 
 from protolens.config import ProtoLensConfig
 from protolens.fsm.abstraction import compact_graph, modeling_policy, select_implementation_facts
-from protolens.fsm.connectivity import CONNECTIVITY_VERSION, repair_connectivity
+from protolens.fsm.connectivity import (
+    CONNECTIVITY_REPORT, CONNECTIVITY_VERSION, connectivity_report, repair_connectivity,
+)
 from protolens.fsm.fsm_model import Evidence, ProtocolFSM
 from protolens.fsm.llm_support import (
     EVIDENCE_SCHEMA,
@@ -482,7 +484,12 @@ class ImplementationFSMBuilder:
                      "evidence_sha256": stable_fingerprint(evidence_table),
                      "llm": LLMClient.from_config(config.llm).cache_identity()},
             force=force, on_progress=on_progress,
+            recover_relationships=lambda candidate, audit: self._recover_source_relationships(
+                config, chunks, candidate, facts, evidence_table, scope_decisions, audit,
+                force=force, on_progress=on_progress,
+            ),
         )
+        all_fact_count = len(self.last_transition_facts["facts"])
         connectivity_aliases = {row["alias"]: row["name"]
                                 for row in connectivity.get("patch", {}).get("state_aliases", [])}
         self._assembly_state_aliases = {
@@ -529,6 +536,122 @@ class ImplementationFSMBuilder:
 
     def drain_conversations(self) -> list[dict[str, Any]]:
         return self.recorder.drain_conversations()
+
+    def _recover_source_relationships(
+        self, config: ProtoLensConfig, chunks: list[dict[str, Any]],
+        assembled: dict[str, Any], facts: list[dict[str, Any]],
+        evidence_table: dict[str, dict[str, Any]], scope_decisions: list[dict[str, Any]],
+        audit: dict[str, Any], *, force: bool,
+        on_progress: Callable[[str], None] | None,
+    ) -> dict[str, Any]:
+        """Revisit source once with global state context; append verified relationships.
+
+        The ordinary extraction cache is deliberately untouched. Recovery has
+        its own source/context fingerprint and revalidates citations on resume.
+        """
+        store = ArtifactStore(config.run_dir)
+        names = {state["name"] for state in assembled["states"]}
+        report: dict[str, Any] = {
+            "chunks": [], "added_fact_ids": [], "uncertainties": [], "status": "recovering",
+        }
+        audit["source_recovery"] = report
+        policy = modeling_policy(config)
+        root = stable_fingerprint({
+            "version": self.CONNECTIVITY_VERSION, "manifest": self.last_manifest,
+            "protocol": config.protocol, "target_name": config.target_name,
+            "entrypoints": config.entrypoints, "policy": policy,
+            "llm": LLMClient.from_config(config.llm).cache_identity(),
+        })
+
+        def validate_partial(partial: dict[str, Any]) -> None:
+            validate_json_schema(partial, TRANSITION_FACT_RESULT_SCHEMA)
+            if set(partial["analyzed_files"]) != {piece["path"] for piece in chunk["files"]}:
+                raise ValueError("source recovery checkpoint file coverage mismatch")
+            for fact in partial["transition_facts"]:
+                if fact["source"] not in names or fact["target"] not in names:
+                    raise ValueError("source recovery must reference retained canonical states")
+            if self._normalize_transition_evidence(partial["transition_facts"], stage="connectivity_source_recovery"):
+                raise ValueError("source recovery contains unverified source evidence")
+            for fact in partial["transition_facts"]:
+                if not any(
+                    self._source_path_for_location(citation["location"]) == piece["path"]
+                    and citation["excerpt"].strip() and citation["excerpt"] in piece["content"]
+                    for citation in fact["evidence"] for piece in chunk["files"]
+                ):
+                    raise ValueError("recovered relationship must cite the supplied source chunk")
+
+        for index, chunk in enumerate(chunks):
+            current = connectivity_report(assembled)
+            if not current["unreachable_states"]:
+                break
+            recovery_context = deepcopy({
+                "states": assembled["states"], "transitions": assembled["transitions"],
+                "connectivity": current, "verified_relationships": self._assembly_fact_payload(facts),
+                "modeling_policy": policy,
+            })
+            checkpoint = "checkpoints/implementation_connectivity_source/" + stable_fingerprint({
+                "root": root, "chunk": chunk, "context": recovery_context,
+            }) + ".json"
+            if on_progress:
+                on_progress(f"implementation connectivity: recovering source relationships from chunk "
+                            f"{index + 1}/{len(chunks)}; {len(current['unreachable_states'])} states unreachable")
+            partial = self._load_assembly_checkpoint(
+                store, checkpoint, force=force, validator=validate_partial, on_progress=on_progress,
+            )
+            reused = partial is not None
+            if partial is None:
+                partial = self._analyze_chunk(
+                    config, chunk, index, len(chunks), recovery_context=recovery_context,
+                    result_validator=validate_partial,
+                )
+                self._save_assembly_checkpoint(store, checkpoint, partial)
+            report["chunks"].append({"index": index + 1, "checkpoint": checkpoint, "reused": reused})
+            report["uncertainties"].extend(partial["uncertainties"])
+            assembled["uncertainties"].extend(partial["uncertainties"])
+            self.last_transition_facts["uncertainties"].extend(partial["uncertainties"])
+            if partial["transition_facts"]:
+                recovered, recovered_evidence, _ = self._compact_transition_facts(config, [partial])
+                for identifier, citation in recovered_evidence.items():
+                    if identifier in evidence_table:
+                        citation["confidence"] = max(citation["confidence"], evidence_table[identifier]["confidence"])
+                    evidence_table[identifier] = citation
+                transition_ids = {edge["id"] for edge in assembled["transitions"]}
+                for fact in recovered:
+                    fact["id"] = "source_recovery_" + stable_fingerprint({"chunk": index, "fact": fact})[:24]
+                    transition_id = fact["id"]
+                    while transition_id in transition_ids:
+                        transition_id += "_recovered"
+                    transition_ids.add(transition_id)
+                    assembled["transitions"].append({
+                        **{key: fact[key] for key in ASSEMBLY_TRANSITION_SCHEMA["properties"]
+                           if key not in {"id", "fact_ids"}},
+                        "id": transition_id, "fact_ids": [fact["id"]],
+                    })
+                    facts.append(fact)
+                    self.last_transition_facts["facts"].append(fact)
+                    report["added_fact_ids"].append(fact["id"])
+                    # Endpoints are already in scope. Retain the recovered
+                    # dependency conservatively, without claiming an LLM scope verdict.
+                    scope_decisions.append({
+                        "fact_id": fact["id"], "decision": "uncertain",
+                        "scope_rule": policy["analysis_scope"][0],
+                        "evidence_ids": fact["evidence_ids"],
+                        "rationale": "Source recovery between retained states; preserve possible in-scope prerequisites.",
+                    })
+                self.last_transition_facts["included_fact_ids"] = [fact["id"] for fact in facts]
+                self.last_transition_facts["connectivity_recovery_fact_ids"] = report["added_fact_ids"]
+                store.write_json("implementation_transition_facts.json", self.last_transition_facts)
+                store.write_json("implementation_evidence_table.json", self.last_evidence_table)
+                scope = store.read_json("implementation_scope.json")
+                scope.update(input_fact_count=len(self.last_transition_facts["facts"]),
+                             included_fact_ids=self.last_transition_facts["included_fact_ids"],
+                             decisions=scope_decisions)
+                store.write_json("implementation_scope.json", scope)
+            audit["after"] = connectivity_report(assembled)
+            audit["unresolved_states"] = audit["after"]["unreachable_states"]
+            store.write_json(CONNECTIVITY_REPORT, audit)
+        report["status"] = "unresolved" if audit["after"]["unreachable_states"] else "recovered"
+        return assembled
 
     def input_snapshot(self, config: ProtoLensConfig) -> dict[str, Any]:
         _, manifest = self._collect_source_chunks(config)
@@ -635,6 +758,8 @@ class ImplementationFSMBuilder:
         chunk: dict[str, Any],
         index: int,
         total: int,
+        *, recovery_context: dict[str, Any] | None = None,
+        result_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         expected_files = {str(item["path"]) for item in chunk["files"]}
         payload = {
@@ -663,6 +788,25 @@ class ImplementationFSMBuilder:
             ],
             "source_chunk": chunk,
         }
+        schema = TRANSITION_FACT_RESULT_SCHEMA
+        schema_name = f"protolens_impl_transition_facts_chunk_{index + 1}"
+        if recovery_context is not None:
+            payload["task"] = "Recover missing source relationships between retained implementation states."
+            payload["connectivity_recovery"] = recovery_context
+            payload["requirements"] += [
+                "Return only missing relationships supported by this chunk together with the supplied verified relationships; do not repeat existing transitions.",
+                "Trace initialization, direct calls, thread handoff, callback registration/invocation and request dispatch that connect the retained states.",
+                "Use the exact canonical states in connectivity_recovery.states for both endpoints. Preserve guards and sequencing; summarize internal steps only when source proves the full relationship.",
+                "Every new relationship must cite at least one exact excerpt from source_chunk. A disconnected graph or matching names alone is never evidence of a call, callback invocation or state equivalence.",
+                "Keep internal/server operations distinct from client_send. Do not add synthetic entry edges or remove retained states.",
+                "If no missing relationship is established here, return transition_facts=[] and describe any missing cross-file evidence in uncertainties.",
+            ]
+            schema = deepcopy(TRANSITION_FACT_RESULT_SCHEMA)
+            for endpoint in ("source", "target"):
+                schema["properties"]["transition_facts"]["items"]["properties"][endpoint] = {
+                    "type": "string", "enum": [state["name"] for state in recovery_context["states"]],
+                }
+            schema_name = f"protolens_impl_connectivity_source_chunk_{index + 1}"
         last_error: ValueError | None = None
         validation_attempts = self.recorder.llm_client.retries + 1
         for validation_attempt in range(validation_attempts):
@@ -693,8 +837,8 @@ class ImplementationFSMBuilder:
                         "No regex-derived or heuristic FSM exists outside this prompt. Produce auditable state-machine facts."
                     ),
                     payload=payload,
-                    schema=TRANSITION_FACT_RESULT_SCHEMA,
-                    schema_name=f"protolens_impl_transition_facts_chunk_{index + 1}",
+                    schema=schema,
+                    schema_name=schema_name,
                     validation_retries=0,
                     response_normalizer=normalize_transition_fact_result,
                     result_normalizer=lambda value: self._repair_chunk_fact_structure(config, chunk, value, index=index),
@@ -722,6 +866,8 @@ class ImplementationFSMBuilder:
                     raise ValueError(
                         f"implementation chunk {index + 1} transitions lack exact source excerpts: {invalid}"
                     )
+                if result_validator is not None:
+                    result_validator(result)
                 return result
             except ValueError as exc:
                 # The recorder deliberately performs one attempt per outer
