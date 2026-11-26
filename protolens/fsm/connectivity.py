@@ -10,8 +10,16 @@ from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
-CONNECTIVITY_VERSION = "implementation-connectivity-v2-source-recovery"
+CONNECTIVITY_VERSION = "implementation-connectivity-v3-cross-file-reconciliation"
 CONNECTIVITY_REPORT = "implementation_connectivity.json"
+
+
+class ConnectivityRepairError(RuntimeError):
+    """Carry the failed attempt's diagnostics through a reconciliation pass."""
+
+    def __init__(self, message: str, audit: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.audit = deepcopy(audit)
 
 
 def connectivity_report(assembled: dict[str, Any]) -> dict[str, Any]:
@@ -194,9 +202,12 @@ def repair_connectivity(
             )
         repaired = apply_repair(patch)
         audit.update(patch=patch, after=connectivity_report(repaired))
+        aliases = {row["alias"]: row["name"] for row in patch["state_aliases"]}
+        audit["state_aliases"] = aliases
         audit["unresolved_states"] = audit["after"]["unreachable_states"]
         requires_source_recovery = bool(audit["after"]["unreachable_states"])
         if requires_source_recovery and recover_relationships is not None:
+            previous_facts = stable_fingerprint(facts)
             audit["status"] = "recovering_source_relationships"
             store.write_json(CONNECTIVITY_REPORT, audit)
             candidate = recover_relationships(deepcopy(repaired), audit)
@@ -207,6 +218,34 @@ def repair_connectivity(
             repaired = candidate
             audit["after"] = connectivity_report(repaired)
             audit["unresolved_states"] = audit["after"]["unreachable_states"]
+            # New source facts can establish identity or entry corrections,
+            # not just direct edges. Rebuild the repair schema/support index
+            # against those facts instead of testing reachability and stopping.
+            # No recovery callback is passed: this is one bounded extra pass.
+            if audit["unresolved_states"] and stable_fingerprint(facts) != previous_facts:
+                if on_progress:
+                    on_progress("implementation connectivity: reconciling states and entry using recovered source facts")
+                try:
+                    repaired, reconciliation = repair_connectivity(
+                        repaired, facts, recorder=recorder, store=store,
+                        transition_schema=transition_schema, validate_assembly=validate_assembly,
+                        context={**context, "recovered_facts_sha256": stable_fingerprint(facts)},
+                        force=force, on_progress=on_progress,
+                    )
+                except ConnectivityRepairError as exc:
+                    audit["source_reconciliation"] = exc.audit
+                    audit["after"] = exc.audit["after"]
+                    audit["unresolved_states"] = exc.audit["unresolved_states"]
+                    raise ValueError("source relationships recovered, but global reconciliation remains incomplete; "
+                                     "inspect source_reconciliation and unresolved_states") from exc
+                audit["source_reconciliation"] = reconciliation
+                next_aliases = reconciliation.get("state_aliases", {})
+                audit["state_aliases"] = {
+                    **{alias: next_aliases.get(name, name) for alias, name in aliases.items()},
+                    **next_aliases,
+                }
+                audit["after"] = connectivity_report(repaired)
+                audit["unresolved_states"] = audit["after"]["unreachable_states"]
         if audit["after"]["unreachable_states"]:
             raise ValueError("verified facts do not establish paths to all retained implementation states; "
                              "inspect unresolved_states and recover missing source relationships")
@@ -220,8 +259,10 @@ def repair_connectivity(
         if audit.get("source_recovery", {}).get("status") == "recovering":
             audit["source_recovery"]["status"] = "failed"
         store.write_json(CONNECTIVITY_REPORT, audit)
-        raise RuntimeError(
+        unresolved = audit["unresolved_states"]
+        raise ConnectivityRepairError(
             f"implementation connectivity repair failed: {exc}; "
+            f"unresolved={len(unresolved)} ({', '.join(unresolved[:8])}); "
             f"report={store.path(CONNECTIVITY_REPORT)}; verified source checkpoints retained; "
-            "no successful implementation checkpoint generated"
+            "no successful implementation checkpoint generated", audit,
         ) from exc

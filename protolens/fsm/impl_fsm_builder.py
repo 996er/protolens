@@ -490,8 +490,7 @@ class ImplementationFSMBuilder:
             ),
         )
         all_fact_count = len(self.last_transition_facts["facts"])
-        connectivity_aliases = {row["alias"]: row["name"]
-                                for row in connectivity.get("patch", {}).get("state_aliases", [])}
+        connectivity_aliases = connectivity.get("state_aliases", {})
         self._assembly_state_aliases = {
             **{alias: connectivity_aliases.get(name, name)
                for alias, name in self._assembly_state_aliases.items()},
@@ -537,6 +536,65 @@ class ImplementationFSMBuilder:
     def drain_conversations(self) -> list[dict[str, Any]]:
         return self.recorder.drain_conversations()
 
+    def _connectivity_source_chunk(
+        self, chunk: dict[str, Any], assembled: dict[str, Any],
+        facts: list[dict[str, Any]], evidence_table: dict[str, dict[str, Any]], *,
+        context_chars: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Supply cross-file source around existing citations, without inferring edges.
+
+        Visit one citation per state before taking more from any state, so a
+        large handler cannot consume the entire context budget. Full source
+        ranges are supplied to the existing citation/structure repair helpers.
+        """
+        current = connectivity_report(assembled)
+        by_id = {fact["id"]: fact for fact in facts}
+        incident: dict[str, list[str]] = {state["name"]: [] for state in assembled["states"]}
+        for edge in assembled["transitions"]:
+            references = [ref for fact_id in edge["fact_ids"] for ref in by_id[fact_id]["evidence_ids"]]
+            for endpoint in (edge["source"], edge["target"]):
+                incident[endpoint].extend(references)
+        order = list(dict.fromkeys([
+            current["initial_state"], *current["unreachable_states"], *current["distances"],
+        ]))
+        pools = [list(dict.fromkeys(incident[name])) for name in order]
+        pieces = deepcopy(chunk["files"])
+        seen: set[str] = set()
+        included: list[str] = []
+        omitted: list[str] = []
+        used = 0
+        for offset in range(max((len(pool) for pool in pools), default=0)):
+            for pool in pools:
+                if offset >= len(pool) or pool[offset] in seen:
+                    continue
+                identifier = pool[offset]
+                seen.add(identifier)
+                citation = evidence_table[identifier]
+                path = self._source_path_for_location(citation["location"])
+                excerpt = citation["excerpt"]
+                source = self._source_texts.get(path, "")
+                if not excerpt.strip() or excerpt not in source:
+                    raise ValueError(f"connectivity context has unverified source evidence: {identifier}")
+                if any(piece["path"] == path and excerpt in piece["content"] for piece in pieces):
+                    continue
+                start = source.index(excerpt)
+                end = start + len(excerpt)
+                # An ambiguous short quote does not identify which occurrence's
+                # neighbours are relevant. Supply only that exact quote instead.
+                if source.count(excerpt) == 1:
+                    start, end = max(0, start - 800), min(len(source), end + 800)
+                if used + end - start > context_chars:
+                    omitted.append(identifier)
+                    continue
+                pieces.append({"path": path, "range": f"characters {start}-{end}",
+                               "content": source[start:end]})
+                included.append(identifier)
+                used += end - start
+        return {"files": pieces}, {
+            "context_evidence_ids": included, "omitted_context_evidence_ids": omitted,
+            "context_characters": used,
+        }
+
     def _recover_source_relationships(
         self, config: ProtoLensConfig, chunks: list[dict[str, Any]],
         assembled: dict[str, Any], facts: list[dict[str, Any]],
@@ -573,21 +631,27 @@ class ImplementationFSMBuilder:
             if self._normalize_transition_evidence(partial["transition_facts"], stage="connectivity_source_recovery"):
                 raise ValueError("source recovery contains unverified source evidence")
             for fact in partial["transition_facts"]:
-                if not any(
-                    self._source_path_for_location(citation["location"]) == piece["path"]
-                    and citation["excerpt"].strip() and citation["excerpt"] in piece["content"]
-                    for citation in fact["evidence"] for piece in chunk["files"]
+                if not all(
+                    any(self._source_path_for_location(citation["location"]) == piece["path"]
+                        and citation["excerpt"].strip() and citation["excerpt"] in piece["content"]
+                        for piece in chunk["files"])
+                    for citation in fact["evidence"]
                 ):
-                    raise ValueError("recovered relationship must cite the supplied source chunk")
+                    raise ValueError("every recovered relationship citation must occur in the supplied source context")
 
-        for index, chunk in enumerate(chunks):
+        for index, original_chunk in enumerate(chunks):
             current = connectivity_report(assembled)
             if not current["unreachable_states"]:
                 break
+            chunk, source_context = self._connectivity_source_chunk(
+                original_chunk, assembled, facts, evidence_table,
+                context_chars=max(4000, min(24000, config.fsm_build.chunk_chars // 2)),
+            )
             recovery_context = deepcopy({
                 "states": assembled["states"], "transitions": assembled["transitions"],
                 "connectivity": current, "verified_relationships": self._assembly_fact_payload(facts),
                 "modeling_policy": policy,
+                "source_context": source_context,
             })
             checkpoint = "checkpoints/implementation_connectivity_source/" + stable_fingerprint({
                 "root": root, "chunk": chunk, "context": recovery_context,
@@ -605,7 +669,8 @@ class ImplementationFSMBuilder:
                     result_validator=validate_partial,
                 )
                 self._save_assembly_checkpoint(store, checkpoint, partial)
-            report["chunks"].append({"index": index + 1, "checkpoint": checkpoint, "reused": reused})
+            report["chunks"].append({"index": index + 1, "checkpoint": checkpoint,
+                                     "reused": reused, **source_context})
             report["uncertainties"].extend(partial["uncertainties"])
             assembled["uncertainties"].extend(partial["uncertainties"])
             self.last_transition_facts["uncertainties"].extend(partial["uncertainties"])
@@ -794,10 +859,12 @@ class ImplementationFSMBuilder:
             payload["task"] = "Recover missing source relationships between retained implementation states."
             payload["connectivity_recovery"] = recovery_context
             payload["requirements"] += [
+                "source_chunk includes the current source piece plus bounded exact source context around facts incident to retained states, possibly from other files. Analyze their relationships together; filenames alone do not establish execution order.",
                 "Return only missing relationships supported by this chunk together with the supplied verified relationships; do not repeat existing transitions.",
                 "Trace initialization, direct calls, thread handoff, callback registration/invocation and request dispatch that connect the retained states.",
                 "Use the exact canonical states in connectivity_recovery.states for both endpoints. Preserve guards and sequencing; summarize internal steps only when source proves the full relationship.",
                 "Every new relationship must cite at least one exact excerpt from source_chunk. A disconnected graph or matching names alone is never evidence of a call, callback invocation or state equivalence.",
+                "When a relationship spans files, cite each supplied source span needed to establish the link, such as both callback registration and the callback's dispatch. If the necessary code was omitted from source context, record the gap in uncertainties instead of assuming it.",
                 "Keep internal/server operations distinct from client_send. Do not add synthetic entry edges or remove retained states.",
                 "If no missing relationship is established here, return transition_facts=[] and describe any missing cross-file evidence in uncertainties.",
             ]
