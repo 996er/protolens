@@ -10,8 +10,9 @@ from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
-CONNECTIVITY_VERSION = "implementation-connectivity-v3-cross-file-reconciliation"
+CONNECTIVITY_VERSION = "implementation-connectivity-v4-progressive-recovery"
 CONNECTIVITY_REPORT = "implementation_connectivity.json"
+MAX_SOURCE_RECOVERY_ROUNDS = 3
 
 
 class ConnectivityRepairError(RuntimeError):
@@ -58,6 +59,7 @@ def repair_connectivity(
     context: dict[str, Any], force: bool = False,
     on_progress: Callable[[str], None] | None = None,
     recover_relationships: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
+    _allow_incomplete: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Reconcile identities or restore fact-supported steps; never guess edges.
 
@@ -189,7 +191,7 @@ def repair_connectivity(
                     raise ValueError("connectivity checkpoint checksum mismatch")
                 candidate = apply_repair(saved["patch"])
                 if (connectivity_report(candidate)["unreachable_states"]
-                        and not (saved.get("requires_source_recovery") and recover_relationships)):
+                        and not (_allow_incomplete or recover_relationships)):
                     raise ValueError("incomplete connectivity checkpoint")
                 patch = saved["patch"]
             except (OSError, ValueError, KeyError, TypeError):
@@ -206,53 +208,83 @@ def repair_connectivity(
         audit["state_aliases"] = aliases
         audit["unresolved_states"] = audit["after"]["unreachable_states"]
         requires_source_recovery = bool(audit["after"]["unreachable_states"])
-        if requires_source_recovery and recover_relationships is not None:
-            previous_facts = stable_fingerprint(facts)
-            audit["status"] = "recovering_source_relationships"
-            store.write_json(CONNECTIVITY_REPORT, audit)
-            candidate = recover_relationships(deepcopy(repaired), audit)
-            if (candidate["states"] != repaired["states"]
-                    or candidate["transitions"][:len(repaired["transitions"])] != repaired["transitions"]):
-                raise ValueError("source relationship recovery must preserve retained states and transitions")
-            validate_assembly(candidate)
-            repaired = candidate
-            audit["after"] = connectivity_report(repaired)
-            audit["unresolved_states"] = audit["after"]["unreachable_states"]
-            # New source facts can establish identity or entry corrections,
-            # not just direct edges. Rebuild the repair schema/support index
-            # against those facts instead of testing reachability and stopping.
-            # No recovery callback is passed: this is one bounded extra pass.
-            if audit["unresolved_states"] and stable_fingerprint(facts) != previous_facts:
-                if on_progress:
-                    on_progress("implementation connectivity: reconciling states and entry using recovered source facts")
-                try:
-                    repaired, reconciliation = repair_connectivity(
-                        repaired, facts, recorder=recorder, store=store,
-                        transition_schema=transition_schema, validate_assembly=validate_assembly,
-                        context={**context, "recovered_facts_sha256": stable_fingerprint(facts)},
-                        force=force, on_progress=on_progress,
-                    )
-                except ConnectivityRepairError as exc:
-                    audit["source_reconciliation"] = exc.audit
-                    audit["after"] = exc.audit["after"]
-                    audit["unresolved_states"] = exc.audit["unresolved_states"]
-                    raise ValueError("source relationships recovered, but global reconciliation remains incomplete; "
-                                     "inspect source_reconciliation and unresolved_states") from exc
-                audit["source_reconciliation"] = reconciliation
-                next_aliases = reconciliation.get("state_aliases", {})
-                audit["state_aliases"] = {
-                    **{alias: next_aliases.get(name, name) for alias, name in aliases.items()},
-                    **next_aliases,
-                }
-                audit["after"] = connectivity_report(repaired)
-                audit["unresolved_states"] = audit["after"]["unreachable_states"]
-        if audit["after"]["unreachable_states"]:
-            raise ValueError("verified facts do not establish paths to all retained implementation states; "
-                             "inspect unresolved_states and recover missing source relationships")
-        audit["status"] = "repaired"
-        store.write_json(CONNECTIVITY_REPORT, audit)
+        # This is a validated delta checkpoint, not a successful FSM checkpoint.
+        # Persist before source recovery so a later failure can resume the same
+        # graph and reuse source checkpoints keyed by that graph's context.
         store.write_json(checkpoint, {"patch": patch, "sha256": stable_fingerprint(patch),
                                       "requires_source_recovery": requires_source_recovery})
+        if requires_source_recovery and recover_relationships is not None:
+            audit["source_recovery_rounds"] = []
+            for round_index in range(MAX_SOURCE_RECOVERY_ROUNDS):
+                previous_facts = stable_fingerprint(facts)
+                previous_graph = stable_fingerprint({
+                    "states": repaired["states"], "transitions": repaired["transitions"],
+                })
+                audit["status"] = "recovering_source_relationships"
+                audit["source_recovery_round"] = round_index + 1
+                store.write_json(CONNECTIVITY_REPORT, audit)
+                if on_progress:
+                    on_progress(f"implementation connectivity: source recovery round "
+                                f"{round_index + 1}/{MAX_SOURCE_RECOVERY_ROUNDS}")
+                candidate = recover_relationships(deepcopy(repaired), audit)
+                if (candidate["states"] != repaired["states"]
+                        or candidate["transitions"][:len(repaired["transitions"])] != repaired["transitions"]):
+                    raise ValueError("source relationship recovery must preserve retained states and transitions")
+                validate_assembly(candidate)
+                repaired = candidate
+                audit["after"] = connectivity_report(repaired)
+                audit["unresolved_states"] = audit["after"]["unreachable_states"]
+                round_audit = {"round": round_index + 1,
+                               "source_recovery": deepcopy(audit.get("source_recovery", {}))}
+                audit["source_recovery_rounds"].append(round_audit)
+                # Reconciliation may make useful partial progress. Retain that
+                # validated graph for the next source pass, without allowing an
+                # incomplete graph to escape the outer repair as success.
+                if audit["unresolved_states"] and stable_fingerprint(facts) != previous_facts:
+                    if on_progress:
+                        on_progress("implementation connectivity: reconciling states and entry using recovered source facts")
+                    try:
+                        repaired, reconciliation = repair_connectivity(
+                            repaired, facts, recorder=recorder, store=store,
+                            transition_schema=transition_schema, validate_assembly=validate_assembly,
+                            context={**context, "recovered_facts_sha256": stable_fingerprint(facts)},
+                            force=force, on_progress=on_progress, _allow_incomplete=True,
+                        )
+                    except ConnectivityRepairError as exc:
+                        audit["source_reconciliation"] = exc.audit
+                        round_audit["source_reconciliation"] = exc.audit
+                        raise
+                    audit["source_reconciliation"] = reconciliation
+                    round_audit["source_reconciliation"] = reconciliation
+                    next_aliases = reconciliation.get("state_aliases", {})
+                    aliases = {
+                        **{alias: next_aliases.get(name, name) for alias, name in aliases.items()},
+                        **next_aliases,
+                    }
+                    audit["state_aliases"] = aliases
+                    audit["after"] = connectivity_report(repaired)
+                    audit["unresolved_states"] = audit["after"]["unreachable_states"]
+                round_audit["after"] = audit["after"]
+                store.write_json(CONNECTIVITY_REPORT, audit)
+                if not audit["unresolved_states"]:
+                    break
+                current_graph = stable_fingerprint({
+                    "states": repaired["states"], "transitions": repaired["transitions"],
+                })
+                if previous_graph == current_graph and stable_fingerprint(facts) == previous_facts:
+                    audit["recovery_stop_reason"] = "no_new_verified_relationships_or_graph_changes"
+                    break
+            else:
+                audit["recovery_stop_reason"] = "source_recovery_round_limit"
+        if audit["after"]["unreachable_states"]:
+            if _allow_incomplete:
+                audit["status"] = "incomplete"
+                store.write_json(CONNECTIVITY_REPORT, audit)
+                return repaired, audit
+            raise ValueError("verified facts do not establish paths to all retained implementation states; "
+                             "inspect source_recovery_rounds, source_reconciliation and unresolved_states")
+        audit["status"] = "repaired"
+        store.write_json(CONNECTIVITY_REPORT, audit)
         return repaired, audit
     except Exception as exc:
         audit.update(status="failed", error=str(exc))

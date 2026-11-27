@@ -540,12 +540,13 @@ class ImplementationFSMBuilder:
         self, chunk: dict[str, Any], assembled: dict[str, Any],
         facts: list[dict[str, Any]], evidence_table: dict[str, dict[str, Any]], *,
         context_chars: int,
+        context_visits: dict[str, int] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Supply cross-file source around existing citations, without inferring edges.
 
-        Visit one citation per state before taking more from any state, so a
-        large handler cannot consume the entire context budget. Full source
-        ranges are supplied to the existing citation/structure repair helpers.
+        Visit one citation per state before taking more from any state, then
+        prioritize citations least often supplied in earlier chunks/rounds.
+        Full source ranges go to the citation/structure repair helpers.
         """
         current = connectivity_report(assembled)
         by_id = {fact["id"]: fact for fact in facts}
@@ -558,38 +559,44 @@ class ImplementationFSMBuilder:
             current["initial_state"], *current["unreachable_states"], *current["distances"],
         ]))
         pools = [list(dict.fromkeys(incident[name])) for name in order]
+        if context_visits is None:
+            context_visits = {}
+        references = list(dict.fromkeys(
+            pool[offset]
+            for offset in range(max((len(pool) for pool in pools), default=0))
+            for pool in pools if offset < len(pool)
+        ))
+        # Keep one entry citation as an anchor; rotate the remaining budget so
+        # alphabetically early unreachable states cannot monopolize every chunk.
+        anchor = pools[0][0] if pools and pools[0] else None
+        references.sort(key=lambda ref: (ref != anchor, context_visits.get(ref, 0)))
         pieces = deepcopy(chunk["files"])
-        seen: set[str] = set()
         included: list[str] = []
         omitted: list[str] = []
         used = 0
-        for offset in range(max((len(pool) for pool in pools), default=0)):
-            for pool in pools:
-                if offset >= len(pool) or pool[offset] in seen:
-                    continue
-                identifier = pool[offset]
-                seen.add(identifier)
-                citation = evidence_table[identifier]
-                path = self._source_path_for_location(citation["location"])
-                excerpt = citation["excerpt"]
-                source = self._source_texts.get(path, "")
-                if not excerpt.strip() or excerpt not in source:
-                    raise ValueError(f"connectivity context has unverified source evidence: {identifier}")
-                if any(piece["path"] == path and excerpt in piece["content"] for piece in pieces):
-                    continue
-                start = source.index(excerpt)
-                end = start + len(excerpt)
-                # An ambiguous short quote does not identify which occurrence's
-                # neighbours are relevant. Supply only that exact quote instead.
-                if source.count(excerpt) == 1:
-                    start, end = max(0, start - 800), min(len(source), end + 800)
-                if used + end - start > context_chars:
-                    omitted.append(identifier)
-                    continue
-                pieces.append({"path": path, "range": f"characters {start}-{end}",
-                               "content": source[start:end]})
-                included.append(identifier)
-                used += end - start
+        for identifier in references:
+            citation = evidence_table[identifier]
+            path = self._source_path_for_location(citation["location"])
+            excerpt = citation["excerpt"]
+            source = self._source_texts.get(path, "")
+            if not excerpt.strip() or excerpt not in source:
+                raise ValueError(f"connectivity context has unverified source evidence: {identifier}")
+            if any(piece["path"] == path and excerpt in piece["content"] for piece in pieces):
+                continue
+            start = source.index(excerpt)
+            end = start + len(excerpt)
+            # An ambiguous short quote does not identify which occurrence's
+            # neighbours are relevant. Supply only that exact quote instead.
+            if source.count(excerpt) == 1:
+                start, end = max(0, start - 800), min(len(source), end + 800)
+            if used + end - start > context_chars:
+                omitted.append(identifier)
+                continue
+            pieces.append({"path": path, "range": f"characters {start}-{end}",
+                           "content": source[start:end]})
+            included.append(identifier)
+            context_visits[identifier] = context_visits.get(identifier, 0) + 1
+            used += end - start
         return {"files": pieces}, {
             "context_evidence_ids": included, "omitted_context_evidence_ids": omitted,
             "context_characters": used,
@@ -602,7 +609,7 @@ class ImplementationFSMBuilder:
         audit: dict[str, Any], *, force: bool,
         on_progress: Callable[[str], None] | None,
     ) -> dict[str, Any]:
-        """Revisit source once with global state context; append verified relationships.
+        """Revisit source with the current state context; append novel relationships.
 
         The ordinary extraction cache is deliberately untouched. Recovery has
         its own source/context fingerprint and revalidates citations on resume.
@@ -611,8 +618,10 @@ class ImplementationFSMBuilder:
         names = {state["name"] for state in assembled["states"]}
         report: dict[str, Any] = {
             "chunks": [], "added_fact_ids": [], "uncertainties": [], "status": "recovering",
+            "duplicate_relationship_count": 0,
         }
         audit["source_recovery"] = report
+        context_visits = audit.setdefault("source_context_visits", {})
         policy = modeling_policy(config)
         root = stable_fingerprint({
             "version": self.CONNECTIVITY_VERSION, "manifest": self.last_manifest,
@@ -620,6 +629,21 @@ class ImplementationFSMBuilder:
             "entrypoints": config.entrypoints, "policy": policy,
             "llm": LLMClient.from_config(config.llm).cache_identity(),
         })
+
+        def relationship_identity(relationship: dict[str, Any], evidence_ids: list[str]) -> str:
+            # Model IDs, chunk order and confidence do not create a new source
+            # relationship. Compare current canonical endpoints after aliases.
+            return stable_fingerprint({
+                **{key: relationship[key] for key in ASSEMBLY_TRANSITION_SCHEMA["properties"]
+                   if key not in {"id", "fact_ids", "confidence"}},
+                "evidence_ids": sorted(set(evidence_ids)),
+            })
+
+        fact_index = {fact["id"]: fact for fact in facts}
+        known_relationships = {
+            relationship_identity(edge, fact_index[identifier]["evidence_ids"])
+            for edge in assembled["transitions"] for identifier in edge["fact_ids"]
+        }
 
         def validate_partial(partial: dict[str, Any]) -> None:
             validate_json_schema(partial, TRANSITION_FACT_RESULT_SCHEMA)
@@ -646,6 +670,7 @@ class ImplementationFSMBuilder:
             chunk, source_context = self._connectivity_source_chunk(
                 original_chunk, assembled, facts, evidence_table,
                 context_chars=max(4000, min(24000, config.fsm_build.chunk_chars // 2)),
+                context_visits=context_visits,
             )
             recovery_context = deepcopy({
                 "states": assembled["states"], "transitions": assembled["transitions"],
@@ -682,7 +707,12 @@ class ImplementationFSMBuilder:
                     evidence_table[identifier] = citation
                 transition_ids = {edge["id"] for edge in assembled["transitions"]}
                 for fact in recovered:
-                    fact["id"] = "source_recovery_" + stable_fingerprint({"chunk": index, "fact": fact})[:24]
+                    identity = relationship_identity(fact, fact["evidence_ids"])
+                    if identity in known_relationships:
+                        report["duplicate_relationship_count"] += 1
+                        continue
+                    known_relationships.add(identity)
+                    fact["id"] = "source_recovery_" + identity[:24]
                     transition_id = fact["id"]
                     while transition_id in transition_ids:
                         transition_id += "_recovered"
@@ -695,6 +725,7 @@ class ImplementationFSMBuilder:
                     facts.append(fact)
                     self.last_transition_facts["facts"].append(fact)
                     report["added_fact_ids"].append(fact["id"])
+                    self.last_transition_facts.setdefault("connectivity_recovery_fact_ids", []).append(fact["id"])
                     # Endpoints are already in scope. Retain the recovered
                     # dependency conservatively, without claiming an LLM scope verdict.
                     scope_decisions.append({
@@ -704,7 +735,6 @@ class ImplementationFSMBuilder:
                         "rationale": "Source recovery between retained states; preserve possible in-scope prerequisites.",
                     })
                 self.last_transition_facts["included_fact_ids"] = [fact["id"] for fact in facts]
-                self.last_transition_facts["connectivity_recovery_fact_ids"] = report["added_fact_ids"]
                 store.write_json("implementation_transition_facts.json", self.last_transition_facts)
                 store.write_json("implementation_evidence_table.json", self.last_evidence_table)
                 scope = store.read_json("implementation_scope.json")
