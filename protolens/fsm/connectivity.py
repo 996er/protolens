@@ -10,7 +10,7 @@ from protolens.utils.artifact_store import ArtifactStore
 from protolens.utils.stage_checkpoints import stable_fingerprint
 
 
-CONNECTIVITY_VERSION = "implementation-connectivity-v4-progressive-recovery"
+CONNECTIVITY_VERSION = "implementation-connectivity-v5-derived-reachability"
 CONNECTIVITY_REPORT = "implementation_connectivity.json"
 MAX_SOURCE_RECOVERY_ROUNDS = 3
 
@@ -93,7 +93,7 @@ def repair_connectivity(
     schema = {
         "type": "object", "additionalProperties": False,
         "required": ["initial_state", "initial_fact_ids", "initial_rationale", "state_aliases",
-                     "additional_transitions", "unresolved_states", "rationale"],
+                     "additional_transitions", "rationale"],
         "properties": {
             "initial_state": name_schema,
             "initial_fact_ids": {"type": "array", "items": support_schema["items"]},
@@ -106,7 +106,6 @@ def repair_connectivity(
             }},
             "additional_transitions": {"type": "array", "maxItems": len(facts),
                                        "items": additional_schema},
-            "unresolved_states": {"type": "array", "items": name_schema},
             "rationale": reason_schema,
         },
     }
@@ -122,7 +121,7 @@ def repair_connectivity(
             "Retain the original initial state unless verified facts establish it was selected incorrectly; justify any change with initial_fact_ids. Never choose the largest component merely to increase reachability.",
             "Additional transitions may only restore sequencing explicitly established by supplied facts, including initialization, thread handoff, callback registration and request dispatch. Cite their fact_ids and preserve guards. Never infer a call or callback edge from names or missing connectivity alone.",
             "Do not invent source facts, synthetic entry edges, client messages or transport operations. Keep server/internal events separate from client_send.",
-            "When supplied facts do not establish a connection, retain those states and list exactly the states still unreachable after your proposed repairs in unresolved_states. This is an explicit incomplete model, not permission to delete states or force connectivity.",
+            "When supplied facts do not establish a connection, retain those states. ProtoLens computes unresolved_states by directed graph traversal after applying your repair; do not return this derived list. An incomplete model is not permission to delete states or force connectivity.",
             "Return only the repair delta, not a replacement graph. Additional transition IDs must be new. Endpoints and initial_state use canonical names after alias resolution.",
         ],
     }
@@ -173,10 +172,6 @@ def repair_connectivity(
             ids.add(edge["id"])
             result["transitions"].append(deepcopy(edge))
         validate_assembly(result)
-        after = connectivity_report(result)
-        if (len(set(patch["unresolved_states"])) != len(patch["unresolved_states"])
-                or set(patch["unresolved_states"]) != set(after["unreachable_states"])):
-            raise ValueError("unresolved_states must exactly describe remaining directed unreachability")
         return result
 
     checkpoint = "checkpoints/implementation_connectivity/" + stable_fingerprint({
@@ -203,6 +198,9 @@ def repair_connectivity(
                 validator=apply_repair,
             )
         repaired = apply_repair(patch)
+        # Reachability is derived from the validated graph, never from a model's
+        # transcription of state names. The same traversal controls recovery
+        # and the final success gate, including when replaying a cached delta.
         audit.update(patch=patch, after=connectivity_report(repaired))
         aliases = {row["alias"]: row["name"] for row in patch["state_aliases"]}
         audit["state_aliases"] = aliases
