@@ -410,8 +410,10 @@ class ProtoLensPipeline:
             "conflict_count": len(conflicts),
             "planned_path_count": len(planned_paths),
             "reachable_path_count": sum(path.reachable for path in planned_paths),
+            "message_path_count": sum(path.reachable and bool(path.messages) for path in planned_paths),
             "seed_intent_count": len(seed_intents),
             "paths": [{"candidate_id": path.candidate_id, "conflict_id": path.conflict_id,
+                       "entry_state": path.states[0] if path.states else None,
                        "reachable": path.reachable, "message_count": len(path.messages),
                        "reason": path.reason, "calibration_status": path.calibration.get("status")}
                       for path in planned_paths],

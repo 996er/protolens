@@ -194,9 +194,10 @@ class PathCalibrator:
         groups: dict[str, list[PlannedStatePath]] = defaultdict(list)
         for path in paths:
             groups[path.conflict_id].append(path)
-        def rank(path: PlannedStatePath) -> tuple[int, int, int]:
+        def rank(path: PlannedStatePath) -> tuple[int, int, int, int]:
             status = path.calibration.get("status", "candidate")
-            return (int(status == "response_accepted"),
+            return (int(path.reachable and bool(path.messages) and status != "not_executable"),
+                    int(status == "response_accepted"),
                     int(path.calibration.get("accepted_prefix_length", 0)), -len(path.messages))
         return [max(group, key=rank) for group in groups.values()]
 

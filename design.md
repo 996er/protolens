@@ -454,7 +454,9 @@ synthesize_and_fuzz(fsm, conflicts)
 
 #### 6.1 PathPlanner
 
-`PathPlanner` 把 unified FSM 当作候选生成器，从 `initial_state` 做有界 BFS，生成到 conflict state 的多个前缀，再附加争议 transition。默认每个 conflict 最多 3 条，前缀最多 16 条边，最多 2000 个搜索节点；同一候选中每条边最多访问一次，允许自环，避免无限循环。它不会求解自然语言 guard，也不会把图上可达当成执行成功。
+`PathPlanner` 把 unified FSM 当作候选生成器，按争议转换或状态的来源选择 `metadata.input_initial_states.impl/spec` 中的入口，缺少来源入口元数据的旧图沿用 `initial_state`；不在两侧入口间补造连接。搜索先从目标反向计算最少客户端请求数及对应边数，再按该距离引导有界候选搜索，跳过不能到达目标的分支，避免环路或序列化顺序耗尽预算。默认每个 conflict 最多 3 条，前缀最多 16 次客户端请求，最多展开 2000 个搜索节点；初始化、线程交接、回调等内部步骤保留在图路径和 guard 中，不占客户端请求深度，也不编码为请求。同一候选中每条边最多访问一次，允许自环，避免无限循环。最后附加争议 transition；它不会求解自然语言 guard，也不会把图上可达当成执行成功。
+
+无法编码的 `client_send` 转换不能作为可发送前缀被静默跳过；争议转换本身无法编码时记录其 ID 和 trigger。只有内部事件的空消息路径不占用可发送候选名额，搜索会继续寻找真实的客户端循环路径；仍找不到时保留空路径及明确原因。`directed_generation.json` 额外记录每条路径的 `entry_state` 和全局 `message_path_count`，便于区分入口、搜索预算与请求编码问题。
 
 ```text
 Conflict
@@ -486,7 +488,7 @@ Conflict
 
 每条结果记录 `accepted_prefix_length`、逐消息 `response_code`、请求 SHA256、消息和 transition 下标；拒绝时记录 `failure_index`。不保存完整原始响应或请求内容到校准日志。所有结果都保留 `state_verified=false`：正向响应不证明到达 LLM 命名的内部状态，也不证明新增覆盖率。全局 IPSM 标签或 queue 文件名不参与这里的执行校准。
 
-选择顺序为：完整正向响应的候选优先，其次成功响应前缀更长的候选，再次消息数更少的候选。每个 conflict 选一条供现有 synthesis 消费，所有替代候选及失败证据保留。没有成功候选时继续保留探索路径，不把单次拒绝解释为 FSM transition 永远不可达，不删除原始 FSM。负向变体仍可能产生拒绝响应，基线的校准结果不自动继承为变体的成功证明。
+选择时先优先保留图上可达、具有消息且未标记 `not_executable` 的候选，再按完整正向响应、成功响应前缀长度、消息数更少排序，避免禁用校准或预算耗尽时空路径因“更短”而挤掉可发送路径。每个 conflict 选一条供现有 synthesis 消费，所有替代候选及失败证据保留。没有成功候选时继续保留探索路径，不把单次拒绝解释为 FSM transition 永远不可达，不删除原始 FSM。负向变体仍可能产生拒绝响应，基线的校准结果不自动继承为变体的成功证明。
 
 工件链路：`candidate_paths.json` 保存探测前候选；`path_calibration.json` 保存结果和选中的 ID；`calibrated_paths.json` 保存所有附带结果的候选；`planned_paths.json` 保存实际交给 synthesis 的路径及跨层路径；`seed_intents.json` 和 `seed_manifest.json` 通过 `source_candidate_id` 关联来源；`state_mapping.json` 同时保留选中路径的校准结果。每轮重新执行，不复用旧环境下的正向响应证明。
 
@@ -1168,7 +1170,7 @@ risk_score =
 
 ### PathPlanner
 
-`PathPlanner` 在 `UnifiedFSM` 上执行有界 BFS，生成多条候选消息序列；当前没有实现加权最短路。`PathCalibrator` 对具体编码输入进行响应校准，再选择交给 synthesis 的路径。配置、状态和限制详见 6.1 节。
+`PathPlanner` 在 `UnifiedFSM` 上按来源入口和反向距离执行有界候选搜索，优先较少的客户端请求，再优先较少的图转换。`PathCalibrator` 对具体编码输入进行响应校准，再选择交给 synthesis 的路径。配置、状态和限制详见 6.1 节。
 
 输入：
 
@@ -1241,7 +1243,7 @@ ProtoLens Result Analyzer
 3. Queue schedule：根据 `mutation_points` 和 guard 生成 `aflnet_queue_weights.tsv`，通过 `AFLNET_PROTO_SCHEDULE` 传给 patch 后的 `afl-fuzz`。
 4. Target state：`AFLNetStateMapper` 使用 `ipsm.dot` 的节点标签和 queue 文件名把 conflict state 与 AFLNet 动态观察做证据映射。
 5. Campaign config：`aflnet.cmd` 必须在 JSON 中完整配置 `-i`、`-o`、`-N`、`-P`、`-D`、`-x`、目标程序和 `--` 分隔；ProtoLens 不自动拼接或替换这些参数。
-6. Candidate calibration：`PathPlanner` 从 FSM 生成多条候选路径，`PathCalibrator` 在 AFLNet corpus 准备前用真实 target socket 响应校准候选，按完整正向响应、最长成功前缀、最短候选的顺序为每个 conflict 选择一条路径。
+6. Candidate calibration：`PathPlanner` 从 FSM 生成多条候选路径，`PathCalibrator` 在 AFLNet corpus 准备前用真实 target socket 响应校准候选，先保留可发送候选，再按完整正向响应、最长成功前缀、最短候选的顺序为每个 conflict 选择一条路径。
 7. Result analyzer：读取 AFLNet 输出目录，归档 crash、hang、coverage、state progression。
 8. Runtime monitor：`MonitorAgent` 读取同一动态输出，覆盖停滞时调用 LLM 进行瓶颈分析并输出强 guard breakthrough seed 候选，ProtoLens 校验并写入 `AFLNET_PROTOLENS_IMPORT_DIR`，由 patch 后的 `afl-fuzz` 立即执行并只保留真实有趣输入。
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict
 import hashlib
+import heapq
+from itertools import count
 import json
 import re
 
 from protolens.fsm.fsm_model import Conflict, PlannedStatePath, ProtocolFSM, StateTransition
-from protolens.utils.client_messages import transition_client_seed_message
+from protolens.utils.client_messages import is_client_send_transition, transition_client_seed_message
 
 
 class PathPlanner:
@@ -28,18 +30,50 @@ class PathPlanner:
         if target not in fsm.states:
             return [self._failed_path(fsm, conflict, f"target state {target!r} is absent from unified FSM")]
 
-        # BFS orders candidates by length; execution may favor a longer prefix.
-        found = self._candidate_prefixes(fsm, fsm.initial_state, target)
+        disputed = _find_disputed_transition(fsm, target, conflict.transition)
+        start = self._entry_state(fsm, target, disputed)
+        if disputed and disputed.source != target:
+            return [self._failed_path(fsm, conflict, "disputed transition does not start at conflict state", start)]
+        if disputed and is_client_send_transition(disputed) and not transition_client_seed_message(disputed, fsm.protocol):
+            return [self._failed_path(fsm, conflict,
+                                     f"client transition {disputed.id!r} has no encodable trigger: {disputed.trigger!r}", start)]
+        found = self._candidate_prefixes(
+            fsm, start, target,
+            require_message=not (disputed and transition_client_seed_message(disputed, fsm.protocol)),
+        )
         if not found:
-            return [self._failed_path(fsm, conflict, f"no candidate to {target!r} within configured search bounds")]
+            unsupported = sum(is_client_send_transition(edge) and not transition_client_seed_message(edge, fsm.protocol)
+                              for edge in fsm.transitions)
+            return [self._failed_path(
+                fsm, conflict, f"no candidate from {start!r} to {target!r} within configured search bounds "
+                f"(client-request depth={self.max_depth}, expansions={self.max_expansions}); "
+                f"excluded {unsupported} client transitions with unencodable triggers", start,
+            )]
         return [self._make_path(fsm, conflict, states, transitions) for states, transitions in found]
 
-    def _failed_path(self, fsm: ProtocolFSM, conflict: Conflict, reason: str) -> PlannedStatePath:
-        identity = json.dumps([conflict.id, fsm.initial_state, conflict.state, conflict.transition, reason],
+    @staticmethod
+    def _entry_state(fsm: ProtocolFSM, target: str, disputed: StateTransition | None) -> str:
+        # A semantic union can retain distinct spec and implementation entries.
+        # Use the recorded source entry without inventing a bridge between them.
+        entries = fsm.metadata.get("input_initial_states", {})
+        side = "impl"
+        sources = fsm.metadata.get("state_sources", {}).get(target, [])
+        if sources and not any(row.get("side") == "impl" for row in sources):
+            side = "spec"
+        if disputed:
+            for row in fsm.metadata.get("transition_sources", []):
+                if row.get("unified_transition_id") == disputed.id:
+                    side = "impl" if row.get("impl_transition_ids") else "spec"
+                    break
+        return entries.get(side, fsm.initial_state)
+
+    def _failed_path(self, fsm: ProtocolFSM, conflict: Conflict, reason: str, start: str | None = None) -> PlannedStatePath:
+        start = start if start is not None else fsm.initial_state
+        identity = json.dumps([conflict.id, start, conflict.state, conflict.transition, reason],
                               ensure_ascii=True)
         return PlannedStatePath(
             conflict_id=conflict.id,
-            states=[fsm.initial_state],
+            states=[start],
             messages=[],
             reachable=False,
             reason=reason,
@@ -63,7 +97,9 @@ class PathPlanner:
         messages = [message for _, message in client_steps]
         transition_ids = [transition.id for transition, _ in client_steps]
         identity = json.dumps([conflict.id, states, [item.id for item in transitions], messages, guards], ensure_ascii=True)
-        if conflict.transition:
+        if not messages:
+            mutation_points = []
+        elif conflict.transition:
             mutation_points = [max(len(messages) - 1, 0)]
         else:
             mutation_points = list(range(max(len(messages) - 1, 0), len(messages)))
@@ -74,36 +110,100 @@ class PathPlanner:
             required_guards=guards,
             mutation_points=mutation_points,
             reachable=True,
-            reason="graph candidate; guards and runtime state are not yet verified",
+            reason=("graph candidate; guards and runtime state are not yet verified" if messages else
+                    "selected graph path contains only server/internal events; no encodable client request"),
             candidate_id="path_" + hashlib.sha256(identity.encode()).hexdigest()[:24],
             transition_ids=transition_ids,
-            calibration={"status": "candidate", "accepted_prefix_length": 0, "state_verified": False},
+            calibration={"status": "candidate" if messages else "not_executable",
+                         "accepted_prefix_length": 0, "state_verified": False},
         )
 
-    def _candidate_prefixes(self, fsm: ProtocolFSM, start: str, target: str) -> list[tuple[list[str], list[StateTransition]]]:
-        queue: deque[tuple[str, list[str], list[StateTransition]]] = deque([(start, [start], [])])
+    def _candidate_prefixes(
+        self, fsm: ProtocolFSM, start: str, target: str, *, require_message: bool = False,
+    ) -> list[tuple[list[str], list[StateTransition]]]:
+        outgoing: dict[str, list[StateTransition]] = defaultdict(list)
+        incoming: dict[str, list[StateTransition]] = defaultdict(list)
+        costs = {}
+        for edge in fsm.transitions:
+            client = is_client_send_transition(edge)
+            # Never silently omit an unsupported client prerequisite from a seed.
+            if client and not transition_client_seed_message(edge, fsm.protocol):
+                continue
+            costs[edge.id] = int(client)
+            outgoing[edge.source].append(edge)
+            incoming[edge.target].append(edge)
+
+        # Exact reverse distances prune dead components and guide candidates
+        # toward the target before loops consume the path-enumeration budget.
+        # Internal steps consume graph work, but not the client-request depth.
+        # Track whether a client request has occurred. Otherwise zero-request
+        # internal cycles can outrank every useful path until the budget ends.
+        goals = [(target, True)] if require_message else [(target, False), (target, True)]
+        distances = {goal: (0, 0) for goal in goals}
+        pending = [(0, 0, *goal) for goal in goals]
+        heapq.heapify(pending)
+        while pending:
+            requests, hops, state, has_request = heapq.heappop(pending)
+            if distances[state, has_request] != (requests, hops):
+                continue
+            for edge in incoming[state]:
+                cost = costs[edge.id]
+                if cost and not has_request:
+                    continue
+                previous_flags = (False, True) if cost else (has_request,)
+                for previous_flag in previous_flags:
+                    previous = (edge.source, previous_flag)
+                    distance = (requests + cost, hops + 1)
+                    if previous not in distances or distance < distances[previous]:
+                        distances[previous] = distance
+                        heapq.heappush(pending, (*distance, *previous))
+        initial = (start, False)
+        if initial not in distances:
+            if require_message:
+                # Keep a graph-only diagnostic when the component has no
+                # client path at all; never fabricate a request for it.
+                return self._candidate_prefixes(fsm, start, target)
+            return []
+        if distances[initial][0] > self.max_depth:
+            return []
+
+        sequence = count()
+        queue = [(*distances[initial], next(sequence), 0, start, [start], [])]
         found = []
         seen: set[str] = set()
         expansions = 0
         while queue and len(found) < self.max_candidates and expansions < self.max_expansions:
-            state, states, transitions = queue.popleft()
+            _, _, _, requests, state, states, transitions = heapq.heappop(queue)
             expansions += 1
-            if state == target:
+            if state == target and (not require_message or requests):
                 identity = json.dumps([states, [item.id for item in transitions],
                                        [item.trigger for item in transitions]], ensure_ascii=True)
                 if identity not in seen:
                     seen.add(identity)
                     found.append((states, transitions))
                 continue
-            if len(transitions) >= self.max_depth:
-                continue
-            for edge in fsm.outgoing(state):
+            for edge in outgoing[state]:
                 # One visit per edge permits state-changing self loops without unbounded cycles.
                 if any(item.id == edge.id for item in transitions):
                     continue
-                if len(queue) + expansions >= self.max_expansions:
-                    break
-                queue.append((edge.target, states + [edge.target], transitions + [edge]))
+                next_requests = requests + costs[edge.id]
+                next_node = (edge.target, bool(next_requests))
+                if next_node not in distances:
+                    continue
+                remaining_requests, remaining_hops = distances[next_node]
+                if next_requests + remaining_requests > self.max_depth:
+                    continue
+                heapq.heappush(queue, (
+                    next_requests + remaining_requests, len(transitions) + 1 + remaining_hops,
+                    next(sequence), next_requests, edge.target,
+                    states + [edge.target], transitions + [edge],
+                ))
+            # Retain the best frontier entries rather than whichever edges
+            # happened to occur first in the serialized FSM.
+            capacity = self.max_expansions - expansions
+            if len(queue) > capacity:
+                queue = heapq.nsmallest(capacity, queue)
+                heapq.heapify(queue)
         return found
 
 def _find_disputed_transition(fsm: ProtocolFSM, source: str, label: str | None) -> StateTransition | None:
