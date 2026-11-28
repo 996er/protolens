@@ -28,6 +28,27 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _empty_legacy_notes(note: Path) -> bool:
+    """Recognize a GCC 4–8 notes header with no function/coverage records.
+
+    Declarations-only translation units can produce these files. Legacy gcov
+    emits no intermediate report for them, even when it exits successfully.
+    Do not infer emptiness from missing output or a small arbitrary file size.
+    """
+    with note.open("rb") as stream:
+        data = stream.read(20)
+    if len(data) not in {12, 16} or data[:4] not in {b"gcno", b"oncg"}:
+        return False
+    version = data[4:8] if data[:4] == b"gcno" else data[4:8][::-1]
+    # Both legacy encodings exist: e.g. 408* and A75*. GCC 9+ adds
+    # header fields, so do not apply this header-only check to newer versions.
+    numeric_version = version[:1] in (b"4", b"5", b"6", b"7", b"8") and version[1:3].isdigit()
+    letter_version = version[:1] == b"A" and version[1:2] in (b"4", b"5", b"6", b"7", b"8") and version[2:3].isdigit()
+    if not (numeric_version or letter_version) or version[3:] != b"*":
+        return False
+    return len(data) == 12 or data[12:] == b"\0\0\0\0"
+
+
 def _summary(files: dict[str, Any]) -> dict[str, Any]:
     result = {}
     for category in ("lines", "branches", "functions"):
@@ -70,6 +91,7 @@ class SourceCoverageCollector:
         self.state: dict[str, Any] = {}
         self.error: str | None = None
         self._gcov_format = "json"
+        self._empty_units: dict[str, Any] = {}
 
     def initialize(self) -> None:
         if self.lock is not None:
@@ -169,12 +191,32 @@ class SourceCoverageCollector:
             self._gcov_format = "intermediate"
             run = invoke("--intermediate-format")
         if run.returncode:
-            raise RuntimeError(f"gcov failed for {note}: {run.stderr[-2000:]}")
+            raise RuntimeError(f"gcov failed for {note}: {(run.stderr + run.stdout)[-2000:]}")
+        pattern = "*.gcov" if self._gcov_format == "intermediate" else "*.gcov.json.gz"
+        reports = sorted(generated.glob(pattern))
+        if not reports:
+            # Older gcov may return zero even for invalid inputs. Only accept
+            # an actually empty legacy notes header, with no error diagnostics.
+            harmless_stderr = all(
+                line.strip().endswith("cannot open data file, assuming not executed")
+                for line in run.stderr.splitlines() if line.strip()
+            )
+            if harmless_stderr and _empty_legacy_notes(mirrored):
+                self._empty_units[str(note)] = {
+                    "reason": "notes contain no function records; no executable coverage to collect",
+                    "format": self._gcov_format,
+                    "stdout": run.stdout, "stderr": run.stderr,
+                }
+                self.store.write_json("gcov_empty_units.json", self._empty_units)
+                return {}
+            diagnostic = (run.stderr + "\n" + run.stdout).strip()[-4000:]
+            raise RuntimeError(
+                f"gcov produced no {self._gcov_format} report for {note}; "
+                f"executable={self.settings.gcov_binary!r}; stdout/stderr: {diagnostic or '(empty)'}; "
+                "check that gcov matches the compiler used to produce this .gcno"
+            )
         if self._gcov_format == "intermediate":
             return self._read_intermediate_reports(note, generated, unit)
-        reports = list(generated.glob("*.gcov.json.gz"))
-        if not reports:
-            raise RuntimeError(f"gcov produced no JSON for {note}; use a matching GCC/gcov version with JSON support")
         result: dict[str, Any] = {}
         for report in reports:
             with gzip.open(report, "rt", encoding="utf-8") as stream:

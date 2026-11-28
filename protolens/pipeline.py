@@ -388,7 +388,8 @@ class ProtoLensPipeline:
         fsm: ProtocolFSM,
         conflicts: list[Conflict],
     ) -> tuple[list[PlannedStatePath], FuzzResult]:
-        self.logger.info("planning state paths and preparing AFLNet campaign")
+        self.logger.info("planning state paths and preparing AFLNet campaign",
+                         planner_version=self.path_planner.VERSION)
         candidates = self.path_planner.plan(fsm, conflicts)
         self.store.write_json("candidate_paths.json", candidates)
         calibration = self.path_calibrator.calibrate(self.config, candidates)
@@ -403,6 +404,10 @@ class ProtoLensPipeline:
         seed_intents = self.state_aware_synthesizer.synthesize(planned_paths, conflicts, self.config.protocol, fsm=fsm)
         directed_generation = {
             "format": "protolens.directed_generation.v1",
+            "planner_version": self.path_planner.VERSION,
+            "search_limits": {"max_candidates": self.path_planner.max_candidates,
+                              "max_client_request_depth": self.path_planner.max_depth,
+                              "max_expansions": self.path_planner.max_expansions},
             "status": "generated" if seed_intents else "failed",
             "reason": ("directed seed intents generated; execution and coverage remain unverified" if seed_intents
                        else "directed generation failed: no executable directed seed intents; "

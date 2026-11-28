@@ -470,6 +470,8 @@ Conflict
 
 所有路径不可执行或未产生任何定向 seed intent 时，`directed_generation.json` 明确记录 `status=failed`、路径原因与零产出计数，日志输出 `directed generation failed`。`fuzz`/`run` 的 JSON 返回值和 `report.md` 同时展示该状态；即使 AFLNet 使用现有 corpus 或最小 fallback 继续运行，也不视为定向生成成功。有 seed intent 时记录 `status=generated`，仅表示生成了候选，不证明实际执行成功或覆盖增长。
 
+规划启动日志和 `directed_generation.json` 都记录 `planner_version`，报告同时保存 `search_limits`。当前版本为 `directed-paths-v2-source-entry`；缺少版本、`entry_state` 且仍使用 `no candidate to ... within configured search bounds` 的报告来自旧规划器，不能作为新版修复后的结果。更新实际运行环境中的代码后重新执行 `fuzz` 即可重建路径与种子，无需重建 FSM；从仓库目录执行 `python -m protolens.main fuzz --config ...` 可明确使用当前仓库模块。
+
 #### 6.1.0 执行校准与路径选择
 
 开启 `path_calibration.enabled` 后，`synthesize_and_fuzz()` 在准备 AFLNet corpus 前进行校准。目标必须已能通过 `aflnet.cmd` 中 `--` 后的命令独立启动。校准器沿用 `source_root`、`host`、`port`，先运行现有 `build_command`，然后对每条候选启动独立目标进程，在同一 TCP 连接中依次发送 `CorpusEncoder` 生成的实际消息。每条候选结束后关闭连接、终止并回收所启动的目标进程组，再进行下一条候选。AFLNet 本身仍只由 JSON 中 `aflnet.cmd` 启动，没有新增命令入口。
@@ -694,6 +696,8 @@ SETUP /media --transport=RTP/AVP/TCP;unicast;interleaved=2-3
 `source_coverage.enabled=true` 时，pipeline 在 AFLNet 启动前初始化独立收集器，并在后台监听 AFLNet 输出目录的 `queue/`。新文件稳定后逐个重放，将计数合并到全局累计覆盖，仅保存每个用例的处理摘要，不再创建 `html/snapshots/` 或 `case_coverage.json`；相同内容的新文件也会单独收集。已有 queue 在首次启动时补采。收集器独立于 MonitorAgent 的模型请求运行，AFLNet 结束时处理剩余 queue，再发布最终覆盖率。收集速度低于 queue 增长速度时，页面显示待处理数量，仍按用例逐个执行。
 
 fuzz 目标继续使用 `aflnet.cmd` 中的 AFLNet 插桩程序；覆盖率目标由 `source_coverage.target_cmd` 单独指定。两者使用不同的服务端口，例如 live555 使用 8554，live555-cov 使用 8555。独立目标每个用例重新启动，并使用该用例专属的 `GCOV_PREFIX`、`GCOV_PREFIX_STRIP=0` 收集 `.gcda`，不读取或清空构建目录中的历史 `.gcda`。收集器复制 `.gcno` 到专属目录，调用与编译器版本匹配的 `gcov --json-format --branch-probabilities --branch-counts`，基于原始计数计算累计覆盖及当前用例新增覆盖。不要求安装 gcovr、lcov 或前端依赖。
+
+配置的旧版 gcov 不支持 `--json-format` 时自动改用 `--intermediate-format`。GCC 4–8 的仅声明编译单元可能只产生包含 magic、version、stamp 的 `.gcno` 文件头（可带零结束标记），不含函数记录，gcov 成功退出却不生成 `.gcov`。采集器仅在确认该格式且没有错误诊断时将其作为空覆盖单元处理，并记录到 `source_coverage/gcov_empty_units.json`，不添加虚假的可执行行或覆盖计数。普通 `.gcno` 缺失报告仍报错，错误包含 gcov 程序名及 stdout/stderr，便于区分版本不匹配、文件损坏和输出失败；整个构建没有可采集源码时仍终止。
 
 配置示例见 `benchmarks/rtsp_live555_coverage.example.json`。把其中的 `source_coverage` 段加入实际 fuzz 配置后，`fuzz`/`run` 自动收集；示例自身用于独立收集现有 queue，`aflnet.dry_run=true` 不影响独立 `coverage` 命令。`build_root` 要包含这份覆盖率二进制对应的全部 `.gcno`；`source_root` 是覆盖率版本源码根目录，文件路径相对此目录展示。编译时建议使用 `--coverage -O0 -g`，保持源码、二进制和 `.gcno` 同一版本。gcov JSON 与 GCOV_PREFIX 的语义以 [GCC gcov 文档](https://gcc.gnu.org/onlinedocs/gcc/Invoking-Gcov.html) 和 [覆盖数据重定位文档](https://gcc.gnu.org/onlinedocs/gcc/Cross-profiling.html) 为准。
 

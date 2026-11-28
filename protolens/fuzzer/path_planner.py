@@ -14,6 +14,8 @@ from protolens.utils.client_messages import is_client_send_transition, transitio
 class PathPlanner:
     """Generate bounded graph candidates; execution establishes feasibility."""
 
+    VERSION = "directed-paths-v2-source-entry"
+
     def __init__(self, max_candidates: int = 3, max_depth: int = 16, max_expansions: int = 2000) -> None:
         self.max_candidates = max_candidates
         self.max_depth = max_depth
