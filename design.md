@@ -372,8 +372,13 @@ spec_fsm + impl_fsm
 
 ### 5. `reason()` 执行流程
 
+默认 `reason`/`fuzz` 在加载统一图前校验阶段依赖。对有源码分析工件和阶段 checkpoint 的 run，先核对 implementation 已完成工件的 SHA-256；缺失或损坏时要求恢复 `build-impl`，不把遗留统一图当作有效结果。实现工件完整时直接复用，不重新扫描源码或重做连通性恢复；按当前实现能力校验或更新 specification，再按当前两侧 FSM 与 EvidenceTable 摘要校验或更新 merge。阶段失效只撤销 checkpoint，磁盘上的旧文件可能仍存在，不能仅凭文件存在就读取。
+
+reasoning 也记录独立阶段 checkpoint，输入指纹包含 UnifiedFSM 内容、divergences 和模型配置，输出校验覆盖 directions、conflicts 和 conflict_reference_report。实现、规范或合并重建会同时失效 reasoning。默认 `fuzz` 在图与冲突指纹不一致、冲突输出变化或缺少 reasoning checkpoint 时重新生成冲突；中断后不会将旧冲突误用于新图。显式 `--fsm`/`--divergences`/`--conflicts` 输入以及没有受管源码分析的独立图仍按用户指定工件处理。
+
 ```text
 reason(fsm, divergences)
+  -> 失效旧 reasoning checkpoint
   -> 清理本轮 findings/*.jsonl 和 findings/*.llm.jsonl
   -> DirectionGenerator.generate(fsm, divergences)
   -> 从 UnifiedFSM transition evidence 收集已验证的源码证据
@@ -385,6 +390,7 @@ reason(fsm, divergences)
   -> 写 conflict_reference_report.json
   -> 写 directions.json
   -> 写 conflicts.json
+  -> 保存 reasoning 输入指纹及输出摘要
 ```
 
 Agent 调用顺序固定为：
@@ -470,7 +476,7 @@ Conflict
 
 所有路径不可执行或未产生任何定向 seed intent 时，`directed_generation.json` 明确记录 `status=failed`、路径原因与零产出计数，日志输出 `directed generation failed`。`fuzz`/`run` 的 JSON 返回值和 `report.md` 同时展示该状态；即使 AFLNet 使用现有 corpus 或最小 fallback 继续运行，也不视为定向生成成功。有 seed intent 时记录 `status=generated`，仅表示生成了候选，不证明实际执行成功或覆盖增长。
 
-规划启动日志和 `directed_generation.json` 都记录 `planner_version`，报告同时保存 `search_limits`。当前版本为 `directed-paths-v2-source-entry`；缺少版本、`entry_state` 且仍使用 `no candidate to ... within configured search bounds` 的报告来自旧规划器，不能作为新版修复后的结果。更新实际运行环境中的代码后重新执行 `fuzz` 即可重建路径与种子，无需重建 FSM；从仓库目录执行 `python -m protolens.main fuzz --config ...` 可明确使用当前仓库模块。
+规划启动日志和 `directed_generation.json` 都记录 `planner_version`，报告同时保存 `search_limits`。当前版本为 `directed-paths-v2-source-entry`。规划器版本更新不代表输入图已更新：实现连通性修复后，如果 UnifiedFSM 和 conflicts 仍来自旧 merge，换入口或扩大预算也无法补上缺失转换。默认 `fuzz` 会先按上述依赖链更新过期阶段，只复用有有效 checkpoint 的工件。这个过程可能调用模型重新构建规范、合并和推理，但不会重做已完成且工件完整的实现分析；从仓库目录执行 `python3 -m protolens.main fuzz --config ...` 可明确使用当前仓库模块。
 
 #### 6.1.0 执行校准与路径选择
 

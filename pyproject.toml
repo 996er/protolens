@@ -7,7 +7,7 @@ name = "protolens"
 version = "0.1.0"
 description = "Adversarial multi-agent state reasoning for protocol fuzzing"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["openai==2.43.0"]
 
 [project.scripts]
 protolens = "protolens.main:main"

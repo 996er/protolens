@@ -297,9 +297,12 @@ def cmd_build_fsm(args: Namespace) -> dict[str, object]:
 def cmd_reason(args: Namespace) -> dict[str, object]:
     config = ProtoLensConfig.load(args.config)
     store = ArtifactStore(config.run_dir)
-    fsm = ProtocolFSM.from_dict(_read_json_arg(args.fsm, store, "unified_fsm.json"))
-    divergences = [Divergence.from_dict(item) for item in _read_json_arg(args.divergences, store, "divergences.json")]
     pipeline = ProtoLensPipeline(config, _logger_for(config, args))
+    if not args.fsm and not args.divergences:
+        fsm, divergences = pipeline.load_current_fsm()
+    else:
+        fsm = ProtocolFSM.from_dict(_read_json_arg(args.fsm, store, "unified_fsm.json"))
+        divergences = [Divergence.from_dict(item) for item in _read_json_arg(args.divergences, store, "divergences.json")]
     directions, findings, conflicts = pipeline.reason(fsm, divergences)
     return {
         "run_dir": str(config.run_dir),
@@ -314,11 +317,15 @@ def cmd_fuzz(args: Namespace) -> dict[str, object]:
         raise ValueError("parallel jobs require explicit AFLNet parallelization in aflnet.cmd; ProtoLens will not synthesize alternate AFLNet commands")
     config = ProtoLensConfig.load(args.config)
     store = ArtifactStore(config.run_dir)
-    fsm = ProtocolFSM.from_dict(_read_json_arg(args.fsm, store, "unified_fsm.json"))
-    conflicts = [Conflict.from_dict(item) for item in _read_json_arg(args.conflicts, store, "conflicts.json")]
     pipeline = ProtoLensPipeline(config, _logger_for(config, args))
+    if not any((args.fsm, args.divergences, args.conflicts)):
+        fsm, divergences, conflicts = pipeline.load_current_fuzz_inputs()
+    else:
+        fsm = ProtocolFSM.from_dict(_read_json_arg(args.fsm, store, "unified_fsm.json"))
+        divergences = [Divergence.from_dict(item) for item in _read_json_arg(args.divergences, store, "divergences.json")]
+        conflicts = [Conflict.from_dict(item) for item in _read_json_arg(args.conflicts, store, "conflicts.json")]
     paths, result = pipeline.synthesize_and_fuzz(fsm, conflicts)
-    pipeline.write_report(fsm, [Divergence.from_dict(item) for item in _read_json_arg(args.divergences, store, "divergences.json")], conflicts, paths, result)
+    pipeline.write_report(fsm, divergences, conflicts, paths, result)
     return {
         "run_dir": str(config.run_dir),
         "planned_paths": len(paths),

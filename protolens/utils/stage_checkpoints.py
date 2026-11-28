@@ -24,7 +24,24 @@ class StageCheckpointStore:
         recorded = record.get("artifacts")
         if not isinstance(recorded, dict) or set(recorded) != set(artifacts):
             return False
-        for relative in artifacts:
+        return self._artifacts_match(recorded)
+
+    def artifacts_valid(self, stage: str) -> bool:
+        """Check a completed stage without re-reading its original source inputs.
+
+        Downstream commands consume saved implementation analysis. They must
+        verify its recorded files, but need not re-extract the source tree.
+        """
+        record = self._read().get("stages", {}).get(stage)
+        if not isinstance(record, dict):
+            return False
+        recorded = record.get("artifacts")
+        if not isinstance(recorded, dict) or not recorded:
+            return False
+        return self._artifacts_match(recorded)
+
+    def _artifacts_match(self, recorded: dict[str, Any]) -> bool:
+        for relative in recorded:
             path = self.store.path(relative)
             if not path.is_file() or file_sha256(path) != recorded.get(relative):
                 return False

@@ -51,6 +51,8 @@ from protolens.utils.stage_checkpoints import StageCheckpointStore, file_sha256,
 class ProtoLensPipeline:
     """串联 FSM 构建、对抗推理、路径规划与 AFLNet 执行的主流程。"""
 
+    REASONING_ARTIFACTS = ["directions.json", "conflicts.json", "conflict_reference_report.json"]
+
     def __init__(self, config: ProtoLensConfig, logger: Logger | None = None) -> None:
         self.config = config
         self.store = ArtifactStore(config.run_dir)
@@ -129,7 +131,7 @@ class ProtoLensPipeline:
             self.stage_reuse["implementation"] = True
             return self._load_implementation_fsm(), True
 
-        self.checkpoints.invalidate("implementation", "specification", "merge")
+        self.checkpoints.invalidate("implementation", "specification", "merge", "reasoning")
         self.logger.info("building implementation transition facts and FSM")
         self.logger.debug(
             "implementation input paths",
@@ -152,7 +154,7 @@ class ProtoLensPipeline:
             "implementation",
             fingerprint,
             artifacts,
-            invalidate=("specification", "merge"),
+            invalidate=("specification", "merge", "reasoning"),
         )
         self.logger.debug(
             "implementation FSM built",
@@ -194,7 +196,7 @@ class ProtoLensPipeline:
             self.stage_reuse["specification"] = True
             return ProtocolFSM.from_dict(self.store.read_json("spec_fsm.json")), True
 
-        self.checkpoints.invalidate("specification", "merge")
+        self.checkpoints.invalidate("specification", "merge", "reasoning")
         self.logger.info("building scoped specification FSM")
         self.logger.debug("spec input paths", spec_paths=[str(path) for path in self.config.spec_paths])
         try:
@@ -202,7 +204,7 @@ class ProtoLensPipeline:
         finally:
             self._write_fsm_llm_conversations(self.spec_builder)
         self.store.write_json("spec_fsm.json", spec_fsm)
-        self.checkpoints.record("specification", fingerprint, artifacts, invalidate=("merge",))
+        self.checkpoints.record("specification", fingerprint, artifacts, invalidate=("merge", "reasoning"))
         self.logger.debug(
             "spec FSM built",
             states=len(spec_fsm.states),
@@ -242,7 +244,7 @@ class ProtoLensPipeline:
             self.stage_reuse["merge"] = True
             return unified, divergences, True
 
-        self.checkpoints.invalidate("merge")
+        self.checkpoints.invalidate("merge", "reasoning")
         self.logger.info("merging FSMs and detecting divergences")
         try:
             unified_fsm, divergences = self.merger.merge(
@@ -253,7 +255,7 @@ class ProtoLensPipeline:
             self._write_fsm_llm_conversations(self.merger)
         self.store.write_json("unified_fsm.json", unified_fsm)
         self.store.write_json("divergences.json", divergences)
-        self.checkpoints.record("merge", fingerprint, artifacts)
+        self.checkpoints.record("merge", fingerprint, artifacts, invalidate=("reasoning",))
         self.logger.debug(
             "FSM merge complete",
             unified_states=len(unified_fsm.states),
@@ -285,7 +287,53 @@ class ProtoLensPipeline:
         unified_fsm, divergences, _ = self.merge_fsms(force=force)
         return spec_fsm, impl_fsm, unified_fsm, divergences
 
+    def _managed_fsm_inputs(self) -> bool:
+        return (self.store.path(StageCheckpointStore.CHECKPOINT_PATH).is_file()
+                and any(self.store.path(name).is_file() for name in (
+                    "implementation_transition_facts.json", "implementation_source_manifest.json",
+                )))
+
+    def load_current_fsm(self) -> tuple[ProtocolFSM, list[Divergence]]:
+        """Refresh stale downstream artifacts before default reason/fuzz reads them."""
+        if self._managed_fsm_inputs():
+            if not self.checkpoints.artifacts_valid("implementation"):
+                raise ValueError(
+                    "implementation checkpoint is missing, incomplete or its artifacts changed; "
+                    "run build-impl (or build-fsm) before consuming default reason/fuzz inputs"
+                )
+            self.logger.info("checking specification and merge dependencies; retaining completed implementation analysis")
+            # build-impl invalidates downstream checkpoints but intentionally
+            # retains files for diagnostics. Existence is not freshness.
+            self.build_specification()
+            fsm, divergences, _ = self.merge_fsms()
+            return fsm, divergences
+        # Standalone/imported FSMs have no managed implementation dependency.
+        return (
+            ProtocolFSM.from_dict(self.store.read_json("unified_fsm.json")),
+            [Divergence.from_dict(item) for item in self.store.read_json("divergences.json")],
+        )
+
+    def load_current_fuzz_inputs(self) -> tuple[ProtocolFSM, list[Divergence], list[Conflict]]:
+        fsm, divergences = self.load_current_fsm()
+        if self._managed_fsm_inputs() and not self.checkpoints.is_valid(
+            "reasoning", self._reasoning_fingerprint(fsm, divergences), self.REASONING_ARTIFACTS,
+        ):
+            self.logger.info("regenerating conflicts for the current merged FSM")
+            _, _, conflicts = self.reason(fsm, divergences)
+        else:
+            conflicts = [Conflict.from_dict(item) for item in self.store.read_json("conflicts.json")]
+        return fsm, divergences, conflicts
+
+    def _reasoning_fingerprint(self, fsm: ProtocolFSM, divergences: list[Divergence]) -> str:
+        return stable_fingerprint({
+            "version": "reasoning-inputs-v1", "fsm": fsm.to_dict(),
+            "divergences": [asdict(item) for item in divergences],
+            "llm": _llm_cache_identity(self.config),
+        })
+
     def reason(self, fsm: ProtocolFSM, divergences: list[Divergence]) -> tuple[list[str], list[ReasoningFinding], list[Conflict]]:
+        fingerprint = self._reasoning_fingerprint(fsm, divergences)
+        self.checkpoints.invalidate("reasoning")
         self.logger.info("running adversarial reasoning agents")
         # reason 子命令允许重复执行；清理本轮拥有的 JSONL，避免旧 finding 混入审计结果。
         for agent in self.agents:
@@ -366,6 +414,7 @@ class ProtoLensPipeline:
             )
         self.logger.debug("wrote artifact", path=self.store.write_json("directions.json", directions))
         self.logger.debug("wrote artifact", path=self.store.write_json("conflicts.json", conflicts))
+        self.checkpoints.record("reasoning", fingerprint, self.REASONING_ARTIFACTS)
         return directions, findings, conflicts
 
     def _write_agent_llm_conversations(self, agent: object) -> None:
